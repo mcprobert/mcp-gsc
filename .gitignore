@@ -20,6 +20,7 @@ service_account_credentials.json
 credentials.json
 token.json
 client_secret*.json
+accounts/
 
 # Editor-specific files
 .vscode/

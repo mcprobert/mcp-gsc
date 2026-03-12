@@ -1,7 +1,9 @@
 from typing import Any, Dict, List, Optional
 import os
 import json
-from datetime import datetime, timedelta
+import re
+import shutil
+from datetime import datetime, timedelta, timezone
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -40,6 +42,128 @@ TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
 SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes")
 
 SCOPES = ["https://www.googleapis.com/auth/webmasters"]
+OAUTH_SCOPES = SCOPES + [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+]
+
+# Multi-account support
+ACCOUNTS_DIR = os.path.join(SCRIPT_DIR, "accounts")
+ACCOUNTS_MANIFEST = os.path.join(ACCOUNTS_DIR, "accounts.json")
+_active_account: Optional[str] = None
+
+
+# --- Multi-account helpers ---
+
+def _validate_alias(alias: str) -> str:
+    """Validate and normalize account alias. Returns normalized alias or raises ValueError."""
+    alias = alias.strip().lower()
+    if not alias or len(alias) > 30:
+        raise ValueError("Alias must be 1-30 characters.")
+    if not re.match(r'^[a-z0-9][a-z0-9-]*$', alias):
+        raise ValueError("Alias must be lowercase alphanumeric and hyphens, starting with a letter or digit.")
+    return alias
+
+
+def _load_manifest() -> dict:
+    """Load accounts manifest. Returns empty structure if missing or corrupted."""
+    if os.path.exists(ACCOUNTS_MANIFEST):
+        try:
+            with open(ACCOUNTS_MANIFEST, "r") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and "accounts" in data:
+                return data
+        except (json.JSONDecodeError, IOError):
+            pass
+    return {"active_account": None, "accounts": {}}
+
+
+def _save_manifest(manifest: dict) -> None:
+    """Atomically write manifest to disk, creating accounts dir if needed."""
+    os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+    tmp_path = ACCOUNTS_MANIFEST + ".tmp"
+    with open(tmp_path, "w") as f:
+        json.dump(manifest, f, indent=2)
+    os.replace(tmp_path, ACCOUNTS_MANIFEST)
+
+
+def _get_active_token_file() -> Optional[str]:
+    """Resolve token file path for the active account.
+    Returns the expected path even if the file is missing on disk,
+    so that OAuth re-auth can recreate it rather than silently falling back."""
+    global _active_account
+    # Ensure legacy migration has run
+    _maybe_migrate_legacy_token()
+    # Lazy init from manifest
+    if _active_account is None:
+        manifest = _load_manifest()
+        _active_account = manifest.get("active_account")
+    if _active_account is None:
+        return None
+    manifest = _load_manifest()
+    acct = manifest.get("accounts", {}).get(_active_account)
+    if acct and acct.get("token_file"):
+        token_path = acct["token_file"]
+        # Resolve relative paths against SCRIPT_DIR
+        if not os.path.isabs(token_path):
+            token_path = os.path.join(SCRIPT_DIR, token_path)
+        return token_path
+    return None
+
+
+def _detect_email(creds) -> Optional[str]:
+    """Detect email from OAuth credentials using tokeninfo endpoint."""
+    try:
+        import urllib.request
+        import urllib.parse
+        if creds.token:
+            url = f"https://oauth2.googleapis.com/tokeninfo?access_token={urllib.parse.quote(creds.token)}"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                return data.get("email")
+    except Exception:
+        pass
+    return None
+
+
+_migration_checked = False
+
+def _maybe_migrate_legacy_token() -> None:
+    """One-time migration of existing token.json into accounts/default/token.json.
+    Deferred to first use — no network I/O, no blocking at import time."""
+    global _migration_checked, _active_account
+    if _migration_checked:
+        return
+    _migration_checked = True
+
+    manifest = _load_manifest()
+    # Skip if accounts already exist
+    if manifest.get("accounts"):
+        return
+    # Check for legacy token
+    if not os.path.exists(TOKEN_FILE):
+        return
+    # Copy token (original left in place for safe rollback)
+    default_dir = os.path.join(ACCOUNTS_DIR, "default")
+    os.makedirs(default_dir, exist_ok=True)
+    dest = os.path.join(default_dir, "token.json")
+    shutil.copy2(TOKEN_FILE, dest)
+
+    manifest = {
+        "active_account": "default",
+        "accounts": {
+            "default": {
+                "alias": "default",
+                "email": None,
+                "token_file": "accounts/default/token.json",
+                "added_at": datetime.now(timezone.utc).isoformat(),
+            }
+        },
+    }
+    _save_manifest(manifest)
+    _active_account = "default"
+
 
 def get_gsc_service():
     """
@@ -74,37 +198,43 @@ def get_gsc_service():
         f"{', '.join([p for p in POSSIBLE_CREDENTIAL_PATHS[1:] if p])}"
     )
 
-def get_gsc_service_oauth():
+def get_gsc_service_oauth(token_file: Optional[str] = None):
     """
     Returns an authorized Search Console service object using OAuth.
+    Resolves token file: explicit param → active account → legacy fallback.
     """
+    if token_file is None:
+        token_file = _get_active_token_file()
+    if token_file is None:
+        token_file = TOKEN_FILE  # legacy fallback
+
     creds = None
-    
+
     # Check if token file exists
-    if os.path.exists(TOKEN_FILE):
+    if os.path.exists(token_file):
         try:
-            creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            creds = Credentials.from_authorized_user_file(token_file, SCOPES)
         except Exception as e:
             # If token file is corrupted, delete it
-            if os.path.exists(TOKEN_FILE):
-                os.remove(TOKEN_FILE)
+            if os.path.exists(token_file):
+                os.remove(token_file)
             creds = None
-    
+
     # If credentials don't exist or are invalid, get new ones
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
                 # Save the refreshed credentials
-                with open(TOKEN_FILE, 'w') as token:
+                with open(token_file, 'w') as token:
                     token.write(creds.to_json())
             except Exception as e:
                 # If refresh fails, delete the bad token and trigger new OAuth flow
-                if os.path.exists(TOKEN_FILE):
-                    os.remove(TOKEN_FILE)
+                if os.path.exists(token_file):
+                    os.remove(token_file)
                 # Fall through to the OAuth flow below
                 creds = None
-        
+
         # Start new OAuth flow if we don't have valid credentials
         if not creds or not creds.valid:
             # Check if client secrets file exists
@@ -113,15 +243,16 @@ def get_gsc_service_oauth():
                     f"OAuth client secrets file not found. Please place a client_secrets.json file in the script directory "
                     f"or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
                 )
-            
-            # Start OAuth flow
-            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, SCOPES)
+
+            # Start OAuth flow (use OAUTH_SCOPES to request email for account detection)
+            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
             creds = flow.run_local_server(port=0)
-            
+
             # Save the credentials for future use
-            with open(TOKEN_FILE, 'w') as token:
+            os.makedirs(os.path.dirname(token_file), exist_ok=True)
+            with open(token_file, 'w') as token:
                 token.write(creds.to_json())
-    
+
     # Build and return the service
     return build("searchconsole", "v1", credentials=creds)
 
@@ -1425,6 +1556,219 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
     
     except Exception as e:
         return f"Error managing sitemaps: {str(e)}"
+
+
+# --- Account Management Tools ---
+
+@mcp.tool()
+async def list_accounts() -> str:
+    """
+    Lists all configured Google accounts with their aliases, emails, and active status.
+    """
+    try:
+        manifest = _load_manifest()
+        accounts = manifest.get("accounts", {})
+        active = manifest.get("active_account")
+
+        if not accounts:
+            return (
+                "No accounts configured.\n\n"
+                "Use `add_account` to add a Google account, or if you have an existing "
+                "token.json it will be auto-migrated on next server restart."
+            )
+
+        lines = ["# Google Search Console Accounts\n"]
+        for alias, info in sorted(accounts.items()):
+            marker = " **(active)**" if alias == active else ""
+            email = info.get("email") or "unknown"
+            added = info.get("added_at", "unknown")
+            lines.append(f"- **{alias}**{marker}: {email} (added {added})")
+
+        lines.append(f"\nTotal: {len(accounts)} account(s)")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error listing accounts: {str(e)}"
+
+
+@mcp.tool()
+async def get_active_account() -> str:
+    """
+    Shows the currently active Google account alias and email.
+    All GSC operations use the active account's credentials.
+    """
+    try:
+        global _active_account
+        # Lazy init
+        if _active_account is None:
+            manifest = _load_manifest()
+            _active_account = manifest.get("active_account")
+
+        if _active_account is None:
+            return "No active account. Use `add_account` to add one, or existing token.json will be used as fallback."
+
+        manifest = _load_manifest()
+        acct = manifest.get("accounts", {}).get(_active_account)
+        if not acct:
+            return f"Active account '{_active_account}' not found in manifest. Use `list_accounts` to see available accounts."
+
+        email = acct.get("email") or "unknown"
+        return f"Active account: **{_active_account}** ({email})"
+    except Exception as e:
+        return f"Error getting active account: {str(e)}"
+
+
+@mcp.tool()
+async def add_account(alias: str) -> str:
+    """
+    Adds a new Google account. Opens a browser window for Google OAuth login.
+    The new account becomes the active account after successful authentication.
+
+    Args:
+        alias: A short name for this account (lowercase alphanumeric and hyphens, 1-30 chars).
+               Examples: 'client-a', 'personal', 'agency-main'
+    """
+    try:
+        alias = _validate_alias(alias)
+    except ValueError as e:
+        return f"Invalid alias: {str(e)}"
+
+    try:
+        manifest = _load_manifest()
+
+        # Check for alias collision
+        if alias in manifest.get("accounts", {}):
+            return f"Account '{alias}' already exists. Use a different alias or remove it first with `remove_account`."
+
+        # Check client secrets
+        if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
+            return (
+                "OAuth client secrets file not found. Please place a client_secrets.json file "
+                "in the script directory or set the GSC_OAUTH_CLIENT_SECRETS_FILE environment variable."
+            )
+
+        # Create account directory (fail if already exists as secondary guard)
+        acct_dir = os.path.join(ACCOUNTS_DIR, alias)
+        os.makedirs(ACCOUNTS_DIR, exist_ok=True)
+        try:
+            os.mkdir(acct_dir)
+        except FileExistsError:
+            return f"Account directory for '{alias}' already exists. Remove it first with `remove_account`."
+        token_path = os.path.join(acct_dir, "token.json")
+
+        # Run OAuth flow
+        try:
+            flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
+            creds = flow.run_local_server(port=0)
+        except Exception as e:
+            # Clean up partial directory on OAuth failure
+            shutil.rmtree(acct_dir, ignore_errors=True)
+            return f"OAuth flow failed: {str(e)}"
+
+        # Save token
+        with open(token_path, "w") as f:
+            f.write(creds.to_json())
+
+        # Detect email
+        email = _detect_email(creds)
+
+        # Update manifest
+        manifest.setdefault("accounts", {})[alias] = {
+            "alias": alias,
+            "email": email,
+            "token_file": f"accounts/{alias}/token.json",
+            "added_at": datetime.now(timezone.utc).isoformat(),
+        }
+        manifest["active_account"] = alias
+        _save_manifest(manifest)
+
+        # Set as active
+        global _active_account
+        _active_account = alias
+
+        email_str = email or "unknown"
+        return f"Account '{alias}' added and set as active. Email: {email_str}"
+    except Exception as e:
+        return f"Error adding account: {str(e)}"
+
+
+@mcp.tool()
+async def switch_account(alias: str) -> str:
+    """
+    Switches the active Google account. All subsequent GSC operations will use this account's credentials.
+
+    Args:
+        alias: The alias of the account to switch to. Use `list_accounts` to see available accounts.
+    """
+    try:
+        alias = _validate_alias(alias)
+    except ValueError as e:
+        return f"Invalid alias: {str(e)}"
+
+    try:
+        manifest = _load_manifest()
+
+        if alias not in manifest.get("accounts", {}):
+            available = ", ".join(sorted(manifest.get("accounts", {}).keys())) or "none"
+            return f"Account '{alias}' not found. Available accounts: {available}"
+
+        manifest["active_account"] = alias
+        _save_manifest(manifest)
+
+        global _active_account
+        _active_account = alias
+
+        email = manifest["accounts"][alias].get("email") or "unknown"
+        return f"Switched to account '{alias}' ({email}). All GSC operations now use this account."
+    except Exception as e:
+        return f"Error switching account: {str(e)}"
+
+
+@mcp.tool()
+async def remove_account(alias: str) -> str:
+    """
+    Removes a Google account and its stored credentials.
+    If the removed account was active, switches to the first remaining account.
+
+    Args:
+        alias: The alias of the account to remove. Use `list_accounts` to see available accounts.
+    """
+    try:
+        alias = _validate_alias(alias)
+    except ValueError as e:
+        return f"Invalid alias: {str(e)}"
+
+    try:
+        manifest = _load_manifest()
+
+        if alias not in manifest.get("accounts", {}):
+            available = ", ".join(sorted(manifest.get("accounts", {}).keys())) or "none"
+            return f"Account '{alias}' not found. Available accounts: {available}"
+
+        # Remove account directory
+        acct_dir = os.path.join(ACCOUNTS_DIR, alias)
+        if os.path.isdir(acct_dir):
+            shutil.rmtree(acct_dir)
+
+        # Remove from manifest
+        del manifest["accounts"][alias]
+
+        # If this was the active account, switch to first remaining or None
+        global _active_account
+        if manifest.get("active_account") == alias:
+            remaining = sorted(manifest.get("accounts", {}).keys())
+            new_active = remaining[0] if remaining else None
+            manifest["active_account"] = new_active
+        _save_manifest(manifest)
+        # Always sync in-memory state from manifest
+        _active_account = manifest.get("active_account")
+
+        if _active_account:
+            return f"Account '{alias}' removed. Active account is now '{_active_account}'."
+        else:
+            return f"Account '{alias}' removed. No accounts remaining — GSC will fall back to legacy token.json if present."
+    except Exception as e:
+        return f"Error removing account: {str(e)}"
+
 
 @mcp.tool()
 async def get_creator_info() -> str:
