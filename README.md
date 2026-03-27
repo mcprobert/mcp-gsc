@@ -25,11 +25,17 @@ A tool that connects [Google Search Console](https://search.google.com/search-co
    - Inspect multiple URLs at once to identify patterns
    - Get actionable insights on how to improve indexing
 
-4. **Sitemap Management**  
+4. **Sitemap Management**
    - View all your sitemaps and their status
    - Submit new sitemaps directly through Claude
    - Check for errors or warnings in your sitemaps
    - Monitor sitemap processing status
+
+5. **Multi-Account Management**
+   - Manage multiple Google accounts for agency workflows
+   - Switch between client accounts without re-authenticating
+   - Add new accounts via browser OAuth
+   - Per-account token storage for security
 
 ---
 
@@ -49,8 +55,12 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
 | `get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
 | `submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
+| `list_accounts`                 | Shows all configured Google accounts                        | Nothing - just ask!                                             |
+| `add_account`                   | Adds a new Google account via browser OAuth                 | An alias (e.g., 'client-a')                                     |
+| `switch_account`                | Switches the active Google account                          | The alias of the account to switch to                           |
+| `remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
-*For a complete list of all 19 available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
+*For a complete list of all 24 available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
 
 ---
 
