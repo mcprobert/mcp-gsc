@@ -240,6 +240,27 @@ def _to_float_or_none(v: Any) -> Optional[float]:
         return None
 
 
+def _filter_value_eq(cell: Any, target: Any) -> bool:
+    """Equality comparison for filter values.
+
+    Only coerces numerically when the CALLER supplied a Python numeric
+    target (int or float, but not bool — bool is a subclass of int in
+    Python). String targets stay string-compared. This resolves the
+    {"status_code": 200.0} vs cell "200" gotcha without introducing
+    collapsing bugs for:
+      - string targets like "200" vs "200.0" (stay !=)
+      - leading-zero strings like "00123" (stay string)
+      - non-finite values like "nan" vs "nan" (stay == via string compare
+        — float('nan') == float('nan') is False per IEEE 754)
+    """
+    if isinstance(target, (int, float)) and not isinstance(target, bool):
+        a = _to_float_or_none(cell)
+        b = float(target)
+        if a is not None and math.isfinite(a) and math.isfinite(b):
+            return a == b
+    return str(cell) == str(target)
+
+
 def _detect_encoding(path: Path) -> str:
     """Peek the first 2 bytes to detect UTF-16LE (Windows SF exports) vs UTF-8-BOM (macOS/Linux).
     Returns an encoding name suitable for open()."""
@@ -352,7 +373,6 @@ def _resolve_sf_dir(path: Path) -> Path:
     """Prefer path/search_console subfolder (brief forwards-compat) if it contains
     search_console_*.csv; otherwise treat path as a flat SF export root.
     Raises ValueError if neither layout yields any search_console_*.csv files."""
-    candidates: List[Path] = []
     sc_sub = path / "search_console"
     if sc_sub.is_dir() and any(sc_sub.glob("search_console_*.csv")):
         return sc_sub
@@ -369,8 +389,16 @@ def _apply_sf_filter(
     filter_spec: Dict[str, Any],
 ) -> bool:
     """Apply a filter dict to a single row. Filter values can be:
-      - scalar (string/number): equality match (string-compared)
+      - scalar (string/number): equality match. Numeric comparison when
+        the scalar is a Python int/float; string comparison otherwise.
+        See _filter_value_eq for exact semantics.
       - dict: {"op": "eq"|"contains"|"gt"|"lt"|"gte"|"lte", "value": ...}
+
+    Equality (scalar form OR dict eq) uses _filter_value_eq, which only
+    coerces numerically when the caller passed a Python numeric target.
+    Ordered ops (gt/lt/gte/lte) always coerce both sides to float; rows
+    where either side fails to coerce are excluded.
+
     Unknown ops or columns raise ValueError (caller surfaces as tool error).
     """
     for col, spec in filter_spec.items():
@@ -381,7 +409,7 @@ def _apply_sf_filter(
             op = spec.get("op", "eq")
             target = spec.get("value")
             if op == "eq":
-                if str(cell) != str(target):
+                if not _filter_value_eq(cell, target):
                     return False
             elif op == "contains":
                 if str(target).lower() not in str(cell).lower():
@@ -402,7 +430,7 @@ def _apply_sf_filter(
             else:
                 raise ValueError(f"unsupported filter op: {op!r}")
         else:
-            if str(cell) != str(spec):
+            if not _filter_value_eq(cell, spec):
                 return False
     return True
 
@@ -958,24 +986,36 @@ async def batch_url_inspection(
     Inspect multiple URLs in batch (within API limits).
 
     Two ways to supply URLs:
-      1. Pass a newline-separated list in `urls` (original behavior).
-      2. Pass `from_session` pointing at a session loaded via gsc_load_from_sf_export.
-         The 'address' column of the specified dataset is used as the URL source.
-         Use `offset`/`limit` to paginate — each call still processes at most 10
-         URLs to respect the URL Inspection API quota.
+      1. Pass a newline-separated list in `urls` (original behavior). The
+         tool errors if more than 10 URLs are supplied.
+      2. Pass `from_session` pointing at a session loaded via
+         gsc_load_from_sf_export. The 'address' column of the specified
+         dataset is used as the URL source. Use `offset`/`limit` to
+         paginate — each call still processes at most 10 URLs to respect
+         the URL Inspection API quota.
 
     Args:
-        site_url: The URL of the site in Search Console (must be exact match, for domain properties use format: sc-domain:example.com)
-        urls: List of URLs to inspect, one per line. Optional if from_session is set.
-        from_session: Optional SF session id. When set, URLs are pulled from that session.
-        dataset: Dataset name within the SF session to pull URLs from (default 'search_console_all').
-        offset: Number of session URLs to skip before taking the next slice.
-        limit: Max URLs to process this call (clamped to 10 regardless).
+        site_url: The URL of the site in Search Console (exact match, or
+            sc-domain:example.com for domain properties).
+        urls: Newline-separated URL list. Optional when `from_session` is
+            set. When supplied directly, the tool errors if >10 URLs are
+            provided.
+        from_session: Optional SF session id. When set, URLs stream from
+            the session's dataset instead of `urls`.
+        dataset: Session-path only. Dataset name within the SF session
+            (default 'search_console_all'). Must match ^[a-z0-9_]+$ and
+            contain an 'address' column.
+        offset: Session-path only. Number of address rows to skip before
+            taking the next slice. Must be >= 0. Ignored when `urls` is
+            supplied directly.
+        limit: Session-path only. Max URLs to process this call. Must be
+            1-10; values > 10 are clamped to 10 with a note in the
+            response. Ignored when `urls` is supplied directly.
     """
     try:
-        service = get_gsc_service()
-
-        # Determine URL source. Session-based path takes priority when from_session is set.
+        # --- Phase 1: resolve URL list (no network) ---
+        # Session/input validation must fail fast WITHOUT authenticating so
+        # session errors don't get masked behind OAuth failures.
         clamp_note = ""
         next_offset_note = ""
         if from_session is not None:
@@ -994,10 +1034,19 @@ async def batch_url_inspection(
                     f"Available columns: {dataset_meta['columns']}"
                 )
 
-            # Clamp limit to API-friendly cap.
-            effective_limit = min(max(1, limit), 10)
+            # Explicit pagination validation. Reject limit<1 and negative
+            # offset rather than silently clamping to 1 (the old code did
+            # min(max(1, limit), 10) which hid these errors).
+            if offset < 0:
+                return f"Invalid offset: {offset}. Must be >= 0."
+            if limit < 1:
+                return (
+                    f"Invalid limit: {limit}. Must be >= 1 for URL inspection "
+                    "(each URL burns API quota)."
+                )
             if limit > 10:
                 clamp_note = f"Note: limit {limit} clamped to 10 for quota safety.\n"
+            effective_limit = min(limit, 10)
 
             # Stream the dataset, pull address values, slice.
             url_list: List[str] = []
@@ -1024,6 +1073,9 @@ async def batch_url_inspection(
 
         if len(url_list) > 10:
             return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
+
+        # --- Phase 2: authenticate and inspect ---
+        service = get_gsc_service()
 
         # Process each URL
         results = []
@@ -1624,6 +1676,7 @@ async def gsc_get_landing_page_summary(
     start_date: str = "90daysAgo",
     end_date: str = "yesterday",
     top_n: int = 25,
+    striking_distance_range: Tuple[float, float] = (11.0, 20.0),
     high_impression_min: int = 500,
     low_ctr_ratio: float = 0.5,
     country: Optional[str] = None,
@@ -1634,8 +1687,8 @@ async def gsc_get_landing_page_summary(
 
     Returns a compact dict (≤~3k tokens) instead of the markdown table that
     get_search_analytics produces, so callers can ingest top-N page data
-    without blowing the context window. Flags striking-distance pages
-    (position 11-20) and high-impression/low-CTR pages.
+    without blowing the context window. Flags striking-distance pages and
+    high-impression/low-CTR pages.
 
     Makes TWO API calls: one for site totals and site-average CTR, one for
     the top-N page rows. Site totals cannot be derived from the capped
@@ -1646,12 +1699,34 @@ async def gsc_get_landing_page_summary(
         start_date: Start of the window. Accepts 'today', 'yesterday', 'Ndaysago', or YYYY-MM-DD.
         end_date: End of the window. Same format as start_date.
         top_n: Number of landing pages to return (default 25).
+        striking_distance_range: Two-item [min, max] tuple/array for the
+            striking-distance flag (default (11.0, 20.0)). Must be finite
+            with min <= max. Accepts Python tuples or JSON lists.
         high_impression_min: Minimum impressions for the high-impression/low-CTR flag (default 500).
-        low_ctr_ratio: A page is flagged low-CTR when its CTR is below site_avg_ctr * this ratio (default 0.5).
+        low_ctr_ratio: A page is flagged low-CTR when its CTR is below site_avg_ctr * low_ctr_ratio (default 0.5).
         country: Optional ISO-3166 country filter (e.g. 'gbr').
         device: Optional device filter ('DESKTOP' | 'MOBILE' | 'TABLET').
     """
     try:
+        # Validate striking_distance_range up front so the error surfaces
+        # before any API call. Accept tuple or list (JSON clients send arrays).
+        try:
+            sd_lo_raw, sd_hi_raw = striking_distance_range
+            sd_lo = float(sd_lo_raw)
+            sd_hi = float(sd_hi_raw)
+        except (TypeError, ValueError):
+            return {
+                "ok": False,
+                "error": "striking_distance_range must be a two-item array/tuple [min, max]",
+                "tool": "gsc_get_landing_page_summary",
+            }
+        if not math.isfinite(sd_lo) or not math.isfinite(sd_hi) or sd_lo > sd_hi:
+            return {
+                "ok": False,
+                "error": "striking_distance_range must contain finite numbers with min <= max",
+                "tool": "gsc_get_landing_page_summary",
+            }
+
         try:
             resolved_start = _parse_gsc_date(start_date)
             resolved_end = _parse_gsc_date(end_date)
@@ -1728,7 +1803,7 @@ async def gsc_get_landing_page_summary(
                 "impressions": impressions,
                 "ctr": ctr,
                 "position": position,
-                "striking_distance_flag": 11.0 <= position <= 20.0,
+                "striking_distance_flag": sd_lo <= position <= sd_hi,
                 "high_impression_low_ctr_flag": (
                     impressions >= high_impression_min
                     and site_avg_ctr > 0
@@ -1744,7 +1819,7 @@ async def gsc_get_landing_page_summary(
             "site_totals": site_totals,
             "top_pages": top_pages,
             "thresholds": {
-                "striking_distance_range": [11.0, 20.0],
+                "striking_distance_range": [sd_lo, sd_hi],
                 "high_impression_min": high_impression_min,
                 "low_ctr_ratio": low_ctr_ratio,
                 "site_avg_ctr": site_avg_ctr,
@@ -1804,10 +1879,18 @@ async def gsc_compare_periods_landing_pages(
         limit: Max rows to return after sorting.
         decay_threshold_pct: clicks_pct threshold for decay_flag (default -0.20
             i.e. 20% click drop). Flag also requires position to have worsened.
-        sort_by: one of 'clicks_delta', 'clicks_pct', 'position_delta', 'impressions_delta'.
-        sort_direction: 'asc' or 'desc'.
+        sort_by: one of 'clicks_delta', 'clicks_pct', 'impressions_delta',
+            'impressions_pct', 'position_delta', 'ctr_delta'.
+        sort_direction: 'asc' or 'desc' (case-insensitive; normalized in the response).
     """
     try:
+        if limit < 1:
+            return {
+                "ok": False,
+                "error": "limit must be >= 1",
+                "tool": "gsc_compare_periods_landing_pages",
+            }
+
         try:
             a_start = _parse_gsc_date(period_a_start)
             a_end = _parse_gsc_date(period_a_end)
@@ -1825,6 +1908,14 @@ async def gsc_compare_periods_landing_pages(
             return {
                 "ok": False,
                 "error": f"invalid sort_by: {sort_by!r}. Valid: {sorted(valid_sort_keys)}",
+                "tool": "gsc_compare_periods_landing_pages",
+            }
+
+        direction_normalized = str(sort_direction).strip().lower()
+        if direction_normalized not in ("asc", "desc"):
+            return {
+                "ok": False,
+                "error": "sort_direction must be 'asc' or 'desc'",
                 "tool": "gsc_compare_periods_landing_pages",
             }
 
@@ -1922,7 +2013,7 @@ async def gsc_compare_periods_landing_pages(
         # Sort with None-safe helper: None values for the sort column always
         # appear LAST regardless of direction (the naive (group, value) key
         # gets flipped by reverse=True and puts None rows at the front).
-        diffs = _sort_landing_page_diffs(diffs, sort_by, sort_direction)
+        diffs = _sort_landing_page_diffs(diffs, sort_by, direction_normalized)
         sliced = diffs[:limit]
 
         return {
@@ -1935,7 +2026,7 @@ async def gsc_compare_periods_landing_pages(
                 "min_impressions": min_impressions,
                 "decay_threshold_pct": decay_threshold_pct,
             },
-            "sort": {"by": sort_by, "direction": sort_direction},
+            "sort": {"by": sort_by, "direction": direction_normalized},
             "total_matched": len(diffs),
             "truncated": len(diffs) > limit,
         }
@@ -2522,7 +2613,8 @@ async def gsc_health_check(site_url: str) -> Dict[str, Any]:
             "error": f"{type(e).__name__}: {e}",
         })
 
-    # Step 2: searchanalytics().query() — last data date via 7-day window sorted desc
+    # Step 2: searchanalytics().query() — find the latest date with data via a
+    # 7-day window. Default (ascending) order is fine; we pick the max date.
     try:
         today = datetime.now().date()
         week_ago = today - timedelta(days=7)
@@ -2536,10 +2628,16 @@ async def gsc_health_check(site_url: str) -> Dict[str, Any]:
             siteUrl=site_url, body=data_request
         ).execute()
         rows = data_response.get("rows", [])
-        if rows:
-            # Rows come back ascending by date; the latest is the tail.
-            dates = sorted(r.get("keys", [""])[0] for r in rows)
-            result["last_data_date"] = dates[-1] if dates else None
+        # Filter out rows with missing/empty keys so the max() below can't
+        # silently pick an empty string if the API ever returns junk.
+        valid_dates = [
+            r["keys"][0]
+            for r in rows
+            if r.get("keys") and r["keys"][0]
+        ]
+        if valid_dates:
+            # ISO date strings sort lex-correctly so max() is safe.
+            result["last_data_date"] = max(valid_dates)
             result["has_recent_data"] = True
         # An empty result is still a successful probe — the property simply
         # has no data for the window. Mark the probe as having executed.
@@ -2731,6 +2829,11 @@ async def gsc_query_sf_export(
         sort_direction: 'asc' or 'desc' (default 'desc').
         limit: Max rows to return (default 100).
         offset: Number of matched rows to skip before limit (default 0).
+
+    Note on non-finite values: inf and nan in a numeric column sort into the
+    non-numeric sentinel group (always last regardless of direction), but
+    remain comparable via gt/lt/gte/lte filters. If you need to exclude them
+    from filter results, combine with a bound such as {"op": "lt", "value": 1e308}.
     """
     try:
         if session_id not in _sf_sessions:

@@ -21,8 +21,13 @@ from gsc_server import (
     _detect_encoding,
     _parse_gsc_date,
     _sort_landing_page_diffs,
+    _filter_value_eq,
+    _read_account_scopes,
     gsc_load_from_sf_export,
     gsc_query_sf_export,
+    gsc_get_landing_page_summary,
+    gsc_compare_periods_landing_pages,
+    batch_url_inspection,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -63,6 +68,15 @@ class TestNormalizeColumn:
         assert a == "position"
         assert b == "position_2"
 
+    def test_avg_position_then_raw_position(self):
+        """Reverse of test_alias_then_dedupe_order: 'Avg. Position' first,
+        then 'Position' should also produce ['position', 'position_2']."""
+        seen: dict = {}
+        a = _normalize_column("Avg. Position", seen)
+        b = _normalize_column("Position", seen)
+        assert a == "position"
+        assert b == "position_2"
+
     def test_strips_bom(self):
         assert _normalize_column("\ufeffAddress", {}) == "address"
 
@@ -87,6 +101,64 @@ class TestToFloatOrNone:
     ])
     def test_coercion(self, raw, expected):
         assert _to_float_or_none(raw) == expected
+
+
+class TestFilterValueEq:
+    """Regression tests for Fix 5 — numeric-target-only eq coercion.
+
+    The helper must resolve the {"status_code": 200.0} vs cell "200" gotcha
+    while preserving string-equality semantics for string targets (so
+    "200" != "200.0"), leading-zero strings, and "nan" literals.
+    """
+
+    def test_float_target_matches_string_cell(self):
+        """The whole point of the fix."""
+        assert _filter_value_eq("200", 200.0) is True
+
+    def test_int_target_matches_string_cell(self):
+        assert _filter_value_eq("200", 200) is True
+
+    def test_string_target_string_cell_unchanged(self):
+        """String target with the same value: exact string match."""
+        assert _filter_value_eq("200", "200") is True
+
+    def test_string_target_different_formatting_stays_unequal(self):
+        """Open-gem blocker: '200' must NOT equal '200.0' when target is a string."""
+        assert _filter_value_eq("200", "200.0") is False
+        assert _filter_value_eq("200.0", "200") is False
+
+    def test_leading_zero_string_preserved(self):
+        """'00123' must not collapse to 123 when target is a string."""
+        assert _filter_value_eq("00123", "00123") is True
+        assert _filter_value_eq("00123", "123") is False
+
+    def test_leading_zero_string_vs_numeric_target(self):
+        """When caller passes numeric target 123, cell '00123' should coerce and match."""
+        assert _filter_value_eq("00123", 123) is True
+
+    def test_nan_string_stays_equal(self):
+        """'nan' vs 'nan' as strings: stays equal via string compare.
+        (float('nan') == float('nan') is False per IEEE 754, which would
+        regress this comparison if the numeric branch were used.)"""
+        assert _filter_value_eq("nan", "nan") is True
+
+    def test_string_column_unchanged(self):
+        """Pure string columns like 'indexability' still work."""
+        assert _filter_value_eq("Indexable", "Indexable") is True
+        assert _filter_value_eq("Indexable", "Non-Indexable") is False
+
+    def test_bool_target_not_treated_as_numeric(self):
+        """bool is a subclass of int in Python. Without the guard,
+        {"col": True} would coerce cells to float and break unexpectedly."""
+        # True != "1" via string compare (str(True) == 'True', not '1')
+        assert _filter_value_eq("1", True) is False
+        # But True == "True" via string compare
+        assert _filter_value_eq("True", True) is True
+
+    def test_non_finite_numeric_target_falls_back_to_string(self):
+        """If target is float('inf'), math.isfinite(b) is False so we fall
+        back to string compare. 'inf' == str(float('inf')) which is 'inf'."""
+        assert _filter_value_eq("inf", float("inf")) is True
 
 
 class TestExtractSnapshotDate:
@@ -330,6 +402,79 @@ class TestQuerySfExport:
         )
         # 301 and 404 rows
         assert result["total_matched"] == 2
+
+    async def test_filter_lt_numeric(self):
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": {"op": "lt", "value": 300}},
+        )
+        # Three 200 rows (home, about, noindex)
+        assert result["total_matched"] == 3
+
+    async def test_filter_gte_numeric(self):
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": {"op": "gte", "value": 301}},
+        )
+        # 301 and 404
+        assert result["total_matched"] == 2
+
+    async def test_filter_lte_numeric(self):
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": {"op": "lte", "value": 200}},
+        )
+        assert result["total_matched"] == 3
+
+    async def test_filter_unknown_op_surfaces_error(self):
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": {"op": "weird", "value": 200}},
+        )
+        assert result["ok"] is False
+        assert "unsupported filter op" in result["error"]
+
+    async def test_filter_eq_numeric_float_vs_string_cell(self):
+        """Regression test for Fix 5: {"status_code": {"op": "eq", "value": 200.0}}
+        against cell '200' must match. Before the fix this silently returned zero rows."""
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": {"op": "eq", "value": 200.0}},
+        )
+        assert result["ok"] is True
+        assert result["total_matched"] == 3
+
+    async def test_filter_eq_scalar_int_target(self):
+        """Scalar (non-dict) int target should also benefit from numeric coercion."""
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"status_code": 200},
+        )
+        assert result["ok"] is True
+        assert result["total_matched"] == 3
+
+    async def test_filter_eq_string_column_unchanged(self):
+        """String columns like 'indexability' still work after Fix 5."""
+        session_id = await self._load_flat()
+        result = await gsc_query_sf_export(
+            session_id=session_id,
+            dataset="search_console_all",
+            filter={"indexability": "Indexable"},
+        )
+        assert result["ok"] is True
+        assert result["total_matched"] == 2  # home + about
 
     async def test_numeric_sort_no_lex(self):
         """word_count column has values [1200, 800, 2500, 10, 100] — descending
@@ -635,3 +780,302 @@ class TestSortLandingPageDiffs:
         ]
         out = _sort_landing_page_diffs(rows, "clicks_pct", "desc")
         assert [r["page"] for r in out] == ["c", "a", "b"]
+
+
+# -------- Fix 3+4: batch_url_inspection validation + auth reorder --------
+
+class _AuthWouldFire(Exception):
+    """Raised by a monkeypatched get_gsc_service when validation should have
+    blocked the call. Catching this in tests proves validation executed
+    AFTER the auth-wall, which is the opposite of what Fix 4 wants."""
+
+
+class TestBatchUrlInspectionValidation:
+    """All tests here assert that validation errors surface WITHOUT calling
+    get_gsc_service. The fixture replaces the auth helper with a function
+    that raises _AuthWouldFire — if a test ever sees that exception, the
+    validation failed to run first."""
+
+    @pytest.fixture(autouse=True)
+    def _no_auth(self, monkeypatch):
+        def _explode():
+            raise _AuthWouldFire("get_gsc_service called before validation")
+        monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
+
+    # --- session-backed path ---
+
+    async def _load_flat_session(self):
+        result = await gsc_load_from_sf_export(
+            sf_export_path=str(FIXTURES / "sf_export_flat"),
+            site_url="https://example.com/",
+        )
+        return result["session_id"]
+
+    async def test_unknown_session(self):
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session="sf-does-not-exist",
+        )
+        assert "Unknown SF session_id" in result
+
+    async def test_invalid_dataset_name_path_traversal(self):
+        session_id = await self._load_flat_session()
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session=session_id,
+            dataset="../../etc/passwd",
+        )
+        assert "Invalid dataset name" in result
+
+    async def test_unknown_dataset_in_session(self):
+        session_id = await self._load_flat_session()
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session=session_id,
+            dataset="nonexistent",
+        )
+        assert "Unknown dataset" in result
+
+    async def test_reject_negative_offset(self):
+        session_id = await self._load_flat_session()
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session=session_id,
+            dataset="search_console_all",
+            offset=-1,
+        )
+        assert "Invalid offset" in result
+
+    async def test_reject_limit_zero(self):
+        session_id = await self._load_flat_session()
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session=session_id,
+            dataset="search_console_all",
+            limit=0,
+        )
+        assert "Invalid limit" in result
+
+    async def test_reject_negative_limit(self):
+        session_id = await self._load_flat_session()
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            from_session=session_id,
+            dataset="search_console_all",
+            limit=-5,
+        )
+        assert "Invalid limit" in result
+
+    # --- direct-urls path ---
+
+    async def test_empty_urls_returns_before_auth(self):
+        """Direct path: empty urls string must fail before the OAuth call."""
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            urls="",
+        )
+        assert result == "No URLs provided for inspection."
+
+    async def test_over_ten_direct_urls_returns_before_auth(self):
+        """Direct path: >10 URLs must surface the count error before auth."""
+        urls = "\n".join(f"https://example.com/p{i}" for i in range(11))
+        result = await batch_url_inspection(
+            site_url="https://example.com/",
+            urls=urls,
+        )
+        assert "Too many URLs provided" in result
+
+
+# -------- Fix 2: gsc_compare_periods_landing_pages validation --------
+
+class TestCompareLandingPagesValidation:
+    """Validation for limit, sort_by, and sort_direction. All tests use a
+    monkeypatched get_gsc_service that raises, proving validation fires
+    BEFORE authentication."""
+
+    @pytest.fixture(autouse=True)
+    def _no_auth(self, monkeypatch):
+        def _explode():
+            raise _AuthWouldFire("get_gsc_service called before validation")
+        monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
+
+    async def test_reject_limit_zero(self):
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="180daysago", period_a_end="91daysago",
+            period_b_start="90daysago", period_b_end="yesterday",
+            limit=0,
+        )
+        assert result["ok"] is False
+        assert "limit must be >= 1" in result["error"]
+
+    async def test_reject_negative_limit(self):
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="180daysago", period_a_end="91daysago",
+            period_b_start="90daysago", period_b_end="yesterday",
+            limit=-5,
+        )
+        assert result["ok"] is False
+        assert "limit must be >= 1" in result["error"]
+
+    async def test_reject_invalid_sort_by(self):
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="180daysago", period_a_end="91daysago",
+            period_b_start="90daysago", period_b_end="yesterday",
+            sort_by="bogus",
+        )
+        assert result["ok"] is False
+        assert "invalid sort_by" in result["error"]
+
+    async def test_reject_invalid_sort_direction(self):
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="180daysago", period_a_end="91daysago",
+            period_b_start="90daysago", period_b_end="yesterday",
+            sort_direction="descending",  # should be 'desc' not 'descending'
+        )
+        assert result["ok"] is False
+        assert "sort_direction must be 'asc' or 'desc'" in result["error"]
+
+    async def test_reject_invalid_date(self):
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="not a date", period_a_end="yesterday",
+            period_b_start="7daysago", period_b_end="yesterday",
+        )
+        assert result["ok"] is False
+        # _parse_gsc_date delegates to datetime.strptime which raises
+        # "time data 'not a date' does not match format '%Y-%m-%d'"
+        assert "does not match format" in result["error"] or "invalid date" in result["error"]
+
+    async def test_sort_direction_uppercase_would_pass_validation(self, monkeypatch):
+        """The normalize-then-validate order means 'DESC' should PASS validation
+        and reach the auth wall (which explodes). This proves the
+        str().strip().lower() normalization works before the whitelist check."""
+        result = await gsc_compare_periods_landing_pages(
+            site_url="https://example.com/",
+            period_a_start="180daysago", period_a_end="91daysago",
+            period_b_start="90daysago", period_b_end="yesterday",
+            sort_direction="DESC",
+        )
+        # Either the auth-wall explodes (proving we passed validation), or
+        # the response surfaces the _AuthWouldFire message through the outer
+        # except-block. Either way it's NOT a sort_direction validation error.
+        assert "sort_direction must be" not in str(result)
+
+
+# -------- Fix 1: gsc_get_landing_page_summary striking_distance_range --------
+
+class TestLandingPageSummaryValidation:
+    """Validation paths for the restored striking_distance_range parameter.
+    All tests use a monkeypatched get_gsc_service that raises, proving the
+    validation error surfaces before any API call."""
+
+    @pytest.fixture(autouse=True)
+    def _no_auth(self, monkeypatch):
+        def _explode():
+            raise _AuthWouldFire("get_gsc_service called before validation")
+        monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
+
+    async def test_reject_reversed_range(self):
+        """min > max must be rejected with the finite-and-ordered error."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=(20.0, 10.0),
+        )
+        assert result["ok"] is False
+        assert "min <= max" in result["error"]
+
+    async def test_reject_wrong_length_range(self):
+        """A one-item tuple must be rejected on unpack with the two-item error."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=(5.0,),
+        )
+        assert result["ok"] is False
+        assert "two-item" in result["error"]
+
+    async def test_reject_non_numeric_range(self):
+        """String values must fail the float() coercion."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=("a", "b"),
+        )
+        assert result["ok"] is False
+        assert "two-item" in result["error"]
+
+    async def test_reject_non_finite_range(self):
+        """inf values must be rejected by the math.isfinite check."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=(float("inf"), 20.0),
+        )
+        assert result["ok"] is False
+        assert "min <= max" in result["error"] or "finite" in result["error"]
+
+    async def test_reject_nan_range(self):
+        """NaN values must be rejected by the math.isfinite check.
+        Note that NaN is excluded via isfinite BEFORE the lo > hi check
+        (which would otherwise be False because all NaN comparisons are False)."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=(float("nan"), 20.0),
+        )
+        assert result["ok"] is False
+
+    async def test_list_range_accepted_as_input(self):
+        """JSON clients send arrays, not tuples — validation should accept
+        [5.0, 15.0]. Validation passes and execution reaches get_gsc_service,
+        which the fixture replaces with a function that raises _AuthWouldFire.
+        The tool's outer except-Exception handler catches that and returns an
+        error dict mentioning the exception name — which is our signal that
+        we got past validation."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+            striking_distance_range=[5.0, 15.0],
+        )
+        assert result["ok"] is False
+        assert "_AuthWouldFire" in result["error"]
+        # And critically, NOT a striking_distance_range validation error:
+        assert "striking_distance_range" not in result["error"]
+
+    async def test_default_range_reaches_auth(self):
+        """With no striking_distance_range passed, the default (11.0, 20.0)
+        is valid and execution reaches get_gsc_service (proved the same way)."""
+        result = await gsc_get_landing_page_summary(
+            site_url="https://example.com/",
+        )
+        assert result["ok"] is False
+        assert "_AuthWouldFire" in result["error"]
+        assert "striking_distance_range" not in result["error"]
+
+
+# -------- _read_account_scopes pure-logic tests --------
+
+class TestReadAccountScopes:
+    """The helper must never leak exceptions or refresh tokens — all
+    failure modes return ['<unavailable>']."""
+
+    def test_none_path(self):
+        assert _read_account_scopes(None) == ["<unavailable>"]
+
+    def test_empty_string_path(self):
+        assert _read_account_scopes("") == ["<unavailable>"]
+
+    def test_nonexistent_relative_path(self):
+        assert _read_account_scopes("accounts/definitely-not-there/token.json") == ["<unavailable>"]
+
+    def test_nonexistent_absolute_path(self, tmp_path):
+        p = tmp_path / "missing.json"
+        assert _read_account_scopes(str(p)) == ["<unavailable>"]
+
+    def test_corrupt_json_swallows_exception(self, tmp_path):
+        """A malformed JSON token file must surface as <unavailable> WITHOUT
+        leaking the underlying exception message (which could contain token
+        material if Credentials ever stringifies its input)."""
+        p = tmp_path / "bad.json"
+        p.write_text("not valid json {{{")
+        result = _read_account_scopes(str(p))
+        assert result == ["<unavailable>"]
