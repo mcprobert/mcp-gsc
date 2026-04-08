@@ -1,9 +1,14 @@
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 import os
 import json
 import re
 import shutil
+import csv
+import heapq
+import math
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from uuid import uuid4
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -51,6 +56,20 @@ OAUTH_SCOPES = SCOPES + [
 ACCOUNTS_DIR = os.path.join(SCRIPT_DIR, "accounts")
 ACCOUNTS_MANIFEST = os.path.join(ACCOUNTS_DIR, "accounts.json")
 _active_account: Optional[str] = None
+
+# --- Screaming Frog CSV bridge (Add 1) ---
+# Sessions hold file paths and metadata only. Rows stream from disk at query time
+# to avoid OOM on large exports (internal_all.csv can be 60MB+ and 1100+ columns).
+_sf_sessions: Dict[str, Dict[str, Any]] = {}
+_SF_FILE_SIZE_WARNING_BYTES = 150 * 1024 * 1024  # 150 MB informational warning
+_ALLOWED_DATASET_RE = re.compile(r"^[a-z0-9_]+$")  # path traversal guard
+_COLUMN_ALIAS = {
+    "avg_position": "position",
+    "average_position": "position",
+}
+_SF_TIMESTAMP_RE = re.compile(
+    r"(\d{4})[.\-_](\d{2})[.\-_](\d{2})[.\-_]\d{2}[.\-_]\d{2}[.\-_]\d{2}"
+)
 
 
 # --- Multi-account helpers ---
@@ -165,6 +184,229 @@ def _maybe_migrate_legacy_token() -> None:
     _active_account = "default"
 
 
+# --- Shared date helper (used by landing-page tools) ---
+
+def _parse_gsc_date(s: str) -> str:
+    """Accepts 'today', 'yesterday', 'Ndaysago' (case-insensitive), or 'YYYY-MM-DD'.
+    Returns an ISO date string (YYYY-MM-DD). Raises ValueError on unrecognised input.
+    """
+    if not isinstance(s, str) or not s.strip():
+        raise ValueError(f"invalid date: {s!r}")
+    normalized = s.strip().lower()
+    today = datetime.now().date()
+    if normalized == "today":
+        return today.isoformat()
+    if normalized == "yesterday":
+        return (today - timedelta(days=1)).isoformat()
+    m = re.fullmatch(r"(\d+)daysago", normalized)
+    if m:
+        return (today - timedelta(days=int(m.group(1)))).isoformat()
+    # Assume ISO date; validate strictly
+    datetime.strptime(s.strip(), "%Y-%m-%d")
+    return s.strip()
+
+
+def _sort_landing_page_diffs(
+    diffs: List[Dict[str, Any]],
+    sort_by: str,
+    sort_direction: str,
+) -> List[Dict[str, Any]]:
+    """Sort landing-page delta rows, keeping None values for the sort column
+    at the tail regardless of ascending/descending direction.
+
+    The naive `(group, value)` sort key gets flipped by `reverse=True` and
+    puts None rows at the FRONT of descending sorts. Partition-and-concatenate
+    avoids that by sorting real values in-place and appending None rows as a
+    tail that direction never touches.
+    """
+    real_rows = [r for r in diffs if r.get(sort_by) is not None]
+    none_rows = [r for r in diffs if r.get(sort_by) is None]
+    real_rows.sort(
+        key=lambda r: float(r[sort_by]),
+        reverse=(sort_direction.lower() == "desc"),
+    )
+    return real_rows + none_rows
+
+
+# --- Screaming Frog CSV bridge helpers ---
+
+def _to_float_or_none(v: Any) -> Optional[float]:
+    """Coerce a value to float, returning None on failure. Used in sort keys and numeric filters."""
+    if v is None or v == "":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _detect_encoding(path: Path) -> str:
+    """Peek the first 2 bytes to detect UTF-16LE (Windows SF exports) vs UTF-8-BOM (macOS/Linux).
+    Returns an encoding name suitable for open()."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(2)
+    except OSError:
+        return "utf-8-sig"
+    if head == b"\xff\xfe":
+        return "utf-16"
+    return "utf-8-sig"
+
+
+def _normalize_column(raw: str, seen: Dict[str, int]) -> str:
+    """Normalize a CSV header to a snake_case key.
+
+    Order of operations is intentional:
+      1. strip BOM/quotes, lowercase
+      2. collapse whitespace/dots/hyphens/slashes to underscore
+      3. drop non-alphanumeric
+      4. apply semantic alias (Avg. Position -> position)
+      5. dedupe via `seen` (position, position_2, ...)
+    Alias BEFORE dedupe prevents 'Avg. Position' from stomping an existing 'position' column.
+    """
+    s = raw.lstrip("\ufeff").strip().strip('"').lower()
+    s = re.sub(r"[ \.\-/]+", "_", s)
+    s = re.sub(r"[^a-z0-9_]", "", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    if not s:
+        s = "col"
+    # Apply alias BEFORE dedupe so aliased name participates in dedupe.
+    s = _COLUMN_ALIAS.get(s, s)
+    if s in seen:
+        seen[s] += 1
+        return f"{s}_{seen[s]}"
+    seen[s] = 1
+    return s
+
+
+def _extract_snapshot_date(path: Path) -> Optional[str]:
+    """Parse YYYY-MM-DD from a Screaming Frog timestamped folder name like 2026.04.08.09.04.01.
+    Checks the given path's own name first, then its parent. None if no match."""
+    for candidate in (path.name, path.parent.name if path.parent != path else ""):
+        if not candidate:
+            continue
+        m = _SF_TIMESTAMP_RE.search(candidate)
+        if m:
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+    return None
+
+
+def _peek_sf_csv(path: Path) -> Dict[str, Any]:
+    """Read the header, normalize columns, and count rows by streaming the file once.
+    Returns metadata only — no row data is buffered."""
+    encoding = _detect_encoding(path)
+    try:
+        with open(path, "r", encoding=encoding, newline="") as f:
+            reader = csv.reader(f)
+            try:
+                header = next(reader)
+            except StopIteration:
+                return {
+                    "columns": [],
+                    "row_count": 0,
+                    "empty": True,
+                    "file": str(path),
+                    "encoding": encoding,
+                    "file_size": path.stat().st_size if path.exists() else 0,
+                }
+            seen: Dict[str, int] = {}
+            columns = [_normalize_column(h, seen) for h in header]
+            row_count = sum(1 for _ in reader)
+    except UnicodeDecodeError as e:
+        raise ValueError(f"could not decode {path.name} with {encoding}: {e}")
+    return {
+        "columns": columns,
+        "row_count": row_count,
+        "empty": row_count == 0,
+        "file": str(path),
+        "encoding": encoding,
+        "file_size": path.stat().st_size,
+    }
+
+
+def _stream_sf_csv(
+    dataset_meta: Dict[str, Any],
+) -> Iterator[Dict[str, str]]:
+    """Stream rows from a dataset's CSV file. Uses pre-normalized column names so
+    subsequent filter/sort operations work on snake_case keys."""
+    file_path = dataset_meta["file"]
+    encoding = dataset_meta["encoding"]
+    columns = dataset_meta["columns"]
+    with open(file_path, "r", encoding=encoding, newline="") as f:
+        reader = csv.reader(f)
+        try:
+            next(reader)  # skip header — we use our normalized columns instead
+        except StopIteration:
+            return
+        n_cols = len(columns)
+        for raw in reader:
+            # Pad or truncate defensively so zip doesn't silently drop columns.
+            if len(raw) < n_cols:
+                raw = raw + [""] * (n_cols - len(raw))
+            elif len(raw) > n_cols:
+                raw = raw[:n_cols]
+            yield dict(zip(columns, raw))
+
+
+def _resolve_sf_dir(path: Path) -> Path:
+    """Prefer path/search_console subfolder (brief forwards-compat) if it contains
+    search_console_*.csv; otherwise treat path as a flat SF export root.
+    Raises ValueError if neither layout yields any search_console_*.csv files."""
+    candidates: List[Path] = []
+    sc_sub = path / "search_console"
+    if sc_sub.is_dir() and any(sc_sub.glob("search_console_*.csv")):
+        return sc_sub
+    if any(path.glob("search_console_*.csv")):
+        return path
+    raise ValueError(
+        f"no search_console_*.csv files found in {path} or {sc_sub}. "
+        "Is this a Screaming Frog export folder?"
+    )
+
+
+def _apply_sf_filter(
+    row: Dict[str, str],
+    filter_spec: Dict[str, Any],
+) -> bool:
+    """Apply a filter dict to a single row. Filter values can be:
+      - scalar (string/number): equality match (string-compared)
+      - dict: {"op": "eq"|"contains"|"gt"|"lt"|"gte"|"lte", "value": ...}
+    Unknown ops or columns raise ValueError (caller surfaces as tool error).
+    """
+    for col, spec in filter_spec.items():
+        if col not in row:
+            raise ValueError(f"unknown column in filter: {col!r}")
+        cell = row[col]
+        if isinstance(spec, dict):
+            op = spec.get("op", "eq")
+            target = spec.get("value")
+            if op == "eq":
+                if str(cell) != str(target):
+                    return False
+            elif op == "contains":
+                if str(target).lower() not in str(cell).lower():
+                    return False
+            elif op in ("gt", "lt", "gte", "lte"):
+                a = _to_float_or_none(cell)
+                b = _to_float_or_none(target)
+                if a is None or b is None:
+                    return False
+                if op == "gt" and not (a > b):
+                    return False
+                if op == "lt" and not (a < b):
+                    return False
+                if op == "gte" and not (a >= b):
+                    return False
+                if op == "lte" and not (a <= b):
+                    return False
+            else:
+                raise ValueError(f"unsupported filter op: {op!r}")
+        else:
+            if str(cell) != str(spec):
+                return False
+    return True
+
+
 def get_gsc_service():
     """
     Returns an authorized Search Console service object.
@@ -257,9 +499,14 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
     return build("searchconsole", "v1", credentials=creds)
 
 @mcp.tool()
-async def list_properties() -> str:
+async def list_properties(name_contains: Optional[str] = None) -> str:
     """
     Retrieves and returns the user's Search Console properties.
+
+    Args:
+        name_contains: Optional case-insensitive substring filter on the site URL.
+            Useful when an account has many verified properties and you want
+            just the one matching a client name (e.g. name_contains='whitehat').
     """
     try:
         service = get_gsc_service()
@@ -274,7 +521,13 @@ async def list_properties() -> str:
         # }
         sites = site_list.get("siteEntry", [])
 
+        if name_contains:
+            needle = name_contains.lower()
+            sites = [s for s in sites if needle in s.get("siteUrl", "").lower()]
+
         if not sites:
+            if name_contains:
+                return f"No Search Console properties matching {name_contains!r}."
             return "No Search Console properties found."
 
         # Format the results for easy reading
@@ -693,26 +946,85 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         return f"Error inspecting URL: {str(e)}"
 
 @mcp.tool()
-async def batch_url_inspection(site_url: str, urls: str) -> str:
+async def batch_url_inspection(
+    site_url: str,
+    urls: str = "",
+    from_session: Optional[str] = None,
+    dataset: str = "search_console_all",
+    offset: int = 0,
+    limit: int = 10,
+) -> str:
     """
     Inspect multiple URLs in batch (within API limits).
-    
+
+    Two ways to supply URLs:
+      1. Pass a newline-separated list in `urls` (original behavior).
+      2. Pass `from_session` pointing at a session loaded via gsc_load_from_sf_export.
+         The 'address' column of the specified dataset is used as the URL source.
+         Use `offset`/`limit` to paginate — each call still processes at most 10
+         URLs to respect the URL Inspection API quota.
+
     Args:
         site_url: The URL of the site in Search Console (must be exact match, for domain properties use format: sc-domain:example.com)
-        urls: List of URLs to inspect, one per line
+        urls: List of URLs to inspect, one per line. Optional if from_session is set.
+        from_session: Optional SF session id. When set, URLs are pulled from that session.
+        dataset: Dataset name within the SF session to pull URLs from (default 'search_console_all').
+        offset: Number of session URLs to skip before taking the next slice.
+        limit: Max URLs to process this call (clamped to 10 regardless).
     """
     try:
         service = get_gsc_service()
-        
-        # Parse URLs
-        url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
+
+        # Determine URL source. Session-based path takes priority when from_session is set.
+        clamp_note = ""
+        next_offset_note = ""
+        if from_session is not None:
+            if from_session not in _sf_sessions:
+                return f"Unknown SF session_id: {from_session!r}"
+            session = _sf_sessions[from_session]
+            if not _ALLOWED_DATASET_RE.match(dataset):
+                return f"Invalid dataset name: {dataset!r} (must match ^[a-z0-9_]+$)"
+            if dataset not in session["datasets"]:
+                available = sorted(session["datasets"].keys())
+                return f"Unknown dataset {dataset!r} in session {from_session!r}. Available: {available}"
+            dataset_meta = session["datasets"][dataset]
+            if "address" not in dataset_meta["columns"]:
+                return (
+                    f"Dataset {dataset!r} has no 'address' column. "
+                    f"Available columns: {dataset_meta['columns']}"
+                )
+
+            # Clamp limit to API-friendly cap.
+            effective_limit = min(max(1, limit), 10)
+            if limit > 10:
+                clamp_note = f"Note: limit {limit} clamped to 10 for quota safety.\n"
+
+            # Stream the dataset, pull address values, slice.
+            url_list: List[str] = []
+            skipped = 0
+            for row in _stream_sf_csv(dataset_meta):
+                addr = row.get("address", "").strip()
+                if not addr:
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                url_list.append(addr)
+                if len(url_list) >= effective_limit:
+                    break
+
+            next_offset = offset + len(url_list)
+            next_offset_note = f"\nNext offset: {next_offset}"
+        else:
+            # Parse URLs from the `urls` string (original behavior).
+            url_list = [url.strip() for url in urls.split('\n') if url.strip()]
+
         if not url_list:
             return "No URLs provided for inspection."
-        
+
         if len(url_list) > 10:
             return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
+
         # Process each URL
         results = []
         
@@ -759,10 +1071,11 @@ async def batch_url_inspection(site_url: str, urls: str) -> str:
             
             except Exception as e:
                 results.append(f"{page_url}: Error - {str(e)}")
-        
+
         # Combine results
-        return f"Batch URL Inspection Results for {site_url}:\n\n" + "\n".join(results)
-    
+        header = clamp_note + f"Batch URL Inspection Results for {site_url}:\n\n"
+        return header + "\n".join(results) + next_offset_note
+
     except Exception as e:
         return f"Error performing batch inspection: {str(e)}"
 
@@ -1302,6 +1615,349 @@ async def get_search_by_page_query(
     except Exception as e:
         return f"Error retrieving page query data: {str(e)}"
 
+
+# --- Aggregated landing-page tools (Adds 2 + 3) ---
+
+@mcp.tool()
+async def gsc_get_landing_page_summary(
+    site_url: str,
+    start_date: str = "90daysAgo",
+    end_date: str = "yesterday",
+    top_n: int = 25,
+    high_impression_min: int = 500,
+    low_ctr_ratio: float = 0.5,
+    country: Optional[str] = None,
+    device: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Server-side aggregated summary of top landing pages for a GSC property.
+
+    Returns a compact dict (≤~3k tokens) instead of the markdown table that
+    get_search_analytics produces, so callers can ingest top-N page data
+    without blowing the context window. Flags striking-distance pages
+    (position 11-20) and high-impression/low-CTR pages.
+
+    Makes TWO API calls: one for site totals and site-average CTR, one for
+    the top-N page rows. Site totals cannot be derived from the capped
+    per-page response because the long tail gets excluded.
+
+    Args:
+        site_url: The GSC site URL (exact match; for domain properties use sc-domain:example.com).
+        start_date: Start of the window. Accepts 'today', 'yesterday', 'Ndaysago', or YYYY-MM-DD.
+        end_date: End of the window. Same format as start_date.
+        top_n: Number of landing pages to return (default 25).
+        high_impression_min: Minimum impressions for the high-impression/low-CTR flag (default 500).
+        low_ctr_ratio: A page is flagged low-CTR when its CTR is below site_avg_ctr * this ratio (default 0.5).
+        country: Optional ISO-3166 country filter (e.g. 'gbr').
+        device: Optional device filter ('DESKTOP' | 'MOBILE' | 'TABLET').
+    """
+    try:
+        try:
+            resolved_start = _parse_gsc_date(start_date)
+            resolved_end = _parse_gsc_date(end_date)
+        except ValueError as e:
+            return {"ok": False, "error": str(e), "tool": "gsc_get_landing_page_summary"}
+
+        service = get_gsc_service()
+
+        # Build common filter group (country + device) if needed.
+        filter_group: Optional[Dict[str, Any]] = None
+        if country or device:
+            filters: List[Dict[str, Any]] = []
+            if country:
+                filters.append({"dimension": "country", "operator": "equals", "expression": country})
+            if device:
+                filters.append({"dimension": "device", "operator": "equals", "expression": device.upper()})
+            filter_group = {"filters": filters}
+
+        # Call 1: site totals
+        totals_request: Dict[str, Any] = {
+            "startDate": resolved_start,
+            "endDate": resolved_end,
+            "dimensions": [],
+            "rowLimit": 1,
+        }
+        if filter_group:
+            totals_request["dimensionFilterGroups"] = [filter_group]
+
+        totals_response = service.searchanalytics().query(
+            siteUrl=site_url, body=totals_request
+        ).execute()
+
+        totals_rows = totals_response.get("rows", [])
+        if totals_rows:
+            t = totals_rows[0]
+            site_totals = {
+                "clicks": int(t.get("clicks", 0)),
+                "impressions": int(t.get("impressions", 0)),
+                "ctr": float(t.get("ctr", 0.0)),
+                "position": float(t.get("position", 0.0)),
+            }
+        else:
+            site_totals = {"clicks": 0, "impressions": 0, "ctr": 0.0, "position": 0.0}
+
+        site_avg_ctr = site_totals["ctr"]
+
+        # Call 2: top-N landing pages by clicks
+        pages_request: Dict[str, Any] = {
+            "startDate": resolved_start,
+            "endDate": resolved_end,
+            "dimensions": ["page"],
+            "rowLimit": max(1, min(top_n, 25000)),
+            "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}],
+        }
+        if filter_group:
+            pages_request["dimensionFilterGroups"] = [filter_group]
+
+        pages_response = service.searchanalytics().query(
+            siteUrl=site_url, body=pages_request
+        ).execute()
+
+        top_pages: List[Dict[str, Any]] = []
+        for row in pages_response.get("rows", []):
+            keys = row.get("keys", [])
+            page = keys[0] if keys else ""
+            clicks = int(row.get("clicks", 0))
+            impressions = int(row.get("impressions", 0))
+            ctr = float(row.get("ctr", 0.0))
+            position = float(row.get("position", 0.0))
+            low_ctr_threshold = site_avg_ctr * low_ctr_ratio if site_avg_ctr > 0 else 0.0
+            top_pages.append({
+                "page": page,
+                "clicks": clicks,
+                "impressions": impressions,
+                "ctr": ctr,
+                "position": position,
+                "striking_distance_flag": 11.0 <= position <= 20.0,
+                "high_impression_low_ctr_flag": (
+                    impressions >= high_impression_min
+                    and site_avg_ctr > 0
+                    and ctr < low_ctr_threshold
+                ),
+            })
+
+        return {
+            "ok": True,
+            "site_url": site_url,
+            "start_date": resolved_start,
+            "end_date": resolved_end,
+            "site_totals": site_totals,
+            "top_pages": top_pages,
+            "thresholds": {
+                "striking_distance_range": [11.0, 20.0],
+                "high_impression_min": high_impression_min,
+                "low_ctr_ratio": low_ctr_ratio,
+                "site_avg_ctr": site_avg_ctr,
+            },
+            "filters": {"country": country, "device": device},
+        }
+    except HttpError as e:
+        try:
+            error_content = json.loads(e.content.decode("utf-8"))
+            message = error_content.get("error", {}).get("message", str(e))
+        except Exception:
+            message = str(e)
+        return {
+            "ok": False,
+            "error": f"HTTP {e.resp.status}: {message}",
+            "tool": "gsc_get_landing_page_summary",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "tool": "gsc_get_landing_page_summary",
+        }
+
+
+@mcp.tool()
+async def gsc_compare_periods_landing_pages(
+    site_url: str,
+    period_a_start: str,
+    period_a_end: str,
+    period_b_start: str,
+    period_b_end: str,
+    min_impressions: int = 100,
+    limit: int = 50,
+    decay_threshold_pct: float = -0.20,
+    sort_by: str = "clicks_delta",
+    sort_direction: str = "asc",
+) -> Dict[str, Any]:
+    """
+    Landing-page-keyed period-vs-period comparison with explicit delta columns
+    and a decay_flag suitable for content-rot detection.
+
+    Queries GSC twice (one per period) with dimensions=['page'], joins on page
+    URL, computes deltas, filters by min_impressions (OR across periods so
+    both decayers and new winners survive), and returns a sorted list.
+
+    Sort is configurable so the same primitive serves both audit flows:
+      - Content rot / decay:  sort_by='clicks_delta',  sort_direction='asc'  (default)
+      - Top risers:           sort_by='clicks_delta',  sort_direction='desc'
+
+    Args:
+        site_url: GSC site URL.
+        period_a_start/end: Start/end dates for the earlier period. Accepts
+            'today'/'yesterday'/'Ndaysago'/YYYY-MM-DD.
+        period_b_start/end: Start/end dates for the later period.
+        min_impressions: Keep rows where period_a OR period_b impressions >= this.
+        limit: Max rows to return after sorting.
+        decay_threshold_pct: clicks_pct threshold for decay_flag (default -0.20
+            i.e. 20% click drop). Flag also requires position to have worsened.
+        sort_by: one of 'clicks_delta', 'clicks_pct', 'position_delta', 'impressions_delta'.
+        sort_direction: 'asc' or 'desc'.
+    """
+    try:
+        try:
+            a_start = _parse_gsc_date(period_a_start)
+            a_end = _parse_gsc_date(period_a_end)
+            b_start = _parse_gsc_date(period_b_start)
+            b_end = _parse_gsc_date(period_b_end)
+        except ValueError as e:
+            return {"ok": False, "error": str(e), "tool": "gsc_compare_periods_landing_pages"}
+
+        valid_sort_keys = {
+            "clicks_delta", "clicks_pct",
+            "impressions_delta", "impressions_pct",
+            "position_delta", "ctr_delta",
+        }
+        if sort_by not in valid_sort_keys:
+            return {
+                "ok": False,
+                "error": f"invalid sort_by: {sort_by!r}. Valid: {sorted(valid_sort_keys)}",
+                "tool": "gsc_compare_periods_landing_pages",
+            }
+
+        service = get_gsc_service()
+
+        def _query(start: str, end: str) -> List[Dict[str, Any]]:
+            req = {
+                "startDate": start,
+                "endDate": end,
+                "dimensions": ["page"],
+                "rowLimit": 25000,
+            }
+            resp = service.searchanalytics().query(siteUrl=site_url, body=req).execute()
+            return resp.get("rows", [])
+
+        a_rows = _query(a_start, a_end)
+        b_rows = _query(b_start, b_end)
+
+        # Index by page URL (single-dim 'keys' tuple). Reuses the pattern from
+        # compare_search_periods at gsc_server.py:1155-1156.
+        a_by_page = {tuple(r.get("keys", [])): r for r in a_rows}
+        b_by_page = {tuple(r.get("keys", [])): r for r in b_rows}
+        all_pages = set(a_by_page.keys()) | set(b_by_page.keys())
+
+        def _metric(row: Optional[Dict[str, Any]], key: str, default: float = 0.0) -> float:
+            if row is None:
+                return default
+            return float(row.get(key, default))
+
+        def _period_totals(rows: List[Dict[str, Any]]) -> Dict[str, float]:
+            clicks = sum(int(r.get("clicks", 0)) for r in rows)
+            impressions = sum(int(r.get("impressions", 0)) for r in rows)
+            ctr = (clicks / impressions) if impressions > 0 else 0.0
+            # Impression-weighted average position
+            if impressions > 0:
+                position = sum(
+                    float(r.get("position", 0.0)) * int(r.get("impressions", 0))
+                    for r in rows
+                ) / impressions
+            else:
+                position = 0.0
+            return {"clicks": clicks, "impressions": impressions, "ctr": ctr, "position": position}
+
+        diffs: List[Dict[str, Any]] = []
+        for page_key in all_pages:
+            a_row = a_by_page.get(page_key)
+            b_row = b_by_page.get(page_key)
+            a_impr = int(_metric(a_row, "impressions"))
+            b_impr = int(_metric(b_row, "impressions"))
+
+            # OR semantics on min_impressions: keep rows where either period clears the bar.
+            if a_impr < min_impressions and b_impr < min_impressions:
+                continue
+
+            a_clicks = int(_metric(a_row, "clicks"))
+            b_clicks = int(_metric(b_row, "clicks"))
+            a_ctr = _metric(a_row, "ctr")
+            b_ctr = _metric(b_row, "ctr")
+            a_pos = _metric(a_row, "position")
+            b_pos = _metric(b_row, "position")
+
+            clicks_delta = b_clicks - a_clicks
+            impressions_delta = b_impr - a_impr
+            ctr_delta = b_ctr - a_ctr
+            position_delta = b_pos - a_pos  # positive = worse (further down)
+
+            clicks_pct = (clicks_delta / a_clicks) if a_clicks > 0 else None
+            impressions_pct = (impressions_delta / a_impr) if a_impr > 0 else None
+
+            decay_flag = (
+                clicks_pct is not None
+                and clicks_pct < decay_threshold_pct
+                and position_delta > 0
+            )
+
+            diffs.append({
+                "page": page_key[0] if page_key else "",
+                "a_clicks": a_clicks,
+                "b_clicks": b_clicks,
+                "clicks_delta": clicks_delta,
+                "clicks_pct": clicks_pct,
+                "a_impressions": a_impr,
+                "b_impressions": b_impr,
+                "impressions_delta": impressions_delta,
+                "impressions_pct": impressions_pct,
+                "a_ctr": a_ctr,
+                "b_ctr": b_ctr,
+                "ctr_delta": ctr_delta,
+                "a_position": a_pos,
+                "b_position": b_pos,
+                "position_delta": position_delta,
+                "decay_flag": decay_flag,
+            })
+
+        # Sort with None-safe helper: None values for the sort column always
+        # appear LAST regardless of direction (the naive (group, value) key
+        # gets flipped by reverse=True and puts None rows at the front).
+        diffs = _sort_landing_page_diffs(diffs, sort_by, sort_direction)
+        sliced = diffs[:limit]
+
+        return {
+            "ok": True,
+            "site_url": site_url,
+            "period_a": {"start": a_start, "end": a_end, "totals": _period_totals(a_rows)},
+            "period_b": {"start": b_start, "end": b_end, "totals": _period_totals(b_rows)},
+            "rows": sliced,
+            "thresholds": {
+                "min_impressions": min_impressions,
+                "decay_threshold_pct": decay_threshold_pct,
+            },
+            "sort": {"by": sort_by, "direction": sort_direction},
+            "total_matched": len(diffs),
+            "truncated": len(diffs) > limit,
+        }
+    except HttpError as e:
+        try:
+            error_content = json.loads(e.content.decode("utf-8"))
+            message = error_content.get("error", {}).get("message", str(e))
+        except Exception:
+            message = str(e)
+        return {
+            "ok": False,
+            "error": f"HTTP {e.resp.status}: {message}",
+            "tool": "gsc_compare_periods_landing_pages",
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "tool": "gsc_compare_periods_landing_pages",
+        }
+
+
 @mcp.tool()
 async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
     """
@@ -1560,10 +2216,37 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
 
 # --- Account Management Tools ---
 
+def _read_account_scopes(token_file_relative: Optional[str]) -> List[str]:
+    """Load an account's OAuth credentials and return its granted scope names.
+    Never include exception repr in the return — Credentials objects can
+    leak refresh tokens when stringified."""
+    if not token_file_relative:
+        return ["<unavailable>"]
+    token_path = token_file_relative
+    if not os.path.isabs(token_path):
+        token_path = os.path.join(SCRIPT_DIR, token_path)
+    if not os.path.exists(token_path):
+        return ["<unavailable>"]
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    except Exception:
+        return ["<unavailable>"]
+    raw_scopes = getattr(creds, "scopes", None) or []
+    # Trim the common Google prefix for readability.
+    trimmed = []
+    for scope in raw_scopes:
+        if scope.startswith("https://www.googleapis.com/auth/"):
+            trimmed.append(scope.rsplit("/", 1)[-1])
+        else:
+            trimmed.append(scope)
+    return trimmed or ["<unavailable>"]
+
+
 @mcp.tool()
 async def list_accounts() -> str:
     """
-    Lists all configured Google accounts with their aliases, emails, and active status.
+    Lists all configured Google accounts with their aliases, emails, active
+    status, and granted OAuth scopes.
     """
     try:
         manifest = _load_manifest()
@@ -1583,6 +2266,8 @@ async def list_accounts() -> str:
             email = info.get("email") or "unknown"
             added = info.get("added_at", "unknown")
             lines.append(f"- **{alias}**{marker}: {email} (added {added})")
+            scopes = _read_account_scopes(info.get("token_file"))
+            lines.append(f"  - scopes: {', '.join(scopes)}")
 
         lines.append(f"\nTotal: {len(accounts)} account(s)")
         return "\n".join(lines)
@@ -1768,6 +2453,460 @@ async def remove_account(alias: str) -> str:
             return f"Account '{alias}' removed. No accounts remaining — GSC will fall back to legacy token.json if present."
     except Exception as e:
         return f"Error removing account: {str(e)}"
+
+
+# --- Health check (Add 4) ---
+
+@mcp.tool()
+async def gsc_health_check(site_url: str) -> Dict[str, Any]:
+    """
+    One-shot diagnostic for a GSC property. Used at the start of every audit.
+
+    Makes up to three API calls, each wrapped independently so one failure
+    doesn't poison the rest. Manual actions and security issues are NOT
+    exposed by the Search Console API v1 (confirmed — the discovery doc
+    only surfaces sites/sitemaps/searchanalytics/urlInspection), so those
+    fields are returned as explicit "not available" stubs.
+
+    Args:
+        site_url: The GSC site URL (exact match, or sc-domain:example.com for domain properties).
+    """
+    result: Dict[str, Any] = {
+        "ok": True,
+        "site_url": site_url,
+        "permission_level": None,
+        "verification_state": None,
+        "has_recent_data": False,
+        "last_data_date": None,
+        "sitemaps": {"count": 0, "with_errors": 0, "with_warnings": 0},
+        "manual_actions": {
+            "available": False,
+            "reason": "Not exposed via Search Console API v1",
+        },
+        "security_issues": {
+            "available": False,
+            "reason": "Not exposed via Search Console API v1",
+        },
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "partial_failures": [],
+    }
+
+    try:
+        service = get_gsc_service()
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"auth failed: {type(e).__name__}: {e}",
+            "tool": "gsc_health_check",
+        }
+
+    # Track whether any probe actually produced useful data. If all three
+    # fail, the health check learned nothing and must return ok=False.
+    any_probe_succeeded = False
+
+    # Step 1: sites().get() for permission + verification
+    try:
+        site_info = service.sites().get(siteUrl=site_url).execute()
+        result["permission_level"] = site_info.get("permissionLevel")
+        verify = site_info.get("siteVerificationInfo", {})
+        result["verification_state"] = verify.get("verificationState")
+        any_probe_succeeded = True
+    except HttpError as e:
+        result["partial_failures"].append({
+            "step": "sites.get",
+            "error": f"HTTP {e.resp.status}: {str(e)[:200]}",
+        })
+    except Exception as e:
+        result["partial_failures"].append({
+            "step": "sites.get",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    # Step 2: searchanalytics().query() — last data date via 7-day window sorted desc
+    try:
+        today = datetime.now().date()
+        week_ago = today - timedelta(days=7)
+        data_request = {
+            "startDate": week_ago.strftime("%Y-%m-%d"),
+            "endDate": today.strftime("%Y-%m-%d"),
+            "dimensions": ["date"],
+            "rowLimit": 7,
+        }
+        data_response = service.searchanalytics().query(
+            siteUrl=site_url, body=data_request
+        ).execute()
+        rows = data_response.get("rows", [])
+        if rows:
+            # Rows come back ascending by date; the latest is the tail.
+            dates = sorted(r.get("keys", [""])[0] for r in rows)
+            result["last_data_date"] = dates[-1] if dates else None
+            result["has_recent_data"] = True
+        # An empty result is still a successful probe — the property simply
+        # has no data for the window. Mark the probe as having executed.
+        any_probe_succeeded = True
+    except HttpError as e:
+        result["partial_failures"].append({
+            "step": "searchanalytics.query",
+            "error": f"HTTP {e.resp.status}: {str(e)[:200]}",
+        })
+    except Exception as e:
+        result["partial_failures"].append({
+            "step": "searchanalytics.query",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    # Step 3: sitemaps().list() — count + error/warning totals
+    try:
+        sitemaps_response = service.sitemaps().list(siteUrl=site_url).execute()
+        sitemaps = sitemaps_response.get("sitemap", [])
+        with_errors = sum(1 for s in sitemaps if int(s.get("errors", 0)) > 0)
+        with_warnings = sum(1 for s in sitemaps if int(s.get("warnings", 0)) > 0)
+        result["sitemaps"] = {
+            "count": len(sitemaps),
+            "with_errors": with_errors,
+            "with_warnings": with_warnings,
+        }
+        any_probe_succeeded = True
+    except HttpError as e:
+        result["partial_failures"].append({
+            "step": "sitemaps.list",
+            "error": f"HTTP {e.resp.status}: {str(e)[:200]}",
+        })
+    except Exception as e:
+        result["partial_failures"].append({
+            "step": "sitemaps.list",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+    if not any_probe_succeeded:
+        result["ok"] = False
+        result["error"] = "all health probes failed; see partial_failures"
+        result["tool"] = "gsc_health_check"
+
+    return result
+
+
+# --- Screaming Frog CSV bridge tools ---
+
+@mcp.tool()
+async def gsc_load_from_sf_export(
+    sf_export_path: str,
+    site_url: str,
+    include_internal: bool = True,
+    session_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Load a Screaming Frog export folder into an in-memory session for local querying.
+
+    Ingests all search_console_*.csv files and (optionally) internal_all.csv,
+    internal_html.csv, internal_pdf.csv. Sessions hold only file paths and
+    metadata — rows stream from disk at query time to stay memory-safe on large
+    exports. Sessions are process-local and die when the MCP server restarts.
+
+    Args:
+        sf_export_path: Absolute path to an SF export folder. The loader accepts
+            both the flat layout (CSVs at the root) and the nested layout
+            (CSVs under a `search_console/` subfolder).
+        site_url: The GSC site URL this export relates to. Echoed back in the
+            response; not validated against GSC.
+        include_internal: If True (default), also load internal_all.csv /
+            internal_html.csv / internal_pdf.csv when present. Set False to
+            skip large internal crawl files.
+        session_id: Optional explicit session id (useful for idempotent reload
+            in tests). A new id is generated if omitted.
+    """
+    try:
+        path = Path(sf_export_path).expanduser().resolve()
+        if not path.exists() or not path.is_dir():
+            return {
+                "ok": False,
+                "error": f"path not found or not a directory: {path}",
+                "tool": "gsc_load_from_sf_export",
+            }
+
+        resolved = _resolve_sf_dir(path)
+
+        # Discover CSVs. Sorted for deterministic test output.
+        csv_files: List[Path] = sorted(resolved.glob("search_console_*.csv"))
+        if include_internal:
+            # Internal crawl CSVs live at the export ROOT in observed SF
+            # exports, even when search_console_*.csv files are nested under a
+            # search_console/ subfolder. Try the root first, then fall back to
+            # the resolved search_console/ dir for forwards-compat with any SF
+            # version or custom export that co-locates internals there.
+            for internal_name in ("internal_all.csv", "internal_html.csv", "internal_pdf.csv"):
+                for candidate in (path / internal_name, resolved / internal_name):
+                    if candidate.is_file():
+                        csv_files.append(candidate)
+                        break
+
+        datasets: Dict[str, Dict[str, Any]] = {}
+        warnings: List[str] = []
+        loaded_summary: List[Dict[str, Any]] = []
+
+        for csv_path in csv_files:
+            dataset_name = csv_path.stem
+            try:
+                meta = _peek_sf_csv(csv_path)
+            except ValueError as e:
+                warnings.append(f"{csv_path.name}: {e}")
+                continue
+            datasets[dataset_name] = meta
+            loaded_summary.append({
+                "dataset": dataset_name,
+                "row_count": meta["row_count"],
+                "columns": len(meta["columns"]),
+                "empty": meta["empty"],
+            })
+            if meta["file_size"] > _SF_FILE_SIZE_WARNING_BYTES:
+                size_mb = meta["file_size"] / (1024 * 1024)
+                warnings.append(
+                    f"{csv_path.name} is {size_mb:.1f} MB; queries will stream from disk"
+                )
+
+        if not datasets:
+            return {
+                "ok": False,
+                "error": f"no usable CSVs in {resolved}",
+                "tool": "gsc_load_from_sf_export",
+            }
+
+        if session_id is None:
+            session_id = f"sf-{uuid4().hex[:12]}"
+
+        _sf_sessions[session_id] = {
+            "session_id": session_id,
+            "site_url": site_url,
+            "sf_export_path": str(path),
+            "loaded_at": datetime.now(timezone.utc).isoformat(),
+            "snapshot_date": _extract_snapshot_date(resolved) or _extract_snapshot_date(path),
+            "datasets": datasets,
+            "warnings": warnings,
+        }
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "site_url": site_url,
+            "snapshot_date": _sf_sessions[session_id]["snapshot_date"],
+            "sf_export_path": str(path),
+            "loaded": loaded_summary,
+            "warnings": warnings,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "tool": "gsc_load_from_sf_export",
+        }
+
+
+@mcp.tool()
+async def gsc_query_sf_export(
+    session_id: str,
+    dataset: str,
+    filter: Optional[Dict[str, Any]] = None,
+    columns: Optional[List[str]] = None,
+    sort_by: Optional[str] = None,
+    sort_direction: str = "desc",
+    limit: int = 100,
+    offset: int = 0,
+) -> Dict[str, Any]:
+    """
+    Query a dataset previously loaded via gsc_load_from_sf_export.
+
+    Streams the CSV from disk, applies filter/sort/limit, and returns matched rows.
+
+    Args:
+        session_id: Session identifier returned by gsc_load_from_sf_export.
+        dataset: Dataset name (filename without .csv, e.g. 'search_console_all',
+            'internal_all'). Must match /^[a-z0-9_]+$/ (path traversal guard).
+        filter: Optional dict keyed by column name. Values can be scalars
+            (eq match) or dicts with {"op": "eq"|"contains"|"gt"|"lt"|"gte"|"lte",
+            "value": ...}. Column names are normalized snake_case (e.g. 'address',
+            'indexability', 'word_count').
+        columns: Optional projection — return only these columns.
+        sort_by: Optional column to sort by. Numeric sort is automatic: values
+            that coerce to float sort numerically, others fall back to lex.
+        sort_direction: 'asc' or 'desc' (default 'desc').
+        limit: Max rows to return (default 100).
+        offset: Number of matched rows to skip before limit (default 0).
+    """
+    try:
+        if session_id not in _sf_sessions:
+            return {
+                "ok": False,
+                "error": f"unknown session_id: {session_id!r}",
+                "tool": "gsc_query_sf_export",
+            }
+        session = _sf_sessions[session_id]
+
+        if not _ALLOWED_DATASET_RE.match(dataset):
+            return {
+                "ok": False,
+                "error": (
+                    f"invalid dataset name: {dataset!r} "
+                    "(must match ^[a-z0-9_]+$)"
+                ),
+                "tool": "gsc_query_sf_export",
+            }
+
+        if dataset not in session["datasets"]:
+            return {
+                "ok": False,
+                "error": f"unknown dataset: {dataset!r}",
+                "available": sorted(session["datasets"].keys()),
+                "tool": "gsc_query_sf_export",
+            }
+
+        dataset_meta = session["datasets"][dataset]
+        available_columns = dataset_meta["columns"]
+
+        # Validate filter column names up front
+        if filter:
+            for col in filter.keys():
+                if col not in available_columns:
+                    return {
+                        "ok": False,
+                        "error": f"unknown filter column: {col!r}",
+                        "available": available_columns,
+                        "tool": "gsc_query_sf_export",
+                    }
+
+        # Validate sort column
+        if sort_by is not None and sort_by not in available_columns:
+            return {
+                "ok": False,
+                "error": f"unknown sort column: {sort_by!r}",
+                "available": available_columns,
+                "tool": "gsc_query_sf_export",
+            }
+
+        # Validate projection
+        if columns is not None:
+            missing = [c for c in columns if c not in available_columns]
+            if missing:
+                return {
+                    "ok": False,
+                    "error": f"unknown projection columns: {missing!r}",
+                    "available": available_columns,
+                    "tool": "gsc_query_sf_export",
+                }
+
+        # Input validation for pagination + sort direction. The old slice-based
+        # code tolerated negative offset/limit via Python slice semantics; the
+        # new streaming path does not. Reject explicit nonsense inputs rather
+        # than create an undocumented contract.
+        if offset < 0 or limit < 0:
+            return {
+                "ok": False,
+                "error": "offset and limit must be >= 0",
+                "tool": "gsc_query_sf_export",
+            }
+        direction = sort_direction.lower()
+        if direction not in ("asc", "desc"):
+            return {
+                "ok": False,
+                "error": "sort_direction must be 'asc' or 'desc'",
+                "tool": "gsc_query_sf_export",
+            }
+
+        # Three execution paths, each memory-bounded to the paginated window:
+        #   1. limit == 0           → counts-only, stream + count
+        #   2. sort_by is None      → streaming short-circuit (O(1) beyond window)
+        #   3. sort_by is not None  → heapq-bounded top-K with offset + limit cap
+        sliced: List[Dict[str, str]] = []
+        total_matched = 0
+
+        try:
+            if limit == 0:
+                # Counts-only query: no buffer, no heap.
+                for row in _stream_sf_csv(dataset_meta):
+                    if filter is None or _apply_sf_filter(row, filter):
+                        total_matched += 1
+            elif sort_by is None:
+                # Streaming short-circuit: collect only the paginated window,
+                # count everything else for total_matched.
+                for row in _stream_sf_csv(dataset_meta):
+                    if filter is not None and not _apply_sf_filter(row, filter):
+                        continue
+                    if total_matched >= offset and len(sliced) < limit:
+                        sliced.append(row)
+                    total_matched += 1
+            else:
+                # Bounded top-K via heapq. Memory capped at offset + limit rows.
+                k = offset + limit
+                reverse = (direction == "desc")
+
+                def _sort_key(row: Dict[str, str]) -> Tuple[int, Any]:
+                    v = _to_float_or_none(row.get(sort_by, ""))
+                    # Treat inf/nan as non-numeric so they don't produce
+                    # nondeterministic placement alongside real values.
+                    if v is not None and not math.isfinite(v):
+                        v = None
+                    if reverse:
+                        # nlargest picks largest keys first → numerics want
+                        # group 1 so they outrank the non-numeric fallback;
+                        # non-numerics end up last regardless of direction.
+                        return (1, v) if v is not None else (0, str(row.get(sort_by, "")))
+                    # nsmallest picks smallest keys first → numerics want group 0.
+                    return (0, v) if v is not None else (1, str(row.get(sort_by, "")))
+
+                def _iter_counted() -> Iterator[Dict[str, str]]:
+                    nonlocal total_matched
+                    for row in _stream_sf_csv(dataset_meta):
+                        if filter is not None and not _apply_sf_filter(row, filter):
+                            continue
+                        total_matched += 1
+                        yield row
+
+                if reverse:
+                    top_rows = heapq.nlargest(k, _iter_counted(), key=_sort_key)
+                else:
+                    top_rows = heapq.nsmallest(k, _iter_counted(), key=_sort_key)
+
+                sliced = top_rows[offset : offset + limit]
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "error": (
+                    f"CSV file missing from disk: {dataset_meta['file']}. "
+                    "The SF export folder may have been moved or deleted after load."
+                ),
+                "tool": "gsc_query_sf_export",
+            }
+        except ValueError as e:
+            # Filter validation errors from _apply_sf_filter (bad op, etc.)
+            return {
+                "ok": False,
+                "error": str(e),
+                "tool": "gsc_query_sf_export",
+            }
+
+        # Project columns if requested
+        if columns is not None:
+            sliced = [{c: row.get(c, "") for c in columns} for row in sliced]
+            returned_columns = list(columns)
+        else:
+            returned_columns = list(available_columns)
+
+        return {
+            "ok": True,
+            "session_id": session_id,
+            "dataset": dataset,
+            "total_matched": total_matched,
+            "offset": offset,
+            "limit": limit,
+            "truncated": total_matched > offset + len(sliced),
+            "columns": returned_columns,
+            "rows": sliced,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "tool": "gsc_query_sf_export",
+        }
 
 
 @mcp.tool()

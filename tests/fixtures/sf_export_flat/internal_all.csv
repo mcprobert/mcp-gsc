@@ -1,0 +1,6 @@
+"Address","Status Code","Title 1","H1-1","H1-2","Word Count","Crawl Depth","Indexability","Indexability Status","Position"
+"https://example.com/","200","Example Home","Welcome","Hero","1200","0","Indexable","","5.3"
+"https://example.com/about","200","About Example","About us","","800","1","Indexable","","12.1"
+"https://example.com/blog/a","200","Blog A","Post A","","2500","2","Indexable","","3.7"
+"https://example.com/blog/b","200","Blog B","Post B","","10","2","Indexable","","22.5"
+"https://example.com/blog/c","200","Blog C","Post C","","100","2","Indexable","","8.2"

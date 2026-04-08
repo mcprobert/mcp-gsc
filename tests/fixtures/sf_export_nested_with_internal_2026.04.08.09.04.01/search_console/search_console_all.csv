@@ -1,0 +1,3 @@
+"Address","Status Code","Title 1","Indexability","Indexability Status"
+"https://nested.example.com/","200","Nested Home","Indexable",""
+"https://nested.example.com/about","200","Nested About","Indexable",""

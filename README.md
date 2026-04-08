@@ -45,22 +45,51 @@ Here's what you can ask Claude to do once you've set up this integration:
 
 | **What You Can Ask For**        | **What It Does**                                            | **What You'll Need to Provide**                                 |
 |---------------------------------|-------------------------------------------------------------|----------------------------------------------------------------|
-| `list_properties`               | Shows all your GSC properties                               | Nothing - just ask!                                             |
+| `list_properties`               | Shows all your GSC properties (now supports `name_contains`)| Nothing - just ask!                                             |
 | `get_site_details`              | Shows details about a specific site                         | Your website URL                                                |
 | `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
 | `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
+| `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with striking-distance flags | Your website URL and time period                                |
+| `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
 | `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
+| `gsc_health_check`              | One-shot audit diagnostic (verification, sitemaps, last data)| Your website URL                                               |
 | `check_indexing_issues`         | Checks if pages have indexing problems                      | Your website URL and list of pages to check                     |
 | `inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
+| `batch_url_inspection`          | Inspect up to 10 URLs (now accepts URLs from an SF session) | Your website URL and URL list (or an SF session id)             |
 | `get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
 | `submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
-| `list_accounts`                 | Shows all configured Google accounts                        | Nothing - just ask!                                             |
+| `gsc_load_from_sf_export`       | Ingests a Screaming Frog export folder for offline querying | Path to the SF export folder and the site URL                   |
+| `gsc_query_sf_export`           | Query a loaded SF export with filter/sort/pagination        | Session id and dataset name                                     |
+| `list_accounts`                 | Shows all configured Google accounts (now with OAuth scopes)| Nothing - just ask!                                             |
 | `add_account`                   | Adds a new Google account via browser OAuth                 | An alias (e.g., 'client-a')                                     |
 | `switch_account`                | Switches the active Google account                          | The alias of the account to switch to                           |
 | `remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
-*For a complete list of all 24 available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
+*For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
+
+### Screaming Frog CSV bridge (new in v0.4.0)
+
+`gsc_load_from_sf_export` and `gsc_query_sf_export` let Claude read a Screaming
+Frog export directly from disk instead of re-hitting the live Search Console
+API for data that's already crawled. The loader:
+
+- Auto-detects both flat and nested (`search_console/` subfolder) SF export layouts
+- Streams rows from disk at query time so sessions stay memory-safe on 100MB+ `internal_all.csv` files
+- Handles UTF-8-BOM (macOS/Linux) and UTF-16LE (Windows) SF exports automatically
+- Normalizes column names to snake_case (e.g. `"Avg. Position"` → `"position"`)
+- Auto-adapts to whichever columns SF exported — indexability-only crawls work today; crawls with GSC API integration enabled light up the full click/impression/CTR/position metrics automatically
+
+`batch_url_inspection` accepts `from_session=<sf-session-id>` to pull URLs from
+an SF dataset (e.g. `search_console_indexable_url_not_indexed`) with
+`offset`/`limit` pagination — the 10-URL-per-call cap is preserved.
+
+### Landing-page aggregation (new in v0.4.0)
+
+`gsc_get_landing_page_summary` and `gsc_compare_periods_landing_pages` return
+compact JSON dicts instead of markdown tables, so top-N page queries don't
+overflow the caller's context window. The comparator returns landing-page-keyed
+delta rows with a `decay_flag` that powers content-rot detection workflows.
 
 ---
 

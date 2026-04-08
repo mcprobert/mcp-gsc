@@ -22,6 +22,9 @@ token.json
 client_secret*.json
 accounts/
 
+# Local MCP server config (contains absolute paths to venv + credentials)
+.mcp.json
+
 # Editor-specific files
 .vscode/
 .idea/

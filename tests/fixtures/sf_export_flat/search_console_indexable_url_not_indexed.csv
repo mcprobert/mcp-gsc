@@ -1,0 +1,4 @@
+"Address","Status Code","Title 1","Indexability","Indexability Status"
+"https://example.com/missing-1","200","Missing 1","Indexable",""
+"https://example.com/missing-2","200","Missing 2","Indexable",""
+"https://example.com/missing-3","200","Missing 3","Indexable",""

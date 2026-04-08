@@ -1,0 +1,6 @@
+"Address","Status Code","Title 1","Indexability","Indexability Status"
+"https://example.com/","200","Example Home","Indexable",""
+"https://example.com/about","200","About Example","Indexable",""
+"https://example.com/old","301","","Non-Indexable","Redirected"
+"https://example.com/broken","404","","Non-Indexable","Client Error"
+"https://example.com/noindex","200","No Index Page","Non-Indexable","Noindex"
