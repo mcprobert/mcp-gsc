@@ -50,7 +50,7 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
 | `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
-| `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with striking-distance flags | Your website URL and time period                                |
+| `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with a configurable striking-distance band | Your website URL and time period                                |
 | `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
 | `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
 | `gsc_health_check`              | One-shot audit diagnostic (verification, sitemaps, last data)| Your website URL                                               |
@@ -90,6 +90,26 @@ an SF dataset (e.g. `search_console_indexable_url_not_indexed`) with
 compact JSON dicts instead of markdown tables, so top-N page queries don't
 overflow the caller's context window. The comparator returns landing-page-keyed
 delta rows with a `decay_flag` that powers content-rot detection workflows.
+
+The striking-distance band is configurable via `striking_distance_range=[lo, hi]`
+(default `[11.0, 20.0]`) — tighten it to `[5.0, 10.0]` to find pages one position
+away from the first page, or widen it for deeper opportunity analysis.
+`gsc_compare_periods_landing_pages` exposes `sort_by` and `sort_direction` so
+the same primitive serves both decay detection (`asc`) and top-riser discovery
+(`desc`).
+
+### v0.4.1 patch (validation + correctness)
+
+- Restored the `striking_distance_range` parameter on
+  `gsc_get_landing_page_summary` (accidentally dropped from v0.4.0).
+- Stricter input validation across the new tools: `limit`, `sort_direction`,
+  `offset`, `striking_distance_range`, and SF-session pagination all reject
+  invalid values up front with clean errors.
+- `batch_url_inspection` now fails fast on session/input errors BEFORE hitting
+  OAuth, so session misconfigurations don't get masked behind auth failures.
+- Filter equality on `gsc_query_sf_export` now coerces numerically when the
+  caller supplies a Python numeric target, so `{"status_code": 200.0}` matches
+  cell `"200"` without breaking leading-zero strings or `"nan"` cells.
 
 ---
 
