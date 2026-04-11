@@ -50,6 +50,7 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
 | `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
+| `get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
 | `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with a configurable striking-distance band | Your website URL and time period                                |
 | `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
 | `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
@@ -97,6 +98,65 @@ away from the first page, or widen it for deeper opportunity analysis.
 `gsc_compare_periods_landing_pages` exposes `sort_by` and `sort_direction` so
 the same primitive serves both decay detection (`asc`) and top-riser discovery
 (`desc`).
+
+### v0.5.0 — `get_search_by_page_query` row-limit fix and opt-in structured mode
+
+**The bug:** the previous implementation hardcoded `rowLimit: 20`, so any
+page ranking for more than 20 queries produced dramatically undercounted
+click/impression totals. A page ranking for 400+ queries would return
+~5% of its real impression volume — wrong enough to break decay
+detection and refresh-prioritisation workflows.
+
+**Backward compatible.** The default return type is still a formatted
+markdown string — pre-0.5 callers keep working without changes. The
+`row_limit` fix applies to the markdown path too: just pass the new
+parameter.
+
+**What's new:**
+
+- `row_limit: int = 20` parameter (clamped to `[1, 25000]`, the GSC API
+  maximum). Pass `500` or `1000` on pages that rank for many queries to
+  avoid silent impression undercounts. Works in both markdown and json
+  modes.
+- `response_format: str = "markdown"` parameter. Pass `"json"` to opt
+  into a structured `Dict[str, Any]` with per-query rows and an
+  impression-weighted summary block: `{ok, site_url, page_url, days,
+  row_limit, total_rows_returned, possibly_truncated, queries[],
+  summary{total_clicks, total_impressions, average_position,
+  average_ctr}}`.
+- `summary.average_position` is **impression-weighted** (not a simple
+  mean), so it matches how GSC itself reports page-level average
+  position.
+- `possibly_truncated` flag (json mode only): `True` when
+  `total_rows_returned >= row_limit`, signaling the data is still
+  capped — raise `row_limit` and retry for full accuracy.
+- `response_format` accepts either `"markdown"` or `"json"`
+  (case-insensitive, whitespace-tolerant).
+
+**Migration example:**
+
+```python
+# Pre-0.5 call — still works unchanged
+response = await get_search_by_page_query(site_url, page_url)
+# response is still a formatted markdown string
+
+# Fix the undercount in markdown mode (no return-type change)
+response = await get_search_by_page_query(site_url, page_url, row_limit=500)
+
+# Opt into structured output for programmatic access
+response = await get_search_by_page_query(
+    site_url, page_url, row_limit=500, response_format="json"
+)
+if response["ok"]:
+    total_impressions = response["summary"]["total_impressions"]
+    if response["possibly_truncated"]:
+        # Data is still capped — retry with a larger row_limit
+        ...
+    for q in response["queries"]:
+        print(q["query"], q["clicks"])
+```
+
+The markdown default is not deprecated — both modes are first-class.
 
 ### v0.4.1 patch (validation + correctness)
 

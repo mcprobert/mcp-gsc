@@ -1598,24 +1598,150 @@ async def compare_search_periods(
 async def get_search_by_page_query(
     site_url: str,
     page_url: str,
-    days: int = 28
-) -> str:
+    days: int = 28,
+    row_limit: int = 20,
+    response_format: str = "markdown",
+):
     """
     Get search analytics data for a specific page, broken down by query.
-    
+
+    By default returns a formatted markdown string (backward compatible with
+    pre-0.5 output). Pass response_format="json" to get a structured dict
+    with per-query rows and an impression-weighted summary block.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        page_url: The specific page URL to analyze
-        days: Number of days to look back (default: 28)
+        site_url: The URL of the site in Search Console (must be exact match).
+        page_url: The specific page URL to analyze. Must match the GSC `page`
+            dimension exactly — typically the full URL (with scheme and host),
+            not a path.
+        days: Number of days to look back (default 28; clamped to min 1).
+        row_limit: Max query rows to return (default 20; clamped to
+            [1, 25000]). Pass 500 or 1000 on pages ranking for many queries
+            to avoid silent impression undercounts. Note that summary
+            aggregates (in json mode) are only accurate across returned
+            rows — if total_rows_returned == row_limit the data is still
+            capped and you should raise row_limit and retry.
+        response_format: "markdown" (default) or "json". Accepted
+            case-insensitively; whitespace is stripped.
+
+    Returns:
+        When response_format="markdown" (default): a formatted str.
+        Matches the pre-0.5 output byte-for-byte for normal inputs. On
+        error, returns a string prefixed "Error retrieving page query
+        data: ...".
+
+        When response_format="json": a Dict[str, Any] with shape:
+            {
+                "ok": True,
+                "site_url": str,
+                "page_url": str,
+                "days": int,              # effective value after clamping
+                "row_limit": int,         # effective value after clamping
+                "total_rows_returned": int,
+                "possibly_truncated": bool,   # True when rows >= row_limit
+                "queries": [
+                    {"query": str, "clicks": int, "impressions": int,
+                     "ctr": float, "position": float},
+                    ...
+                ],
+                "summary": {
+                    "total_clicks": int,
+                    "total_impressions": int,
+                    "average_position": float,   # impression-weighted
+                    "average_ctr": float,        # clicks / impressions
+                },
+            }
+        On error: {"ok": False, "error": str, "tool":
+        "get_search_by_page_query"}. Invalid response_format values
+        always return a string error (the conservative default).
     """
+    fmt = str(response_format).strip().lower()
+    if fmt not in ("markdown", "json"):
+        return (
+            "Error retrieving page query data: "
+            f"response_format must be 'markdown' or 'json', got {response_format!r}"
+        )
+
+    if fmt == "markdown":
+        # Near-verbatim copy of the pre-0.5 body. The ONLY intentional
+        # differences vs pre-0.5 are:
+        #   1. rowLimit: 20 (hardcoded) → effective_row_limit (the bug fix)
+        #   2. days clamped via max(1, int(days)) so negative/zero inputs
+        #      don't break date math (strict improvement for pathological
+        #      input only; normal positive int values render identically).
+        try:
+            effective_days = max(1, int(days))
+            effective_row_limit = max(1, min(int(row_limit), 25000))
+
+            service = get_gsc_service()
+
+            # Calculate date range
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=effective_days)
+
+            # Build request with page filter
+            request = {
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
+                "dimensions": ["query"],
+                "dimensionFilterGroups": [{
+                    "filters": [{
+                        "dimension": "page",
+                        "operator": "equals",
+                        "expression": page_url
+                    }]
+                }],
+                "rowLimit": effective_row_limit,
+                "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
+            }
+
+            # Execute request
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+
+            if not response.get("rows"):
+                return f"No search data found for page {page_url} in the last {effective_days} days."
+
+            # Format results
+            result_lines = [f"Search queries for page {page_url} (last {effective_days} days):"]
+            result_lines.append("\n" + "-" * 80 + "\n")
+
+            # Create header
+            result_lines.append("Query | Clicks | Impressions | CTR | Position")
+            result_lines.append("-" * 80)
+
+            # Add data rows (byte-for-byte pre-0.5: raw row values, no
+            # int/float coercion, "Unknown" fallback for missing keys).
+            for row in response.get("rows", []):
+                query = row.get("keys", ["Unknown"])[0]
+                clicks = row.get("clicks", 0)
+                impressions = row.get("impressions", 0)
+                ctr = row.get("ctr", 0) * 100
+                position = row.get("position", 0)
+
+                result_lines.append(f"{query[:100]} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
+
+            # Add total metrics
+            total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
+            total_impressions = sum(row.get("impressions", 0) for row in response.get("rows", []))
+            avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
+
+            result_lines.append("-" * 80)
+            result_lines.append(f"TOTAL | {total_clicks} | {total_impressions} | {avg_ctr:.2f}% | -")
+
+            return "\n".join(result_lines)
+        except Exception as e:
+            return f"Error retrieving page query data: {str(e)}"
+
+    # response_format == "json" — structured output with summary aggregates
     try:
+        effective_days = max(1, int(days))
+        effective_row_limit = max(1, min(int(row_limit), 25000))
+
         service = get_gsc_service()
-        
-        # Calculate date range
+
         end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
-        
-        # Build request with page filter
+        start_date = end_date - timedelta(days=effective_days)
+
         request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
@@ -1627,45 +1753,62 @@ async def get_search_by_page_query(
                     "expression": page_url
                 }]
             }],
-            "rowLimit": 20,  # Top 20 queries for this page
+            "rowLimit": effective_row_limit,
             "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
         }
-        
-        # Execute request
+
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
-        if not response.get("rows"):
-            return f"No search data found for page {page_url} in the last {days} days."
-        
-        # Format results
-        result_lines = [f"Search queries for page {page_url} (last {days} days):"]
-        result_lines.append("\n" + "-" * 80 + "\n")
-        
-        # Create header
-        result_lines.append("Query | Clicks | Impressions | CTR | Position")
-        result_lines.append("-" * 80)
-        
-        # Add data rows
-        for row in response.get("rows", []):
-            query = row.get("keys", ["Unknown"])[0]
-            clicks = row.get("clicks", 0)
-            impressions = row.get("impressions", 0)
-            ctr = row.get("ctr", 0) * 100
-            position = row.get("position", 0)
-            
-            result_lines.append(f"{query[:100]} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
-        
-        # Add total metrics
-        total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
-        total_impressions = sum(row.get("impressions", 0) for row in response.get("rows", []))
-        avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
-        
-        result_lines.append("-" * 80)
-        result_lines.append(f"TOTAL | {total_clicks} | {total_impressions} | {avg_ctr:.2f}% | -")
-        
-        return "\n".join(result_lines)
+
+        queries: List[Dict[str, Any]] = []
+        for row in response.get("rows", []) or []:
+            keys = row.get("keys", [])
+            query = keys[0] if keys else ""
+            queries.append({
+                "query": query,
+                "clicks": int(row.get("clicks", 0)),
+                "impressions": int(row.get("impressions", 0)),
+                "ctr": float(row.get("ctr", 0.0)),
+                "position": float(row.get("position", 0.0)),
+            })
+
+        # Inline aggregation (see NOTE above _period_totals in
+        # gsc_compare_periods_landing_pages — future DRY opportunity).
+        total_clicks = sum(q["clicks"] for q in queries)
+        total_impressions = sum(q["impressions"] for q in queries)
+        if total_impressions > 0:
+            average_ctr = total_clicks / total_impressions
+            average_position = sum(
+                q["position"] * q["impressions"] for q in queries
+            ) / total_impressions
+        else:
+            average_ctr = 0.0
+            average_position = 0.0
+
+        return {
+            "ok": True,
+            "site_url": site_url,
+            "page_url": page_url,
+            "days": effective_days,
+            "row_limit": effective_row_limit,
+            "total_rows_returned": len(queries),
+            "possibly_truncated": len(queries) >= effective_row_limit,
+            "queries": queries,
+            "summary": {
+                "total_clicks": total_clicks,
+                "total_impressions": total_impressions,
+                "average_position": average_position,
+                "average_ctr": average_ctr,
+            },
+        }
+    except HttpError as e:
+        try:
+            error_content = json.loads(e.content.decode("utf-8"))
+            message = error_content.get("error", {}).get("message", str(e))
+        except Exception:
+            message = str(e)
+        return {"ok": False, "error": message, "tool": "get_search_by_page_query"}
     except Exception as e:
-        return f"Error retrieving page query data: {str(e)}"
+        return {"ok": False, "error": str(e), "tool": "get_search_by_page_query"}
 
 
 # --- Aggregated landing-page tools (Adds 2 + 3) ---
@@ -1945,6 +2088,8 @@ async def gsc_compare_periods_landing_pages(
                 return default
             return float(row.get(key, default))
 
+        # NOTE: This duplicates the inline aggregation in get_search_by_page_query.
+        # If extracted to a module-level helper, add regression coverage for both call sites.
         def _period_totals(rows: List[Dict[str, Any]]) -> Dict[str, float]:
             clicks = sum(int(r.get("clicks", 0)) for r in rows)
             impressions = sum(int(r.get("impressions", 0)) for r in rows)
