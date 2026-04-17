@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "description": "30 multi-step test prompts for the GSC MCP eval harness. Mirrors audit/04-eval-harness.md §1.",
+  "placeholders": {
+    "{{SITE_URL}}": "Replaced at run time via --property.",
+    "{{PAGE_URL}}": "Replaced at run time via --page-url (or inferred from a preceding tool call).",
+    "{{SF_EXPORT_PATH}}": "Replaced via --sf-export (required only for prompts 20-21)."
+  },
+  "prompts": [
+    {
+      "id": 1,
+      "prompt": "What's my active GSC account?",
+      "expected_tool_path": ["get_active_account"],
+      "category": "meta",
+      "mutate": false
+    },
+    {
+      "id": 2,
+      "prompt": "List the GSC properties I have access to that contain 'chaser'.",
+      "expected_tool_path": ["list_properties"],
+      "category": "discovery",
+      "mutate": false
+    },
+    {
+      "id": 3,
+      "prompt": "Show every property I can see.",
+      "expected_tool_path": ["list_properties"],
+      "category": "discovery",
+      "mutate": false,
+      "notes": "Post-A.6, the response should be capped at 50 with a nudge."
+    },
+    {
+      "id": 4,
+      "prompt": "Switch to the 'chaser' account.",
+      "expected_tool_path": ["list_accounts", "switch_account"],
+      "category": "account",
+      "mutate": true
+    },
+    {
+      "id": 5,
+      "prompt": "Run a health check on {{SITE_URL}}.",
+      "expected_tool_path": ["gsc_health_check"],
+      "category": "composed",
+      "mutate": false
+    },
+    {
+      "id": 6,
+      "prompt": "Give me a 28-day performance overview of {{SITE_URL}}.",
+      "expected_tool_path": ["get_performance_overview"],
+      "category": "analytics",
+      "mutate": false
+    },
+    {
+      "id": 7,
+      "prompt": "Top 100 queries by clicks for {{SITE_URL}} last 28 days.",
+      "expected_tool_path": ["get_advanced_search_analytics"],
+      "category": "analytics",
+      "mutate": false,
+      "notes": "Post-A.1 default is 100; this prompt tests that 100 is sufficient and no loud TRUNCATED warning fires if the site has <=100 unique queries."
+    },
+    {
+      "id": 8,
+      "prompt": "Top 1000 queries for last 7 days, sorted by impressions descending.",
+      "expected_tool_path": ["get_advanced_search_analytics"],
+      "category": "analytics",
+      "mutate": false,
+      "notes": "Agent must explicitly pass row_limit=1000 post-A.1."
+    },
+    {
+      "id": 9,
+      "prompt": "Compare last 28 days vs the prior 28 days by query for {{SITE_URL}}.",
+      "expected_tool_path": ["compare_search_periods"],
+      "category": "analytics",
+      "mutate": false
+    },
+    {
+      "id": 10,
+      "prompt": "Which of my landing pages are in striking distance of page 1 on {{SITE_URL}}?",
+      "expected_tool_path": ["gsc_get_landing_page_summary"],
+      "category": "composed",
+      "mutate": false
+    },
+    {
+      "id": 11,
+      "prompt": "Compare landing-page performance this quarter vs last quarter for {{SITE_URL}}.",
+      "expected_tool_path": ["gsc_compare_periods_landing_pages"],
+      "category": "composed",
+      "mutate": false
+    },
+    {
+      "id": 12,
+      "prompt": "Which queries drive the top-performing page on {{SITE_URL}}?",
+      "expected_tool_path": ["gsc_get_landing_page_summary", "get_search_by_page_query"],
+      "category": "disambiguation",
+      "mutate": false,
+      "notes": "Tests disambiguation — agent must pick the composed landing-page tool then drill into one page. Post-A.5 the description guidance should make this obvious."
+    },
+    {
+      "id": 13,
+      "prompt": "Break down queries for {{PAGE_URL}} as JSON.",
+      "expected_tool_path": ["get_search_by_page_query"],
+      "category": "format",
+      "mutate": false,
+      "notes": "Tests the JSON vs markdown overhead; post-B.5 the JSON default would flip."
+    },
+    {
+      "id": 14,
+      "prompt": "Is {{PAGE_URL}} indexed?",
+      "expected_tool_path": ["inspect_url_enhanced"],
+      "category": "inspection",
+      "mutate": false
+    },
+    {
+      "id": 15,
+      "prompt": "Batch-check these 8 URLs for indexing issues: {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}.",
+      "expected_tool_path": ["batch_url_inspection"],
+      "category": "inspection",
+      "mutate": false
+    },
+    {
+      "id": 16,
+      "prompt": "Which of these URLs have indexing problems? {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}, {{PAGE_URL}}.",
+      "expected_tool_path": ["check_indexing_issues"],
+      "category": "disambiguation",
+      "mutate": false,
+      "notes": "Tests inspection-tool disambiguation — agent should pick check_indexing_issues over inspect_url_enhanced or batch_url_inspection."
+    },
+    {
+      "id": 17,
+      "prompt": "List all sitemaps for {{SITE_URL}}.",
+      "expected_tool_path": ["list_sitemaps_enhanced"],
+      "category": "sitemap",
+      "mutate": false,
+      "notes": "Pre-A.3 get_sitemaps was broken; agent would have to route to list_sitemaps_enhanced. Post-A.3 either tool works."
+    },
+    {
+      "id": 18,
+      "prompt": "Show me details for sitemap https://example.com/sitemap.xml on {{SITE_URL}}.",
+      "expected_tool_path": ["get_sitemap_details"],
+      "category": "sitemap",
+      "mutate": false
+    },
+    {
+      "id": 19,
+      "prompt": "Submit a new sitemap at https://example.com/new-sitemap.xml to {{SITE_URL}}.",
+      "expected_tool_path": ["submit_sitemap"],
+      "category": "sitemap",
+      "mutate": true
+    },
+    {
+      "id": 20,
+      "prompt": "Load my Screaming Frog export from {{SF_EXPORT_PATH}} for {{SITE_URL}}.",
+      "expected_tool_path": ["gsc_load_from_sf_export"],
+      "category": "sf_bridge",
+      "mutate": false,
+      "notes": "Requires --sf-export CLI arg pointing at a real SF export."
+    },
+    {
+      "id": 21,
+      "prompt": "Query the SF session for all URLs with status 200 ordered by inlinks.",
+      "expected_tool_path": ["gsc_query_sf_export"],
+      "category": "sf_bridge",
+      "mutate": false,
+      "notes": "Must follow prompt 20 in the same session so session_id exists."
+    },
+    {
+      "id": 22,
+      "prompt": "Find the 5 striking-distance pages on {{SITE_URL}}, then run a per-page query drilldown on each.",
+      "expected_tool_path": ["gsc_get_landing_page_summary", "get_search_by_page_query", "get_search_by_page_query", "get_search_by_page_query", "get_search_by_page_query", "get_search_by_page_query"],
+      "category": "chained",
+      "mutate": false,
+      "notes": "Multi-step chained workflow — the ref doc's key requirement."
+    },
+    {
+      "id": 23,
+      "prompt": "Show me striking-distance pages for UK desktop only on {{SITE_URL}}.",
+      "expected_tool_path": ["gsc_get_landing_page_summary"],
+      "category": "filter",
+      "mutate": false
+    },
+    {
+      "id": 24,
+      "prompt": "Compare the 'chaser login' query position this month vs last month on {{SITE_URL}}.",
+      "expected_tool_path": ["get_advanced_search_analytics", "get_advanced_search_analytics"],
+      "category": "filter",
+      "mutate": false
+    },
+    {
+      "id": 25,
+      "prompt": "Drop the 'ephemeral-test' account.",
+      "expected_tool_path": ["remove_account"],
+      "category": "account",
+      "mutate": true
+    },
+    {
+      "id": 26,
+      "prompt": "My GSC quota is exceeded right now, check sitemaps on {{SITE_URL}} anyway.",
+      "expected_tool_path": ["list_sitemaps_enhanced"],
+      "category": "error_recovery",
+      "mutate": false,
+      "notes": "Error-recovery test — agent should proceed rather than refuse."
+    },
+    {
+      "id": 27,
+      "prompt": "Inspect {{PAGE_URL}} on {{SITE_URL}}; I don't have permission for it.",
+      "expected_tool_path": ["inspect_url_enhanced"],
+      "category": "error_recovery",
+      "mutate": false,
+      "notes": "Tests 403 handling and agent resilience."
+    },
+    {
+      "id": 28,
+      "prompt": "Get all 2,500 queries from {{SITE_URL}}.",
+      "expected_tool_path": ["get_advanced_search_analytics", "get_advanced_search_analytics", "get_advanced_search_analytics"],
+      "category": "pagination",
+      "mutate": false,
+      "notes": "Tests that the agent follows the pagination cursor nudge at least 3 times (at row_limit=1000, 2500 rows = 3 pages). Post-A.1 with default 100, this would be 25 pages — an excellent test of pagination-follow-through under the tightened default."
+    },
+    {
+      "id": 29,
+      "prompt": "Scan every sitemap on {{SITE_URL}} for errors.",
+      "expected_tool_path": ["list_sitemaps_enhanced", "get_sitemap_details"],
+      "category": "chained",
+      "mutate": false,
+      "notes": "Multi-step across sitemap tools."
+    },
+    {
+      "id": 30,
+      "prompt": "Compare last month vs this month for my top 50 landing pages on {{SITE_URL}}.",
+      "expected_tool_path": ["gsc_compare_periods_landing_pages"],
+      "category": "composed",
+      "mutate": false
+    }
+  ]
+}

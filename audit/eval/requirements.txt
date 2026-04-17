@@ -1,0 +1,6 @@
+# Eval harness deps. Install with:
+#   uv pip install -r audit/eval/requirements.txt
+#
+# Kept separate from the server's runtime deps so the MCP server
+# doesn't drag the Anthropic SDK into every install.
+anthropic>=0.40,<1.0

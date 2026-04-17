@@ -1,0 +1,4 @@
+# Run outputs regenerate on every harness invocation.
+runs/*.jsonl
+# Everything else in runs/ (README stubs etc.) stays tracked.
+!runs/.gitkeep
