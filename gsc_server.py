@@ -1427,8 +1427,20 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
                     result_lines.append(f"- [{severity}] {message}")
         
         return "\n".join(result_lines)
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="inspect_url_enhanced", site_url=site_url),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error inspecting URL: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="inspect_url_enhanced",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def batch_url_inspection(
@@ -1581,8 +1593,20 @@ async def batch_url_inspection(
         header = clamp_note + f"Batch URL Inspection Results for {site_url}:\n\n"
         return header + "\n".join(results) + next_offset_note
 
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="batch_url_inspection", site_url=site_url),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error performing batch inspection: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="batch_url_inspection",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def check_indexing_issues(site_url: str, urls: str) -> str:
@@ -1704,9 +1728,21 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
                 result_lines.append(f"- {issue}")
         
         return "\n".join(result_lines)
-    
+
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="check_indexing_issues", site_url=site_url),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error checking indexing issues: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="check_indexing_issues",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def get_performance_overview(site_url: str, days: int = 28) -> str:
