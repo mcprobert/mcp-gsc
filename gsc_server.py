@@ -2992,12 +2992,27 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
             result_lines.append("\nNote: Google may take some time to process the sitemap. Check back later for full details.")
             
             return "\n".join(result_lines)
-        except:
-            # If we can't get details, just return basic success message
+        except Exception:
+            # If we can't get details, just return basic success message.
+            # We swallow the details-fetch failure — the submit itself
+            # already succeeded; the agent just gets a slimmer confirmation.
             return f"Successfully submitted sitemap: {sitemap_url}\n\nGoogle will queue it for processing."
-    
+
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="submit_sitemap", site_url=site_url),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error submitting sitemap: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Verify the sitemap URL is reachable and uses the same "
+                     "scheme/host as the GSC property.",
+                tool="submit_sitemap",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
@@ -3010,23 +3025,45 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
-        # First check if the sitemap exists
+
+        # Pre-check: if the sitemap isn't registered, short-circuit to an
+        # idempotent "already deleted" message rather than surfacing an
+        # error envelope (matches delete_site's 404 semantics from the
+        # site-CRUD B.4 rollout).
         try:
             service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+        except HttpError as e:
+            if getattr(e.resp, "status", None) == 404:
+                return f"Sitemap not found: {sitemap_url}. It may have already been deleted or was never submitted."
+            raise
         except Exception as e:
+            # Older error shapes used string match on "404"; keep the
+            # fallback for defensive coverage of non-HttpError 404s.
             if "404" in str(e):
                 return f"Sitemap not found: {sitemap_url}. It may have already been deleted or was never submitted."
-            else:
-                raise e
-        
-        # Delete the sitemap
+            raise
+
         service.sitemaps().delete(siteUrl=site_url, feedpath=sitemap_url).execute()
-        
-        return f"Successfully deleted sitemap: {sitemap_url}\n\nNote: This only removes the sitemap from Search Console. Any URLs already indexed will remain in Google's index."
-    
+        return (
+            f"Successfully deleted sitemap: {sitemap_url}\n\n"
+            "Note: This only removes the sitemap from Search Console. Any URLs "
+            "already indexed will remain in Google's index."
+        )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="delete_sitemap", site_url=site_url),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error deleting sitemap: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Verify the sitemap URL was submitted in the first place; "
+                     "use `list_sitemaps_enhanced` to list known sitemaps.",
+                tool="delete_sitemap",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
@@ -3059,9 +3096,21 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
             return await submit_sitemap(site_url, sitemap_url)
         elif action == "delete":
             return await delete_sitemap(site_url, sitemap_url)
-    
+
     except Exception as e:
-        return f"Error managing sitemaps: {str(e)}"
+        # Dispatcher-level safety net. The underlying tools handle
+        # HttpError + their own exceptions, so this branch only fires
+        # for a validation-layer programming error (unreachable in
+        # normal flow) or an exception escaping the dispatch logic
+        # itself (e.g. TypeError on bad kwargs).
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Check `action` is one of: list, details, submit, delete.",
+                tool="manage_sitemaps",
+            ),
+            response_format="markdown",
+        )
 
 
 # --- Account Management Tools ---
