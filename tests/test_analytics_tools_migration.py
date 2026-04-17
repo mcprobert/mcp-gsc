@@ -4,7 +4,7 @@
 Prior coverage tested `_format_table` against hand-crafted fixtures but
 never exercised the wiring in the tool functions themselves. That gap
 let the truncation-ordering regression (Review issue 3) and the
-`compare_search_periods` silent-truncation bug (Review issue 4) ship.
+`gsc_compare_search_periods` silent-truncation bug (Review issue 4) ship.
 These tests cover both the behavioural contracts those fixes restore,
 plus golden markdown shape + JSON shape for each migrated tool.
 """
@@ -16,9 +16,9 @@ import pytest
 
 import gsc_server
 from gsc_server import (
-    compare_search_periods,
-    get_advanced_search_analytics,
-    get_search_analytics,
+    gsc_compare_search_periods,
+    gsc_get_advanced_search_analytics,
+    gsc_get_search_analytics,
 )
 
 
@@ -36,7 +36,7 @@ def _mock_analytics_service(rows):
 
 
 def _mock_two_period_service(period1_rows, period2_rows):
-    """Mock for compare_search_periods — returns different rows per call."""
+    """Mock for gsc_compare_search_periods — returns different rows per call."""
     service = MagicMock()
     calls = {"count": 0}
 
@@ -60,7 +60,7 @@ def _patch(monkeypatch, service):
 
 
 # =============================================================================
-# get_search_analytics
+# gsc_get_search_analytics
 # =============================================================================
 
 
@@ -71,7 +71,7 @@ class TestGetSearchAnalyticsMigration:
             {"keys": ["chaser login"], "clicks": 58, "impressions": 121, "ctr": 0.4793, "position": 1.3},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_analytics(
+        out = await gsc_get_search_analytics(
             site_url="sc-domain:example.com", days=28, dimensions="query", row_limit=100
         )
         assert isinstance(out, str)
@@ -89,7 +89,7 @@ class TestGetSearchAnalyticsMigration:
             {"keys": ["seo"], "clicks": 10, "impressions": 100, "ctr": 0.10, "position": 3.0},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_analytics(
+        out = await gsc_get_search_analytics(
             site_url="sc-domain:example.com",
             row_limit=100,
             response_format="json",
@@ -107,7 +107,7 @@ class TestGetSearchAnalyticsMigration:
 
     async def test_empty_rows_returns_string_not_envelope(self, monkeypatch):
         _patch(monkeypatch, _mock_analytics_service([]))
-        out = await get_search_analytics(site_url="sc-domain:example.com")
+        out = await gsc_get_search_analytics(site_url="sc-domain:example.com")
         assert isinstance(out, str)
         assert "No search analytics data found" in out
 
@@ -117,7 +117,7 @@ class TestGetSearchAnalyticsMigration:
             for i in range(100)
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_analytics(
+        out = await gsc_get_search_analytics(
             site_url="sc-domain:example.com", row_limit=100
         )
         # Must be the first line — agents skim the top.
@@ -130,7 +130,7 @@ class TestGetSearchAnalyticsMigration:
             {"keys": ["kw a"], "clicks": 5, "impressions": 50, "ctr": 0.1, "position": 1.0},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_analytics(
+        out = await gsc_get_search_analytics(
             site_url="sc-domain:example.com", response_format="csv"
         )
         assert isinstance(out, str)
@@ -139,7 +139,7 @@ class TestGetSearchAnalyticsMigration:
 
 
 # =============================================================================
-# get_advanced_search_analytics
+# gsc_get_advanced_search_analytics
 # =============================================================================
 
 
@@ -149,7 +149,7 @@ class TestGetAdvancedSearchAnalyticsMigration:
             {"keys": ["chaser"], "clicks": 672, "impressions": 31130, "ctr": 0.0216, "position": 6.3},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_advanced_search_analytics(
+        out = await gsc_get_advanced_search_analytics(
             site_url="sc-domain:example.com",
             start_date="2026-03-20",
             end_date="2026-04-17",
@@ -167,7 +167,7 @@ class TestGetAdvancedSearchAnalyticsMigration:
             for i in range(100)
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_advanced_search_analytics(
+        out = await gsc_get_advanced_search_analytics(
             site_url="sc-domain:example.com",
             row_limit=100,
         )
@@ -184,7 +184,7 @@ class TestGetAdvancedSearchAnalyticsMigration:
             for i in range(100)
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_advanced_search_analytics(
+        out = await gsc_get_advanced_search_analytics(
             site_url="sc-domain:example.com",
             row_limit=100,
             response_format="json",
@@ -207,7 +207,7 @@ class TestGetAdvancedSearchAnalyticsMigration:
         service.searchanalytics.return_value.query.side_effect = _query
         _patch(monkeypatch, service)
 
-        out = await get_advanced_search_analytics(
+        out = await gsc_get_advanced_search_analytics(
             site_url="sc-domain:example.com",
             filter_dimension="query",
             filter_operator="contains",
@@ -227,7 +227,7 @@ class TestGetAdvancedSearchAnalyticsMigration:
 
 
 # =============================================================================
-# compare_search_periods
+# gsc_compare_search_periods
 # =============================================================================
 
 
@@ -240,7 +240,7 @@ class TestCompareSearchPeriodsMigration:
             {"keys": ["chaser"], "clicks": 691, "impressions": 31000, "ctr": 0.022, "position": 6.3},
         ]
         _patch(monkeypatch, _mock_two_period_service(period1, period2))
-        out = await compare_search_periods(
+        out = await gsc_compare_search_periods(
             site_url="sc-domain:example.com",
             period1_start="2026-02-21",
             period1_end="2026-03-20",
@@ -268,7 +268,7 @@ class TestCompareSearchPeriodsMigration:
             for i in range(15)
         ]
         _patch(monkeypatch, _mock_two_period_service(period1, period2))
-        out = await compare_search_periods(
+        out = await gsc_compare_search_periods(
             site_url="sc-domain:example.com",
             period1_start="2026-01-01",
             period1_end="2026-01-31",
@@ -288,7 +288,7 @@ class TestCompareSearchPeriodsMigration:
             {"keys": ["only"], "clicks": 20, "impressions": 100, "ctr": 0.2, "position": 1.0},
         ]
         _patch(monkeypatch, _mock_two_period_service(period1, period2))
-        out = await compare_search_periods(
+        out = await gsc_compare_search_periods(
             site_url="sc-domain:example.com",
             period1_start="2026-01-01",
             period1_end="2026-01-31",
@@ -308,7 +308,7 @@ class TestCompareSearchPeriodsMigration:
             for i in range(25)
         ]
         _patch(monkeypatch, _mock_two_period_service(period1, period2))
-        out = await compare_search_periods(
+        out = await gsc_compare_search_periods(
             site_url="sc-domain:example.com",
             period1_start="2026-01-01",
             period1_end="2026-01-31",
@@ -335,7 +335,7 @@ class TestCompareSearchPeriodsMigration:
         service.searchanalytics.return_value.query.side_effect = _query
         _patch(monkeypatch, service)
 
-        await compare_search_periods(
+        await gsc_compare_search_periods(
             site_url="sc-domain:example.com",
             period1_start="2026-01-01",
             period1_end="2026-01-31",
@@ -358,7 +358,7 @@ class TestAnalyticsErrorEnvelopes:
         service = MagicMock()
         service.searchanalytics.side_effect = RuntimeError("network flakey")
         _patch(monkeypatch, service)
-        out = await get_search_analytics(site_url="sc-domain:example.com")
+        out = await gsc_get_search_analytics(site_url="sc-domain:example.com")
         assert isinstance(out, str)
         assert out.startswith("Error: RuntimeError: network flakey")
         assert "Hint:" in out
@@ -367,12 +367,12 @@ class TestAnalyticsErrorEnvelopes:
         service = MagicMock()
         service.searchanalytics.side_effect = RuntimeError("bad")
         _patch(monkeypatch, service)
-        out = await get_search_analytics(
+        out = await gsc_get_search_analytics(
             site_url="sc-domain:example.com", response_format="json"
         )
         assert isinstance(out, dict)
         assert out["ok"] is False
-        assert out["tool"] == "get_search_analytics"
+        assert out["tool"] == "gsc_get_search_analytics"
         assert "RuntimeError" in out["error"]
 
 
@@ -386,12 +386,12 @@ class TestPageQuerySummaryBoundary:
     included. Review flagged this as load-bearing — test the boundary."""
 
     async def test_row_limit_50_omits_summary_by_default(self, monkeypatch):
-        from gsc_server import get_search_by_page_query
+        from gsc_server import gsc_get_search_by_page_query
         rows = [
             {"keys": ["kw a"], "clicks": 1, "impressions": 10, "ctr": 0.1, "position": 1.0},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_by_page_query(
+        out = await gsc_get_search_by_page_query(
             site_url="sc-domain:example.com",
             page_url="https://example.com/",
             row_limit=50,
@@ -400,12 +400,12 @@ class TestPageQuerySummaryBoundary:
         assert "summary" not in out
 
     async def test_row_limit_51_includes_summary_by_default(self, monkeypatch):
-        from gsc_server import get_search_by_page_query
+        from gsc_server import gsc_get_search_by_page_query
         rows = [
             {"keys": ["kw a"], "clicks": 1, "impressions": 10, "ctr": 0.1, "position": 1.0},
         ]
         _patch(monkeypatch, _mock_analytics_service(rows))
-        out = await get_search_by_page_query(
+        out = await gsc_get_search_by_page_query(
             site_url="sc-domain:example.com",
             page_url="https://example.com/",
             row_limit=51,

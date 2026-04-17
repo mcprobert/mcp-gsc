@@ -14,12 +14,12 @@ uv pip install -r requirements.txt
 
 Single-file FastMCP server (`gsc_server.py`) with 24 tools covering:
 
-- **Properties**: `list_properties`, `add_site`, `delete_site`, `get_site_details`
-- **Search Analytics**: `get_search_analytics`, `get_advanced_search_analytics`, `compare_search_periods`, `get_search_by_page_query`, `get_performance_overview`
-- **URL Inspection**: `inspect_url_enhanced`, `batch_url_inspection`, `check_indexing_issues`
-- **Sitemaps**: `get_sitemaps`, `list_sitemaps_enhanced`, `get_sitemap_details`, `submit_sitemap`, `delete_sitemap`, `manage_sitemaps`
-- **Account Management**: `list_accounts`, `get_active_account`, `add_account`, `switch_account`, `remove_account`
-- **Meta**: `get_creator_info`
+- **Properties**: `gsc_list_properties`, `gsc_add_site`, `gsc_delete_site`, `gsc_get_site_details`
+- **Search Analytics**: `gsc_get_search_analytics`, `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`, `gsc_get_search_by_page_query`, `gsc_get_performance_overview`
+- **URL Inspection**: `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, `gsc_check_indexing_issues`
+- **Sitemaps**: `gsc_get_sitemaps`, `gsc_list_sitemaps_enhanced`, `gsc_get_sitemap_details`, `gsc_submit_sitemap`, `gsc_delete_sitemap`, `gsc_manage_sitemaps`
+- **Account Management**: `gsc_list_accounts`, `gsc_get_active_account`, `gsc_add_account`, `gsc_switch_account`, `gsc_remove_account`
+- **Meta**: `gsc_get_creator_info`
 
 ## Auth
 
@@ -37,11 +37,11 @@ accounts/
 ```
 
 **Account tools:**
-- `list_accounts` — show all configured accounts
-- `get_active_account` — show which account is currently active
-- `add_account(alias)` — authenticate a new Google account via browser OAuth
-- `switch_account(alias)` — switch active account (all GSC tools use this)
-- `remove_account(alias)` — delete an account and its stored token
+- `gsc_list_accounts` — show all configured accounts
+- `gsc_get_active_account` — show which account is currently active
+- `gsc_add_account(alias)` — authenticate a new Google account via browser OAuth
+- `gsc_switch_account(alias)` — switch active account (all GSC tools use this)
+- `gsc_remove_account(alias)` — delete an account and its stored token
 
 **Migration:** On first start after upgrade, existing `token.json` is automatically copied to `accounts/default/token.json`. The original file is preserved for safe rollback. If no accounts are configured, the legacy `token.json` is used as fallback.
 

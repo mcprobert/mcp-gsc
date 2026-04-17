@@ -1,8 +1,8 @@
-"""Tests for submit_sitemap / delete_sitemap / manage_sitemaps after
+"""Tests for gsc_submit_sitemap / gsc_delete_sitemap / gsc_manage_sitemaps after
 the B.4 envelope rollout.
 
-delete_sitemap preserves its idempotent 404 short-circuit (same
-pattern as delete_site). manage_sitemaps is a dispatcher — its own
+gsc_delete_sitemap preserves its idempotent 404 short-circuit (same
+pattern as gsc_delete_site). gsc_manage_sitemaps is a dispatcher — its own
 envelope fires only on validation-layer programming errors since the
 delegated tools already handle their own HttpError.
 """
@@ -14,7 +14,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 import gsc_server
-from gsc_server import delete_sitemap, manage_sitemaps, submit_sitemap
+from gsc_server import gsc_delete_sitemap, gsc_manage_sitemaps, gsc_submit_sitemap
 
 
 def _http_error(status: int, message: str = "err") -> HttpError:
@@ -34,7 +34,7 @@ class TestSubmitSitemap:
             "isPending": True,
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await submit_sitemap(
+        out = await gsc_submit_sitemap(
             "sc-domain:example.com", "https://example.com/sitemap.xml"
         )
         assert "Successfully submitted sitemap" in out
@@ -46,7 +46,7 @@ class TestSubmitSitemap:
         # details() fetch raises, but submit already succeeded.
         service.sitemaps.return_value.get.return_value.execute.side_effect = RuntimeError("details hiccup")
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await submit_sitemap(
+        out = await gsc_submit_sitemap(
             "sc-domain:example.com", "https://example.com/sitemap.xml"
         )
         assert "Successfully submitted sitemap" in out
@@ -58,7 +58,7 @@ class TestSubmitSitemap:
         service = MagicMock()
         service.sitemaps.return_value.submit.return_value.execute.side_effect = _http_error(403)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await submit_sitemap(
+        out = await gsc_submit_sitemap(
             "sc-domain:example.com", "https://example.com/sitemap.xml"
         )
         assert out.startswith("Error: HTTP 403")
@@ -68,7 +68,7 @@ class TestSubmitSitemap:
         def _explode():
             raise RuntimeError("network dead")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await submit_sitemap(
+        out = await gsc_submit_sitemap(
             "sc-domain:example.com", "https://example.com/sitemap.xml"
         )
         assert "RuntimeError" in out
@@ -81,19 +81,19 @@ class TestDeleteSitemap:
         service.sitemaps.return_value.get.return_value.execute.return_value = {"path": "x"}
         service.sitemaps.return_value.delete.return_value.execute.return_value = None
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_sitemap(
+        out = await gsc_delete_sitemap(
             "sc-domain:example.com", "https://example.com/sitemap.xml"
         )
         assert "Successfully deleted sitemap" in out
 
     async def test_404_idempotent_short_circuit_via_http_error(self, monkeypatch):
-        """When sitemaps().get() raises a 404 HttpError, delete_sitemap
-        treats it as idempotent success — matches delete_site's
+        """When sitemaps().get() raises a 404 HttpError, gsc_delete_sitemap
+        treats it as idempotent success — matches gsc_delete_site's
         404 behaviour from the site-CRUD rollout."""
         service = MagicMock()
         service.sitemaps.return_value.get.return_value.execute.side_effect = _http_error(404)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_sitemap(
+        out = await gsc_delete_sitemap(
             "sc-domain:example.com", "https://example.com/missing.xml"
         )
         assert "Sitemap not found" in out
@@ -108,7 +108,7 @@ class TestDeleteSitemap:
             "something 404 something"
         )
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_sitemap(
+        out = await gsc_delete_sitemap(
             "sc-domain:example.com", "https://example.com/x.xml"
         )
         assert "Sitemap not found" in out
@@ -118,7 +118,7 @@ class TestDeleteSitemap:
         service.sitemaps.return_value.get.return_value.execute.return_value = {"path": "x"}
         service.sitemaps.return_value.delete.return_value.execute.side_effect = _http_error(403)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_sitemap(
+        out = await gsc_delete_sitemap(
             "sc-domain:example.com", "https://example.com/x.xml"
         )
         assert out.startswith("Error: HTTP 403")
@@ -127,15 +127,15 @@ class TestDeleteSitemap:
         def _explode():
             raise RuntimeError("boom")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await delete_sitemap(
+        out = await gsc_delete_sitemap(
             "sc-domain:example.com", "https://example.com/x.xml"
         )
-        assert "list_sitemaps_enhanced" in out
+        assert "gsc_list_sitemaps_enhanced" in out
 
 
 class TestManageSitemaps:
     async def test_unknown_action_returns_plain_validation_message(self, monkeypatch):
-        out = await manage_sitemaps(
+        out = await gsc_manage_sitemaps(
             "sc-domain:example.com", action="fetch-all"
         )
         assert "Invalid action" in out
@@ -143,7 +143,7 @@ class TestManageSitemaps:
         assert "Error:" not in out
 
     async def test_missing_sitemap_url_for_details(self, monkeypatch):
-        out = await manage_sitemaps(
+        out = await gsc_manage_sitemaps(
             "sc-domain:example.com", action="details"
         )
         assert "requires a sitemap_url parameter" in out
@@ -158,8 +158,8 @@ class TestManageSitemaps:
             called["n"] += 1
             return "delegated-list-ok"
 
-        monkeypatch.setattr(gsc_server, "list_sitemaps_enhanced", _fake_list)
-        out = await manage_sitemaps(
+        monkeypatch.setattr(gsc_server, "gsc_list_sitemaps_enhanced", _fake_list)
+        out = await gsc_manage_sitemaps(
             "sc-domain:example.com", action="list"
         )
         assert out == "delegated-list-ok"
@@ -174,8 +174,8 @@ class TestManageSitemaps:
         async def _fake_list_bad_signature(site_url, sitemap_index=None, response_format="markdown"):
             raise TypeError("unexpected argument xyz")
 
-        monkeypatch.setattr(gsc_server, "list_sitemaps_enhanced", _fake_list_bad_signature)
-        out = await manage_sitemaps(
+        monkeypatch.setattr(gsc_server, "gsc_list_sitemaps_enhanced", _fake_list_bad_signature)
+        out = await gsc_manage_sitemaps(
             "sc-domain:example.com", action="list"
         )
         assert "TypeError" in out

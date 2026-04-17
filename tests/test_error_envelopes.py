@@ -69,7 +69,7 @@ class TestHttpErrorEnvelope:
 
     def test_403_permission_denied_without_site_url(self):
         env = _http_error_envelope(_make_http_error(403), tool="x")
-        assert "get_active_account" in env["hint"]
+        assert "gsc_get_active_account" in env["hint"]
 
     def test_404_site_hint(self):
         env = _http_error_envelope(
@@ -126,13 +126,13 @@ class TestFormatError:
     def test_markdown_renders_error_and_hint(self):
         env = _make_error_envelope(
             error="HTTP 403: no access",
-            hint="use get_active_account",
+            hint="use gsc_get_active_account",
             tool="t",
         )
         out = _format_error(env, response_format="markdown")
         assert isinstance(out, str)
         assert out.startswith("Error: HTTP 403: no access")
-        assert "Hint: use get_active_account" in out
+        assert "Hint: use gsc_get_active_account" in out
 
     def test_markdown_omits_empty_hint(self):
         env = _make_error_envelope(error="plain fail")

@@ -54,7 +54,7 @@ class TestLandingPageSummary:
         env = await gsc_get_landing_page_summary(site_url="sc-domain:example.com")
         _assert_full_b4_envelope(env, tool="gsc_get_landing_page_summary")
         assert "HTTP 403" in env["error"]
-        assert "get_active_account" in env["hint"]
+        assert "gsc_get_active_account" in env["hint"]
 
     async def test_generic_exception_envelope_full_shape(self, monkeypatch):
         def _explode():

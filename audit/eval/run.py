@@ -159,7 +159,7 @@ async def _list_and_run(
         # eval against the wrong account.
         if account:
             switch_response = await session.call_tool(
-                "switch_account", arguments={"alias": account}
+                "gsc_switch_account", arguments={"alias": account}
             )
             if getattr(switch_response, "isError", False):
                 body = "\n".join(
@@ -167,7 +167,7 @@ async def _list_and_run(
                     for item in switch_response.content
                 )
                 raise RuntimeError(
-                    f"switch_account({account!r}) failed before eval started: {body}"
+                    f"gsc_switch_account({account!r}) failed before eval started: {body}"
                 )
 
         for p in prompts:

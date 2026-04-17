@@ -1,4 +1,4 @@
-"""Tests for search-analytics tools — specifically the get_search_by_page_query
+"""Tests for search-analytics tools — specifically the gsc_get_search_by_page_query
 row_limit enhancement and opt-in structured response mode (v0.5.0).
 
 Covers:
@@ -23,7 +23,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 import gsc_server
-from gsc_server import get_search_by_page_query
+from gsc_server import gsc_get_search_by_page_query
 
 
 def _build_mock_service(rows, captured):
@@ -62,7 +62,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -87,7 +87,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -115,7 +115,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -131,7 +131,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -147,7 +147,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -160,7 +160,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=500,
@@ -178,7 +178,7 @@ class TestMarkdownModeBackwardCompat:
 
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -196,7 +196,7 @@ class TestMarkdownModeBackwardCompat:
         service.searchanalytics.return_value.query.return_value.execute.side_effect = http_error
         _patch_service(monkeypatch, service)
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
@@ -213,7 +213,7 @@ class TestMarkdownModeBackwardCompat:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             days="abc",  # type: ignore[arg-type]
@@ -234,7 +234,7 @@ class TestResponseFormatValidation:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="xml",
@@ -249,7 +249,7 @@ class TestResponseFormatValidation:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format=" JSON ",
@@ -269,7 +269,7 @@ class TestJsonRowLimitPassthrough:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -283,7 +283,7 @@ class TestJsonRowLimitPassthrough:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=500,
@@ -298,7 +298,7 @@ class TestJsonRowLimitPassthrough:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=50_000,
@@ -312,7 +312,7 @@ class TestJsonRowLimitPassthrough:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=0,
@@ -326,7 +326,7 @@ class TestJsonRowLimitPassthrough:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=-5,
@@ -342,7 +342,7 @@ class TestJsonDaysClamping:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             days=0,
@@ -381,7 +381,7 @@ class TestJsonSummaryAggregates:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=500,
@@ -411,7 +411,7 @@ class TestJsonPossiblyTruncated:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -429,7 +429,7 @@ class TestJsonPossiblyTruncated:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -455,7 +455,7 @@ class TestSummaryAutoInclude:
         ]
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=20,  # <= 50 threshold
@@ -470,7 +470,7 @@ class TestSummaryAutoInclude:
         ]
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=100,  # > 50 threshold
@@ -486,7 +486,7 @@ class TestSummaryAutoInclude:
         ]
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=20,
@@ -501,7 +501,7 @@ class TestSummaryAutoInclude:
         ]
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             row_limit=500,
@@ -523,7 +523,7 @@ class TestJsonEmptyAndDefensive:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -546,7 +546,7 @@ class TestJsonEmptyAndDefensive:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(None, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -563,7 +563,7 @@ class TestJsonEmptyAndDefensive:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service(rows, captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -595,7 +595,7 @@ class TestJsonErrorPaths:
         service.searchanalytics.return_value.query.return_value.execute.side_effect = http_error
         _patch_service(monkeypatch, service)
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -604,7 +604,7 @@ class TestJsonErrorPaths:
         assert result["ok"] is False
         assert "Invalid site URL" in result["error"]
         assert "HTTP 400" in result["error"]
-        assert result["tool"] == "get_search_by_page_query"
+        assert result["tool"] == "gsc_get_search_by_page_query"
 
     async def test_generic_exception_returns_error_dict(self, monkeypatch):
         # Post-B.4: generic exceptions surface with the exception type
@@ -614,7 +614,7 @@ class TestJsonErrorPaths:
 
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
@@ -623,7 +623,7 @@ class TestJsonErrorPaths:
         assert result["ok"] is False
         assert "boom" in result["error"]
         assert "RuntimeError" in result["error"]
-        assert result["tool"] == "get_search_by_page_query"
+        assert result["tool"] == "gsc_get_search_by_page_query"
         # Hint now present thanks to the envelope helpers.
         assert "hint" in result
 
@@ -633,7 +633,7 @@ class TestJsonErrorPaths:
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
-        result = await get_search_by_page_query(
+        result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             days="abc",  # type: ignore[arg-type]
@@ -642,4 +642,4 @@ class TestJsonErrorPaths:
 
         assert result["ok"] is False
         assert "invalid literal" in result["error"]
-        assert result["tool"] == "get_search_by_page_query"
+        assert result["tool"] == "gsc_get_search_by_page_query"

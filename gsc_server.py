@@ -218,14 +218,14 @@ def _http_error_envelope(
 
     if status == 401:
         hint = (
-            "Unauthorised. Re-authenticate with `add_account` / "
-            "`switch_account`, or set GSC_OAUTH_CLIENT_SECRETS_FILE."
+            "Unauthorised. Re-authenticate with `gsc_add_account` / "
+            "`gsc_switch_account`, or set GSC_OAUTH_CLIENT_SECRETS_FILE."
         )
     elif status == 403:
         site_part = f" Verify `{site_url!r}` is shared with the active account." if site_url else ""
         hint = (
-            f"Permission denied. Check `get_active_account` and "
-            f"`list_properties` first.{site_part}"
+            f"Permission denied. Check `gsc_get_active_account` and "
+            f"`gsc_list_properties` first.{site_part}"
         )
     elif status == 404:
         if site_url:
@@ -936,7 +936,7 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
     return build("searchconsole", "v1", credentials=creds)
 
 @mcp.tool()
-async def list_properties(
+async def gsc_list_properties(
     name_contains: Optional[str] = None,
     limit: int = 50,
 ) -> str:
@@ -949,7 +949,7 @@ async def list_properties(
         limit: Max properties to return (default 50; clamped to [1, 1000]).
     """
     try:
-        async with _instrument("list_properties", name_contains=name_contains, limit=limit):
+        async with _instrument("gsc_list_properties", name_contains=name_contains, limit=limit):
             limit = max(1, min(int(limit), 1000))
 
             service = get_gsc_service()
@@ -999,7 +999,7 @@ async def list_properties(
         return f"Error retrieving properties: {str(e)}"
 
 @mcp.tool()
-async def add_site(site_url: str) -> str:
+async def gsc_add_site(site_url: str) -> str:
     """
     Add a site to your Search Console properties.
     
@@ -1020,7 +1020,7 @@ async def add_site(site_url: str) -> str:
         if getattr(e.resp, "status", None) == 409:
             return f"Site {site_url} is already added to Search Console."
         return _format_error(
-            _http_error_envelope(e, tool="add_site", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_add_site", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1028,13 +1028,13 @@ async def add_site(site_url: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="add_site",
+                tool="gsc_add_site",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def delete_site(site_url: str) -> str:
+async def gsc_delete_site(site_url: str) -> str:
     """
     Remove a site from your Search Console properties.
 
@@ -1051,7 +1051,7 @@ async def delete_site(site_url: str) -> str:
         if getattr(e.resp, "status", None) == 404:
             return f"Site {site_url} was not found in Search Console."
         return _format_error(
-            _http_error_envelope(e, tool="delete_site", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_delete_site", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1059,13 +1059,13 @@ async def delete_site(site_url: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="delete_site",
+                tool="gsc_delete_site",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def get_search_analytics(
+async def gsc_get_search_analytics(
     site_url: str,
     days: int = 28,
     dimensions: str = "query",
@@ -1073,8 +1073,8 @@ async def get_search_analytics(
     response_format: str = "markdown",
 ) -> Any:
     """Overview of a GSC property's top rows. Pick me for a single-dimension
-    summary; use `get_advanced_search_analytics` for sorting/filtering, or
-    `get_search_by_page_query` to break queries down for one page.
+    summary; use `gsc_get_advanced_search_analytics` for sorting/filtering, or
+    `gsc_get_search_by_page_query` to break queries down for one page.
 
     Args:
         site_url: GSC site URL (exact match; for domain properties use `sc-domain:example.com`).
@@ -1085,7 +1085,7 @@ async def get_search_analytics(
             for downstream parsing) | `json` (dict with typed rows).
     """
     try:
-        async with _instrument("get_search_analytics", site_url=site_url, days=days, row_limit=row_limit):
+        async with _instrument("gsc_get_search_analytics", site_url=site_url, days=days, row_limit=row_limit):
             days = max(int(days), 1)
             row_limit = max(1, min(int(row_limit), 25000))
 
@@ -1136,7 +1136,7 @@ async def get_search_analytics(
             truncated = len(rows) >= row_limit
             truncation_hint = (
                 f"Showing {row_limit} rows of possibly-more. Pass a larger "
-                f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
+                f"`row_limit` (max 25000) or use `gsc_get_advanced_search_analytics` "
                 f"with `start_row` to paginate."
             )
 
@@ -1156,7 +1156,7 @@ async def get_search_analytics(
             )
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="get_search_analytics", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_get_search_analytics", site_url=site_url),
             response_format=response_format,
         )
     except Exception as e:
@@ -1164,13 +1164,13 @@ async def get_search_analytics(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="get_search_analytics",
+                tool="gsc_get_search_analytics",
             ),
             response_format=response_format,
         )
 
 @mcp.tool()
-async def get_site_details(site_url: str) -> str:
+async def gsc_get_site_details(site_url: str) -> str:
     """
     Get detailed information about a specific Search Console property.
     
@@ -1213,7 +1213,7 @@ async def get_site_details(site_url: str) -> str:
         return "\n".join(result_lines)
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="get_site_details", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_get_site_details", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1221,15 +1221,15 @@ async def get_site_details(site_url: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="get_site_details",
+                tool="gsc_get_site_details",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
+async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
     """List submitted sitemaps for a GSC property. Compact output with
-    Valid/Has-errors status. Use `list_sitemaps_enhanced` for the richer
+    Valid/Has-errors status. Use `gsc_list_sitemaps_enhanced` for the richer
     table (includes submission + download timestamps + warnings).
 
     Args:
@@ -1299,7 +1299,7 @@ async def get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
         )
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="get_sitemaps", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_get_sitemaps", site_url=site_url),
             response_format=response_format,
         )
     except Exception as e:
@@ -1307,16 +1307,16 @@ async def get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="get_sitemaps",
+                tool="gsc_get_sitemaps",
             ),
             response_format=response_format,
         )
 
 @mcp.tool()
-async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
+async def gsc_inspect_url_enhanced(site_url: str, page_url: str) -> str:
     """Inspect a single URL's indexing status + rich results in Google.
-    Pick me for one URL; use `batch_url_inspection` for up to 10 URLs
-    or `check_indexing_issues` to bucket several URLs by problem type.
+    Pick me for one URL; use `gsc_batch_url_inspection` for up to 10 URLs
+    or `gsc_check_indexing_issues` to bucket several URLs by problem type.
 
     Args:
         site_url: GSC site URL (exact match; `sc-domain:example.com`
@@ -1333,7 +1333,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         }
 
         async with _instrument(
-            "inspect_url_enhanced",
+            "gsc_inspect_url_enhanced",
             site_url=site_url,
             page_url=page_url,
         ):
@@ -1435,7 +1435,7 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
         return "\n".join(result_lines)
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="inspect_url_enhanced", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_inspect_url_enhanced", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1443,13 +1443,13 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="inspect_url_enhanced",
+                tool="gsc_inspect_url_enhanced",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def batch_url_inspection(
+async def gsc_batch_url_inspection(
     site_url: str,
     urls: str = "",
     from_session: Optional[str] = None,
@@ -1459,8 +1459,8 @@ async def batch_url_inspection(
 ) -> str:
     """Inspect up to 10 URLs in batch (URL Inspection API quota limit).
     Pick me when you have several URLs and want the same 4-field
-    per-URL output; use `inspect_url_enhanced` for a single URL with
-    full detail, or `check_indexing_issues` to bucket URLs by problem
+    per-URL output; use `gsc_inspect_url_enhanced` for a single URL with
+    full detail, or `gsc_check_indexing_issues` to bucket URLs by problem
     type.
 
     Two ways to supply URLs:
@@ -1601,7 +1601,7 @@ async def batch_url_inspection(
 
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="batch_url_inspection", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_batch_url_inspection", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1609,17 +1609,17 @@ async def batch_url_inspection(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="batch_url_inspection",
+                tool="gsc_batch_url_inspection",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def check_indexing_issues(site_url: str, urls: str) -> str:
+async def gsc_check_indexing_issues(site_url: str, urls: str) -> str:
     """Bucket up to 10 URLs by indexing problem (not-indexed, canonical
     conflict, robots-blocked, fetch failure, indexed). Pick me when you
-    want a triage summary across several URLs; use `inspect_url_enhanced`
-    for one URL in full detail, or `batch_url_inspection` for uniform
+    want a triage summary across several URLs; use `gsc_inspect_url_enhanced`
+    for one URL in full detail, or `gsc_batch_url_inspection` for uniform
     per-URL output.
 
     Args:
@@ -1737,7 +1737,7 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
 
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="check_indexing_issues", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_check_indexing_issues", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -1745,13 +1745,13 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="check_indexing_issues",
+                tool="gsc_check_indexing_issues",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def get_performance_overview(site_url: str, days: int = 28) -> str:
+async def gsc_get_performance_overview(site_url: str, days: int = 28) -> str:
     """
     Get a performance overview for a specific property.
     
@@ -1775,7 +1775,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         }
 
         async with _instrument(
-            "get_performance_overview",
+            "gsc_get_performance_overview",
             site_url=site_url,
             days=days,
         ):
@@ -1836,7 +1836,7 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
         return f"Error retrieving performance overview: {str(e)}"
 
 @mcp.tool()
-async def get_advanced_search_analytics(
+async def gsc_get_advanced_search_analytics(
     site_url: str,
     start_date: str = None,
     end_date: str = None,
@@ -1852,8 +1852,8 @@ async def get_advanced_search_analytics(
     response_format: str = "markdown",
 ) -> Any:
     """GSC search analytics with sorting, filtering, and pagination. Pick me
-    when you need more than a plain top-N summary; use `get_search_analytics`
-    for a quick overview or `get_search_by_page_query` to break one page
+    when you need more than a plain top-N summary; use `gsc_get_search_analytics`
+    for a quick overview or `gsc_get_search_by_page_query` to break one page
     down by query.
 
     Args:
@@ -1918,7 +1918,7 @@ async def get_advanced_search_analytics(
             request["dimensionFilterGroups"] = [filter_group]
 
         async with _instrument(
-            "get_advanced_search_analytics",
+            "gsc_get_advanced_search_analytics",
             site_url=site_url,
             row_limit=row_limit,
             start_row=start_row,
@@ -2009,7 +2009,7 @@ async def get_advanced_search_analytics(
         )
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="get_advanced_search_analytics", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_get_advanced_search_analytics", site_url=site_url),
             response_format=response_format,
         )
     except Exception as e:
@@ -2017,13 +2017,13 @@ async def get_advanced_search_analytics(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="get_advanced_search_analytics",
+                tool="gsc_get_advanced_search_analytics",
             ),
             response_format=response_format,
         )
 
 @mcp.tool()
-async def compare_search_periods(
+async def gsc_compare_search_periods(
     site_url: str,
     period1_start: str,
     period1_end: str,
@@ -2071,7 +2071,7 @@ async def compare_search_periods(
         }
 
         async with _instrument(
-            "compare_search_periods",
+            "gsc_compare_search_periods",
             site_url=site_url,
             upstream_row_limit=upstream_row_limit,
             dimensions=dimensions,
@@ -2172,7 +2172,7 @@ async def compare_search_periods(
         )
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="compare_search_periods", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_compare_search_periods", site_url=site_url),
             response_format=response_format,
         )
     except Exception as e:
@@ -2180,7 +2180,7 @@ async def compare_search_periods(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="compare_search_periods",
+                tool="gsc_compare_search_periods",
             ),
             response_format=response_format,
         )
@@ -2189,7 +2189,7 @@ _PAGE_QUERY_SUMMARY_MIN_ROWS = 50
 
 
 @mcp.tool()
-async def get_search_by_page_query(
+async def gsc_get_search_by_page_query(
     site_url: str,
     page_url: str,
     days: int = 28,
@@ -2198,8 +2198,8 @@ async def get_search_by_page_query(
     include_summary: Optional[bool] = None,
 ):
     """Break down GSC queries for a single page. Pick me when you already
-    know which URL you want to analyse; use `get_search_analytics` for
-    a property-wide overview or `get_advanced_search_analytics` for
+    know which URL you want to analyse; use `gsc_get_search_analytics` for
+    a property-wide overview or `gsc_get_advanced_search_analytics` for
     filtered/paginated analytics.
 
     Args:
@@ -2275,7 +2275,7 @@ async def get_search_by_page_query(
             }
 
             async with _instrument(
-                "get_search_by_page_query",
+                "gsc_get_search_by_page_query",
                 site_url=site_url,
                 page_url=page_url,
                 mode="markdown",
@@ -2343,7 +2343,7 @@ async def get_search_by_page_query(
         }
 
         async with _instrument(
-            "get_search_by_page_query",
+            "gsc_get_search_by_page_query",
             site_url=site_url,
             page_url=page_url,
             mode="json",
@@ -2402,13 +2402,13 @@ async def get_search_by_page_query(
         return result
     except HttpError as e:
         return _http_error_envelope(
-            e, tool="get_search_by_page_query", site_url=site_url
+            e, tool="gsc_get_search_by_page_query", site_url=site_url
         )
     except Exception as e:
         return _make_error_envelope(
             error=f"{type(e).__name__}: {e}",
             hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-            tool="get_search_by_page_query",
+            tool="gsc_get_search_by_page_query",
         )
 
 
@@ -2671,7 +2671,7 @@ async def gsc_compare_periods_landing_pages(
             b_rows = _query(b_start, b_end)
 
         # Index by page URL (single-dim 'keys' tuple). Reuses the pattern from
-        # compare_search_periods at gsc_server.py:1155-1156.
+        # gsc_compare_search_periods at gsc_server.py:1155-1156.
         a_by_page = {tuple(r.get("keys", [])): r for r in a_rows}
         b_by_page = {tuple(r.get("keys", [])): r for r in b_rows}
         all_pages = set(a_by_page.keys()) | set(b_by_page.keys())
@@ -2681,7 +2681,7 @@ async def gsc_compare_periods_landing_pages(
                 return default
             return float(row.get(key, default))
 
-        # NOTE: This duplicates the inline aggregation in get_search_by_page_query.
+        # NOTE: This duplicates the inline aggregation in gsc_get_search_by_page_query.
         # If extracted to a module-level helper, add regression coverage for both call sites.
         def _period_totals(rows: List[Dict[str, Any]]) -> Dict[str, float]:
             clicks = sum(int(r.get("clicks", 0)) for r in rows)
@@ -2782,14 +2782,14 @@ async def gsc_compare_periods_landing_pages(
 
 
 @mcp.tool()
-async def list_sitemaps_enhanced(
+async def gsc_list_sitemaps_enhanced(
     site_url: str,
     sitemap_index: str = None,
     response_format: str = "markdown",
 ) -> Any:
     """List submitted sitemaps for a GSC property with submission +
     download timestamps, type, URL counts, and error/warning totals.
-    Pick me for the detailed table; use `get_sitemaps` for a compact
+    Pick me for the detailed table; use `gsc_get_sitemaps` for a compact
     Valid/Has-errors summary.
 
     Args:
@@ -2896,7 +2896,7 @@ async def list_sitemaps_enhanced(
         return rendered
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="list_sitemaps_enhanced", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_list_sitemaps_enhanced", site_url=site_url),
             response_format=response_format,
         )
     except Exception as e:
@@ -2904,13 +2904,13 @@ async def list_sitemaps_enhanced(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="list_sitemaps_enhanced",
+                tool="gsc_list_sitemaps_enhanced",
             ),
             response_format=response_format,
         )
 
 @mcp.tool()
-async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
+async def gsc_get_sitemap_details(site_url: str, sitemap_url: str) -> str:
     """
     Get detailed information about a specific sitemap.
     
@@ -2971,22 +2971,22 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         # If it's an index, suggest how to list child sitemaps
         if is_index:
             result_lines.append("\nThis is a sitemap index. To list child sitemaps, use:")
-            result_lines.append(f"list_sitemaps_enhanced with sitemap_index={sitemap_url}")
+            result_lines.append(f"gsc_list_sitemaps_enhanced with sitemap_index={sitemap_url}")
         
         return "\n".join(result_lines)
     except HttpError as e:
-        env = _http_error_envelope(e, tool="get_sitemap_details", site_url=site_url)
+        env = _http_error_envelope(e, tool="gsc_get_sitemap_details", site_url=site_url)
         return _format_error(env, response_format="markdown")
     except Exception as e:
         env = _make_error_envelope(
             error=f"{type(e).__name__}: {e}",
             hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-            tool="get_sitemap_details",
+            tool="gsc_get_sitemap_details",
         )
         return _format_error(env, response_format="markdown")
 
 @mcp.tool()
-async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
+async def gsc_submit_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     Submit a new sitemap or resubmit an existing one to Google.
     
@@ -3031,7 +3031,7 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
 
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="submit_sitemap", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_submit_sitemap", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -3040,13 +3040,13 @@ async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
                 error=f"{type(e).__name__}: {e}",
                 hint="Verify the sitemap URL is reachable and uses the same "
                      "scheme/host as the GSC property.",
-                tool="submit_sitemap",
+                tool="gsc_submit_sitemap",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
+async def gsc_delete_sitemap(site_url: str, sitemap_url: str) -> str:
     """
     Delete (unsubmit) a sitemap from Google Search Console.
     
@@ -3059,7 +3059,7 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
 
         # Pre-check: if the sitemap isn't registered, short-circuit to an
         # idempotent "already deleted" message rather than surfacing an
-        # error envelope (matches delete_site's 404 semantics from the
+        # error envelope (matches gsc_delete_site's 404 semantics from the
         # site-CRUD B.4 rollout).
         try:
             service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
@@ -3082,7 +3082,7 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
         )
     except HttpError as e:
         return _format_error(
-            _http_error_envelope(e, tool="delete_sitemap", site_url=site_url),
+            _http_error_envelope(e, tool="gsc_delete_sitemap", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
@@ -3090,14 +3090,14 @@ async def delete_sitemap(site_url: str, sitemap_url: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Verify the sitemap URL was submitted in the first place; "
-                     "use `list_sitemaps_enhanced` to list known sitemaps.",
-                tool="delete_sitemap",
+                     "use `gsc_list_sitemaps_enhanced` to list known sitemaps.",
+                tool="gsc_delete_sitemap",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
+async def gsc_manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
     """
     All-in-one tool to manage sitemaps (list, get details, submit, delete).
     
@@ -3120,13 +3120,13 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
         
         # Perform the requested action
         if action == "list":
-            return await list_sitemaps_enhanced(site_url, sitemap_index)
+            return await gsc_list_sitemaps_enhanced(site_url, sitemap_index)
         elif action == "details":
-            return await get_sitemap_details(site_url, sitemap_url)
+            return await gsc_get_sitemap_details(site_url, sitemap_url)
         elif action == "submit":
-            return await submit_sitemap(site_url, sitemap_url)
+            return await gsc_submit_sitemap(site_url, sitemap_url)
         elif action == "delete":
-            return await delete_sitemap(site_url, sitemap_url)
+            return await gsc_delete_sitemap(site_url, sitemap_url)
 
     except Exception as e:
         # Dispatcher-level safety net. The underlying tools handle
@@ -3138,7 +3138,7 @@ async def manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, s
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Check `action` is one of: list, details, submit, delete.",
-                tool="manage_sitemaps",
+                tool="gsc_manage_sitemaps",
             ),
             response_format="markdown",
         )
@@ -3173,7 +3173,7 @@ def _read_account_scopes(token_file_relative: Optional[str]) -> List[str]:
 
 
 @mcp.tool()
-async def list_accounts() -> str:
+async def gsc_list_accounts() -> str:
     """
     Lists all configured Google accounts with their aliases, emails, active
     status, and granted OAuth scopes.
@@ -3186,7 +3186,7 @@ async def list_accounts() -> str:
         if not accounts:
             return (
                 "No accounts configured.\n\n"
-                "Use `add_account` to add a Google account, or if you have an existing "
+                "Use `gsc_add_account` to add a Google account, or if you have an existing "
                 "token.json it will be auto-migrated on next server restart."
             )
 
@@ -3206,14 +3206,14 @@ async def list_accounts() -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint="Check that the accounts manifest exists and is readable.",
-                tool="list_accounts",
+                tool="gsc_list_accounts",
             ),
             response_format="markdown",
         )
 
 
 @mcp.tool()
-async def get_active_account() -> str:
+async def gsc_get_active_account() -> str:
     """
     Shows the currently active Google account alias and email.
     All GSC operations use the active account's credentials.
@@ -3222,19 +3222,19 @@ async def get_active_account() -> str:
     # outside so _instrument sees the original exception (tool_error
     # log emitted) before we convert it to a user-facing string.
     try:
-        async with _instrument("get_active_account"):
+        async with _instrument("gsc_get_active_account"):
             global _active_account
             if _active_account is None:
                 manifest = _load_manifest()
                 _active_account = manifest.get("active_account")
 
             if _active_account is None:
-                return "No active account. Use `add_account` to add one, or existing token.json will be used as fallback."
+                return "No active account. Use `gsc_add_account` to add one, or existing token.json will be used as fallback."
 
             manifest = _load_manifest()
             acct = manifest.get("accounts", {}).get(_active_account)
             if not acct:
-                return f"Active account '{_active_account}' not found in manifest. Use `list_accounts` to see available accounts."
+                return f"Active account '{_active_account}' not found in manifest. Use `gsc_list_accounts` to see available accounts."
 
             email = acct.get("email") or "unknown"
             return f"Active account: **{_active_account}** ({email})"
@@ -3243,7 +3243,7 @@ async def get_active_account() -> str:
 
 
 @mcp.tool()
-async def add_account(alias: str) -> str:
+async def gsc_add_account(alias: str) -> str:
     """
     Adds a new Google account. Opens a browser window for Google OAuth login.
     The new account becomes the active account after successful authentication.
@@ -3262,7 +3262,7 @@ async def add_account(alias: str) -> str:
 
         # Check for alias collision
         if alias in manifest.get("accounts", {}):
-            return f"Account '{alias}' already exists. Use a different alias or remove it first with `remove_account`."
+            return f"Account '{alias}' already exists. Use a different alias or remove it first with `gsc_remove_account`."
 
         # Check client secrets
         if not os.path.exists(OAUTH_CLIENT_SECRETS_FILE):
@@ -3277,13 +3277,13 @@ async def add_account(alias: str) -> str:
         try:
             os.mkdir(acct_dir)
         except FileExistsError:
-            return f"Account directory for '{alias}' already exists. Remove it first with `remove_account`."
+            return f"Account directory for '{alias}' already exists. Remove it first with `gsc_remove_account`."
         token_path = os.path.join(acct_dir, "token.json")
 
         # Run OAuth flow
         try:
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
-            creds = _start_oauth_flow(flow, context=f"add_account('{alias}')")
+            creds = _start_oauth_flow(flow, context=f"gsc_add_account('{alias}')")
         except HeadlessOAuthError as e:
             # HeadlessOAuthError carries its own remediation message —
             # surface it verbatim rather than wrapping in an envelope.
@@ -3297,7 +3297,7 @@ async def add_account(alias: str) -> str:
                     error=f"OAuth flow failed: {type(e).__name__}: {e}",
                     hint="Check that client_secrets.json is current and that the "
                          "browser was able to reach the local callback port.",
-                    tool="add_account",
+                    tool="gsc_add_account",
                 ),
                 response_format="markdown",
             )
@@ -3330,20 +3330,20 @@ async def add_account(alias: str) -> str:
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
                 hint=f"The `{alias}` account directory may be in a partial state; "
-                     "try `remove_account` to clean up, then retry.",
-                tool="add_account",
+                     "try `gsc_remove_account` to clean up, then retry.",
+                tool="gsc_add_account",
             ),
             response_format="markdown",
         )
 
 
 @mcp.tool()
-async def switch_account(alias: str) -> str:
+async def gsc_switch_account(alias: str) -> str:
     """
     Switches the active Google account. All subsequent GSC operations will use this account's credentials.
 
     Args:
-        alias: The alias of the account to switch to. Use `list_accounts` to see available accounts.
+        alias: The alias of the account to switch to. Use `gsc_list_accounts` to see available accounts.
     """
     try:
         alias = _validate_alias(alias)
@@ -3369,21 +3369,21 @@ async def switch_account(alias: str) -> str:
         return _format_error(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
-                hint="Run `list_accounts` to see available aliases.",
-                tool="switch_account",
+                hint="Run `gsc_list_accounts` to see available aliases.",
+                tool="gsc_switch_account",
             ),
             response_format="markdown",
         )
 
 
 @mcp.tool()
-async def remove_account(alias: str) -> str:
+async def gsc_remove_account(alias: str) -> str:
     """
     Removes a Google account and its stored credentials.
     If the removed account was active, switches to the first remaining account.
 
     Args:
-        alias: The alias of the account to remove. Use `list_accounts` to see available accounts.
+        alias: The alias of the account to remove. Use `gsc_list_accounts` to see available accounts.
     """
     try:
         alias = _validate_alias(alias)
@@ -3425,7 +3425,7 @@ async def remove_account(alias: str) -> str:
                 error=f"{type(e).__name__}: {e}",
                 hint="The account directory or manifest may be locked; check file "
                      "permissions on accounts/ and retry.",
-                tool="remove_account",
+                tool="gsc_remove_account",
             ),
             response_format="markdown",
         )
@@ -3477,7 +3477,7 @@ async def gsc_health_check(site_url: str) -> Dict[str, Any]:
         return _make_error_envelope(
             error=f"auth failed: {type(e).__name__}: {e}",
             hint="Check that `client_secrets.json` is present and that the "
-                 "active account has a valid token (see `get_active_account`).",
+                 "active account has a valid token (see `gsc_get_active_account`).",
             tool="gsc_health_check",
         )
 
@@ -3906,7 +3906,7 @@ async def gsc_query_sf_export(
 
 
 @mcp.tool()
-async def get_creator_info() -> str:
+async def gsc_get_creator_info() -> str:
     """
     Provides information about Amin Foroutan, the creator of the MCP-GSC tool.
     """

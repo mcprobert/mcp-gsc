@@ -1,20 +1,20 @@
 """Regression tests for sitemap tools.
 
 A.3 fix: the GSC Sitemaps API returns ``errors`` and ``warnings`` as
-*strings* ("0", "7", ...), but ``get_sitemaps`` compared the raw value to
+*strings* ("0", "7", ...), but ``gsc_get_sitemaps`` compared the raw value to
 ``0`` (``sitemap["errors"] > 0``), raising
 ``TypeError: '>' not supported between instances of 'str' and 'int'``.
 The fix coerces both fields via ``int(...)`` with a defensive fallback.
 
 Also covers the B.2/B.4 sitemap rollout: response_format enum on
-``get_sitemaps`` and ``list_sitemaps_enhanced`` + error envelopes.
+``gsc_get_sitemaps`` and ``gsc_list_sitemaps_enhanced`` + error envelopes.
 """
 from unittest.mock import MagicMock
 
 from googleapiclient.errors import HttpError
 
 import gsc_server
-from gsc_server import get_sitemaps, list_sitemaps_enhanced
+from gsc_server import gsc_get_sitemaps, gsc_list_sitemaps_enhanced
 
 
 def _mock_service(sitemap_payload):
@@ -40,7 +40,7 @@ class TestGetSitemapsStringTypedCounts:
             ]
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "Error retrieving sitemaps" not in out
         assert "https://example.com/sitemap.xml" in out
         assert "Valid" in out  # errors=0 → Valid
@@ -57,7 +57,7 @@ class TestGetSitemapsStringTypedCounts:
             ]
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "Has errors" in out
         assert "| 3" in out  # error count surfaced
 
@@ -69,13 +69,13 @@ class TestGetSitemapsStringTypedCounts:
             ]
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "Has errors" in out
 
     async def test_errors_missing_defaults_to_zero(self, monkeypatch):
         payload = {"sitemap": [{"path": "https://example.com/s.xml"}]}
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "Valid" in out
         # Pin the errors column rendering so a future regression that
         # returns "None" or blank is caught.
@@ -87,19 +87,19 @@ class TestGetSitemapsStringTypedCounts:
             "sitemap": [{"path": "https://example.com/s.xml", "errors": "n/a"}]
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "Error retrieving sitemaps" not in out
         assert "Valid" in out
 
     async def test_empty_sitemap_list(self, monkeypatch):
         payload = {}
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert "No sitemaps found" in out
 
 
 class TestGetSitemapsResponseFormat:
-    """B.2 rollout — response_format enum on get_sitemaps."""
+    """B.2 rollout — response_format enum on gsc_get_sitemaps."""
 
     PAYLOAD = {
         "sitemap": [
@@ -120,7 +120,7 @@ class TestGetSitemapsResponseFormat:
 
     async def test_markdown_golden_shape(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await get_sitemaps("sc-domain:example.com")
+        out = await gsc_get_sitemaps("sc-domain:example.com")
         assert isinstance(out, str)
         assert "Sitemaps for sc-domain:example.com" in out
         assert "Path | Last Downloaded | Status | Indexed URLs | Errors" in out
@@ -129,7 +129,7 @@ class TestGetSitemapsResponseFormat:
 
     async def test_json_shape(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await get_sitemaps(
+        out = await gsc_get_sitemaps(
             "sc-domain:example.com", response_format="json"
         )
         assert isinstance(out, dict)
@@ -144,7 +144,7 @@ class TestGetSitemapsResponseFormat:
 
     async def test_csv_mode(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await get_sitemaps(
+        out = await gsc_get_sitemaps(
             "sc-domain:example.com", response_format="csv"
         )
         assert isinstance(out, str)
@@ -159,15 +159,15 @@ class TestGetSitemapsResponseFormat:
         service.sitemaps.return_value.list.side_effect = http_err
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
 
-        out = await get_sitemaps("sc-domain:example.com", response_format="json")
+        out = await gsc_get_sitemaps("sc-domain:example.com", response_format="json")
         assert isinstance(out, dict)
         assert out["ok"] is False
         assert "HTTP 403" in out["error"]
-        assert "get_active_account" in out["hint"]
+        assert "gsc_get_active_account" in out["hint"]
 
 
 class TestListSitemapsEnhancedResponseFormat:
-    """B.2 rollout — response_format enum on list_sitemaps_enhanced."""
+    """B.2 rollout — response_format enum on gsc_list_sitemaps_enhanced."""
 
     PAYLOAD = {
         "sitemap": [
@@ -190,7 +190,7 @@ class TestListSitemapsEnhancedResponseFormat:
 
     async def test_markdown_shape_with_pending_note(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await list_sitemaps_enhanced("sc-domain:example.com")
+        out = await gsc_list_sitemaps_enhanced("sc-domain:example.com")
         assert isinstance(out, str)
         assert "all submitted sitemaps" in out
         assert "Path | Last Submitted | Last Downloaded | Type | URLs | Errors | Warnings" in out
@@ -199,7 +199,7 @@ class TestListSitemapsEnhancedResponseFormat:
 
     async def test_json_shape_exposes_pending_count_in_meta(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await list_sitemaps_enhanced(
+        out = await gsc_list_sitemaps_enhanced(
             "sc-domain:example.com", response_format="json"
         )
         assert isinstance(out, dict)
@@ -209,12 +209,12 @@ class TestListSitemapsEnhancedResponseFormat:
 
     async def test_empty_returns_plain_message(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service({}))
-        out = await list_sitemaps_enhanced("sc-domain:example.com")
+        out = await gsc_list_sitemaps_enhanced("sc-domain:example.com")
         assert "No sitemaps found" in out
 
     async def test_sitemap_index_param_changes_header(self, monkeypatch):
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(self.PAYLOAD))
-        out = await list_sitemaps_enhanced(
+        out = await gsc_list_sitemaps_enhanced(
             "sc-domain:example.com",
             sitemap_index="https://example.com/sitemap-index.xml",
         )
@@ -230,7 +230,7 @@ class TestListSitemapsEnhancedResponseFormat:
         service.sitemaps.return_value.list.side_effect = http_err
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
 
-        out = await list_sitemaps_enhanced(
+        out = await gsc_list_sitemaps_enhanced(
             "sc-domain:example.com", response_format="json"
         )
         assert out["ok"] is False

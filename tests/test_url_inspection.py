@@ -14,9 +14,9 @@ from googleapiclient.errors import HttpError
 
 import gsc_server
 from gsc_server import (
-    batch_url_inspection,
-    check_indexing_issues,
-    inspect_url_enhanced,
+    gsc_batch_url_inspection,
+    gsc_check_indexing_issues,
+    gsc_inspect_url_enhanced,
 )
 
 
@@ -35,7 +35,7 @@ class TestInspectUrlEnhanced:
             _http_error(403, "no access")
         )
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await inspect_url_enhanced(
+        out = await gsc_inspect_url_enhanced(
             "sc-domain:example.com", "https://example.com/foo"
         )
         assert out.startswith("Error: HTTP 403")
@@ -46,7 +46,7 @@ class TestInspectUrlEnhanced:
         def _explode():
             raise RuntimeError("boom")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await inspect_url_enhanced(
+        out = await gsc_inspect_url_enhanced(
             "sc-domain:example.com", "https://example.com/foo"
         )
         assert "RuntimeError" in out
@@ -65,7 +65,7 @@ class TestInspectUrlEnhanced:
             }
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await inspect_url_enhanced(
+        out = await gsc_inspect_url_enhanced(
             "sc-domain:example.com", "https://example.com/foo"
         )
         assert "URL Inspection for https://example.com/foo" in out
@@ -78,7 +78,7 @@ class TestBatchUrlInspection:
         def _explode():
             raise RuntimeError("oauth dead")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await batch_url_inspection(
+        out = await gsc_batch_url_inspection(
             site_url="sc-domain:example.com",
             urls="https://example.com/a",
         )
@@ -94,7 +94,7 @@ class TestBatchUrlInspection:
         def _raise_http_err():
             raise _http_error(401, "token expired")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _raise_http_err)
-        out = await batch_url_inspection(
+        out = await gsc_batch_url_inspection(
             site_url="sc-domain:example.com",
             urls="https://example.com/a",
         )
@@ -124,7 +124,7 @@ class TestBatchUrlInspection:
         service.urlInspection.return_value.index.return_value.inspect.return_value.execute.side_effect = _execute_side_effect
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
 
-        out = await batch_url_inspection(
+        out = await gsc_batch_url_inspection(
             site_url="sc-domain:example.com",
             urls="https://example.com/a\nhttps://example.com/b",
         )
@@ -140,7 +140,7 @@ class TestCheckIndexingIssues:
         def _explode():
             raise RuntimeError("boom")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await check_indexing_issues(
+        out = await gsc_check_indexing_issues(
             "sc-domain:example.com", "https://example.com/a"
         )
         assert "RuntimeError" in out
@@ -150,7 +150,7 @@ class TestCheckIndexingIssues:
         def _explode():
             raise _http_error(429, "slow down")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await check_indexing_issues(
+        out = await gsc_check_indexing_issues(
             "sc-domain:example.com", "https://example.com/a"
         )
         assert "HTTP 429" in out

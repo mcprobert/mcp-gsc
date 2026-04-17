@@ -153,12 +153,12 @@ class TestHotPathToolsEmitTelemetry:
     @pytest.mark.asyncio
     async def test_list_properties_emits_enter_and_exit(self, monkeypatch, capsys):
         mod = _reload_with_env(monkeypatch, "1")
-        await self._run_with_mocked_service(mod, "list_properties", {})
+        await self._run_with_mocked_service(mod, "gsc_list_properties", {})
         lines = [
             json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
             if line.startswith("{")
         ]
-        events_for_tool = [l for l in lines if l.get("tool") == "list_properties"]
+        events_for_tool = [l for l in lines if l.get("tool") == "gsc_list_properties"]
         # Must have at least tool_enter + tool_exit.
         event_types = {e["event"] for e in events_for_tool}
         assert "tool_enter" in event_types
@@ -169,14 +169,14 @@ class TestHotPathToolsEmitTelemetry:
         mod = _reload_with_env(monkeypatch, "1")
         await self._run_with_mocked_service(
             mod,
-            "get_search_analytics",
+            "gsc_get_search_analytics",
             {"site_url": "sc-domain:example.com", "days": 14, "row_limit": 50},
         )
         lines = [
             json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
             if line.startswith("{")
         ]
-        enter = next(l for l in lines if l["event"] == "tool_enter" and l["tool"] == "get_search_analytics")
+        enter = next(l for l in lines if l["event"] == "tool_enter" and l["tool"] == "gsc_get_search_analytics")
         # Initial fields passed to _instrument must appear on the enter event.
         assert enter["site_url"] == "sc-domain:example.com"
         assert enter["days"] == 14
@@ -195,7 +195,7 @@ class TestHotPathToolsEmitTelemetry:
         service.sites.return_value.list.return_value.execute.side_effect = RuntimeError("boom")
         mod.get_gsc_service = lambda: service  # type: ignore[assignment]
 
-        out = await mod.list_properties()
+        out = await mod.gsc_list_properties()
         # User saw the envelope-converted string...
         assert "RuntimeError" in out or "boom" in out or "Error" in out
 
@@ -204,7 +204,7 @@ class TestHotPathToolsEmitTelemetry:
             json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
             if line.startswith("{")
         ]
-        tool_errors = [l for l in lines if l["event"] == "tool_error" and l["tool"] == "list_properties"]
+        tool_errors = [l for l in lines if l["event"] == "tool_error" and l["tool"] == "gsc_list_properties"]
         assert tool_errors, "tool_error must fire before the envelope swallows the exception"
         assert tool_errors[0]["error_type"] == "RuntimeError"
         assert tool_errors[0]["ok"] is False

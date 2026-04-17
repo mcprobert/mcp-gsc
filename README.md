@@ -45,27 +45,27 @@ Here's what you can ask Claude to do once you've set up this integration:
 
 | **What You Can Ask For**        | **What It Does**                                            | **What You'll Need to Provide**                                 |
 |---------------------------------|-------------------------------------------------------------|----------------------------------------------------------------|
-| `list_properties`               | Shows all your GSC properties (now supports `name_contains`)| Nothing - just ask!                                             |
-| `get_site_details`              | Shows details about a specific site                         | Your website URL                                                |
-| `add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
-| `delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
-| `get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
-| `get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
+| `gsc_list_properties`               | Shows all your GSC properties (now supports `name_contains`)| Nothing - just ask!                                             |
+| `gsc_get_site_details`              | Shows details about a specific site                         | Your website URL                                                |
+| `gsc_add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
+| `gsc_delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
+| `gsc_get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
+| `gsc_get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
 | `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with a configurable striking-distance band | Your website URL and time period                                |
 | `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
-| `get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
+| `gsc_get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
 | `gsc_health_check`              | One-shot audit diagnostic (verification, sitemaps, last data)| Your website URL                                               |
-| `check_indexing_issues`         | Checks if pages have indexing problems                      | Your website URL and list of pages to check                     |
-| `inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
-| `batch_url_inspection`          | Inspect up to 10 URLs (now accepts URLs from an SF session) | Your website URL and URL list (or an SF session id)             |
-| `get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
-| `submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
+| `gsc_check_indexing_issues`         | Checks if pages have indexing problems                      | Your website URL and list of pages to check                     |
+| `gsc_inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
+| `gsc_batch_url_inspection`          | Inspect up to 10 URLs (now accepts URLs from an SF session) | Your website URL and URL list (or an SF session id)             |
+| `gsc_get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
+| `gsc_submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
 | `gsc_load_from_sf_export`       | Ingests a Screaming Frog export folder for offline querying | Path to the SF export folder and the site URL                   |
 | `gsc_query_sf_export`           | Query a loaded SF export with filter/sort/pagination        | Session id and dataset name                                     |
-| `list_accounts`                 | Shows all configured Google accounts (now with OAuth scopes)| Nothing - just ask!                                             |
-| `add_account`                   | Adds a new Google account via browser OAuth                 | An alias (e.g., 'client-a')                                     |
-| `switch_account`                | Switches the active Google account                          | The alias of the account to switch to                           |
-| `remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
+| `gsc_list_accounts`                 | Shows all configured Google accounts (now with OAuth scopes)| Nothing - just ask!                                             |
+| `gsc_add_account`                   | Adds a new Google account via browser OAuth                 | An alias (e.g., 'client-a')                                     |
+| `gsc_switch_account`                | Switches the active Google account                          | The alias of the account to switch to                           |
+| `gsc_remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
 
@@ -81,7 +81,7 @@ API for data that's already crawled. The loader:
 - Normalizes column names to snake_case (e.g. `"Avg. Position"` → `"position"`)
 - Auto-adapts to whichever columns SF exported — indexability-only crawls work today; crawls with GSC API integration enabled light up the full click/impression/CTR/position metrics automatically
 
-`batch_url_inspection` accepts `from_session=<sf-session-id>` to pull URLs from
+`gsc_batch_url_inspection` accepts `from_session=<sf-session-id>` to pull URLs from
 an SF dataset (e.g. `search_console_indexable_url_not_indexed`) with
 `offset`/`limit` pagination — the 10-URL-per-call cap is preserved.
 
@@ -99,7 +99,7 @@ away from the first page, or widen it for deeper opportunity analysis.
 the same primitive serves both decay detection (`asc`) and top-riser discovery
 (`desc`).
 
-### v0.5.0 — `get_search_by_page_query` row-limit fix and opt-in structured mode
+### v0.5.0 — `gsc_get_search_by_page_query` row-limit fix and opt-in structured mode
 
 **The bug:** the previous implementation hardcoded `rowLimit: 20`, so any
 page ranking for more than 20 queries produced dramatically undercounted
@@ -137,14 +137,14 @@ parameter.
 
 ```python
 # Pre-0.5 call — still works unchanged
-response = await get_search_by_page_query(site_url, page_url)
+response = await gsc_get_search_by_page_query(site_url, page_url)
 # response is still a formatted markdown string
 
 # Fix the undercount in markdown mode (no return-type change)
-response = await get_search_by_page_query(site_url, page_url, row_limit=500)
+response = await gsc_get_search_by_page_query(site_url, page_url, row_limit=500)
 
 # Opt into structured output for programmatic access
-response = await get_search_by_page_query(
+response = await gsc_get_search_by_page_query(
     site_url, page_url, row_limit=500, response_format="json"
 )
 if response["ok"]:
@@ -165,7 +165,7 @@ The markdown default is not deprecated — both modes are first-class.
 - Stricter input validation across the new tools: `limit`, `sort_direction`,
   `offset`, `striking_distance_range`, and SF-session pagination all reject
   invalid values up front with clean errors.
-- `batch_url_inspection` now fails fast on session/input errors BEFORE hitting
+- `gsc_batch_url_inspection` now fails fast on session/input errors BEFORE hitting
   OAuth, so session misconfigurations don't get masked behind auth failures.
 - Filter equality on `gsc_query_sf_export` now coerces numerically when the
   caller supplies a Python numeric target, so `{"status_code": 200.0}` matches
@@ -394,22 +394,22 @@ Here are some powerful prompts you can use with each tool:
 
 | **Tool Name**                   | **Sample Prompt**                                                                                |
 |---------------------------------|--------------------------------------------------------------------------------------------------|
-| `list_properties`               | "List all my GSC properties and tell me which ones have the most pages indexed."                 |
-| `get_site_details`              | "Analyze the verification status of mywebsite.com and explain what the ownership details mean."  |
-| `add_site`                      | "Add my new website https://mywebsite.com to Search Console and verify its status."              |
-| `delete_site`                   | "Remove the old test site https://test.mywebsite.com from Search Console."                       |
-| `get_search_analytics`          | "Show me the top 20 search queries for mywebsite.com in the last 30 days, highlight any with CTR below 2%, and suggest title improvements." |
-| `get_performance_overview`      | "Create a visual performance overview of mywebsite.com for the last 28 days, identify any unusual drops or spikes, and explain possible causes." |
-| `check_indexing_issues`         | "Check these important pages for indexing issues and prioritize which ones need immediate attention: mywebsite.com/product, mywebsite.com/services, mywebsite.com/about" |
-| `inspect_url_enhanced`          | "Do a comprehensive inspection of mywebsite.com/landing-page and give me actionable recommendations to improve its indexing status." |
-| `batch_url_inspection`          | "Inspect my top 5 product pages, identify common crawling or indexing patterns, and suggest technical SEO improvements." |
-| `get_sitemaps`                  | "List all sitemaps for mywebsite.com, identify any with errors, and recommend next steps." |
-| `list_sitemaps_enhanced`        | "Analyze all my sitemaps for mywebsite.com, focusing on error patterns, and create a prioritized action plan." |
-| `submit_sitemap`                | "Submit my new product sitemap at https://mywebsite.com/product-sitemap.xml and explain how long it typically takes for Google to process it." |
-| `get_sitemap_details`           | "Check the status of my main sitemap at mywebsite.com/sitemap.xml and explain what the warnings mean for my SEO." |
-| `get_search_by_page_query`      | "What search terms are driving traffic to my blog post at mywebsite.com/blog/post-title? Identify opportunities to optimize for related keywords." |
-| `compare_search_periods`        | "Compare my site's performance between January and February. What queries improved the most, which declined, and what might explain these changes?" |
-| `get_advanced_search_analytics` | "Analyze my mobile search performance for queries with high impressions but positions below 10, and suggest content improvements to help them rank better." |
+| `gsc_list_properties`               | "List all my GSC properties and tell me which ones have the most pages indexed."                 |
+| `gsc_get_site_details`              | "Analyze the verification status of mywebsite.com and explain what the ownership details mean."  |
+| `gsc_add_site`                      | "Add my new website https://mywebsite.com to Search Console and verify its status."              |
+| `gsc_delete_site`                   | "Remove the old test site https://test.mywebsite.com from Search Console."                       |
+| `gsc_get_search_analytics`          | "Show me the top 20 search queries for mywebsite.com in the last 30 days, highlight any with CTR below 2%, and suggest title improvements." |
+| `gsc_get_performance_overview`      | "Create a visual performance overview of mywebsite.com for the last 28 days, identify any unusual drops or spikes, and explain possible causes." |
+| `gsc_check_indexing_issues`         | "Check these important pages for indexing issues and prioritize which ones need immediate attention: mywebsite.com/product, mywebsite.com/services, mywebsite.com/about" |
+| `gsc_inspect_url_enhanced`          | "Do a comprehensive inspection of mywebsite.com/landing-page and give me actionable recommendations to improve its indexing status." |
+| `gsc_batch_url_inspection`          | "Inspect my top 5 product pages, identify common crawling or indexing patterns, and suggest technical SEO improvements." |
+| `gsc_get_sitemaps`                  | "List all sitemaps for mywebsite.com, identify any with errors, and recommend next steps." |
+| `gsc_list_sitemaps_enhanced`        | "Analyze all my sitemaps for mywebsite.com, focusing on error patterns, and create a prioritized action plan." |
+| `gsc_submit_sitemap`                | "Submit my new product sitemap at https://mywebsite.com/product-sitemap.xml and explain how long it typically takes for Google to process it." |
+| `gsc_get_sitemap_details`           | "Check the status of my main sitemap at mywebsite.com/sitemap.xml and explain what the warnings mean for my SEO." |
+| `gsc_get_search_by_page_query`      | "What search terms are driving traffic to my blog post at mywebsite.com/blog/post-title? Identify opportunities to optimize for related keywords." |
+| `gsc_compare_search_periods`        | "Compare my site's performance between January and February. What queries improved the most, which declined, and what might explain these changes?" |
+| `gsc_get_advanced_search_analytics` | "Analyze my mobile search performance for queries with high impressions but positions below 10, and suggest content improvements to help them rank better." |
 
 You can also ask Claude to combine multiple tools and analyze the results. For example:
 

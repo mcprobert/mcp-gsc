@@ -5,6 +5,107 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.0.0] — 2026-04-17 — Namespace rename (A.4) + Tranche B complete
+
+### Breaking — tool namespace rename
+
+The deferred A.4 item from the original audit lands. Every one of the
+24 previously-bare tools is now prefixed `gsc_`. The other 5 tools
+already had the prefix and are unchanged. **Every client config that
+pins old tool names MUST be updated.**
+
+| Old name                       | New name                           |
+|--------------------------------|------------------------------------|
+| `list_properties`              | `gsc_list_properties`              |
+| `add_site`                     | `gsc_add_site`                     |
+| `delete_site`                  | `gsc_delete_site`                  |
+| `get_site_details`             | `gsc_get_site_details`             |
+| `get_search_analytics`         | `gsc_get_search_analytics`         |
+| `get_advanced_search_analytics`| `gsc_get_advanced_search_analytics`|
+| `compare_search_periods`       | `gsc_compare_search_periods`       |
+| `get_search_by_page_query`     | `gsc_get_search_by_page_query`     |
+| `get_performance_overview`     | `gsc_get_performance_overview`     |
+| `inspect_url_enhanced`         | `gsc_inspect_url_enhanced`         |
+| `batch_url_inspection`         | `gsc_batch_url_inspection`         |
+| `check_indexing_issues`        | `gsc_check_indexing_issues`        |
+| `get_sitemaps`                 | `gsc_get_sitemaps`                 |
+| `list_sitemaps_enhanced`       | `gsc_list_sitemaps_enhanced`       |
+| `get_sitemap_details`          | `gsc_get_sitemap_details`          |
+| `submit_sitemap`               | `gsc_submit_sitemap`               |
+| `delete_sitemap`               | `gsc_delete_sitemap`               |
+| `manage_sitemaps`              | `gsc_manage_sitemaps`              |
+| `list_accounts`                | `gsc_list_accounts`                |
+| `get_active_account`           | `gsc_get_active_account`           |
+| `add_account`                  | `gsc_add_account`                  |
+| `switch_account`               | `gsc_switch_account`               |
+| `remove_account`               | `gsc_remove_account`               |
+| `get_creator_info`             | `gsc_get_creator_info`             |
+
+**Why this matters.** The pre-1.0 tools had names generic enough to
+collide with any other MCP server that exposes `list_properties`,
+`inspect_url_enhanced`, `list_accounts`, etc. `gsc_*` prefix prevents
+accidental cross-server tool routing and makes the server's namespace
+discoverable via simple prefix filter.
+
+**Rollout.** Hard cutover — no legacy-alias wrappers. The
+remediation plan called out that dual-register would double the
+schema tax for 24 tools. 397 substitutions across `gsc_server.py`,
+tests, README, CLAUDE.md, and `audit/eval/prompts.json` applied via
+`audit/_work/rename_tools_a4.py`. All 308 tests pass unchanged.
+
+**Audit docs** (01/02/03/04 markdown) preserved with old names — they
+are historical snapshots, not a running ledger.
+
+### Tranche B — all items landed (shipped incrementally during v0.6.x)
+
+The full Tranche B rollout from `audit/03-remediation-plan.md` is now
+on main:
+
+- **B.3** shared `_format_table` helper (markdown / csv / json
+  renderer) — `3e3a5cd`.
+- **B.6** opt-in structured telemetry behind `GSC_MCP_TELEMETRY=1`;
+  hot-path tools (`gsc_list_properties`, `gsc_get_search_analytics`,
+  `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`,
+  `gsc_get_search_by_page_query`, `gsc_inspect_url_enhanced`,
+  `gsc_get_performance_overview`, `gsc_compare_periods_landing_pages`,
+  `gsc_get_active_account`) emit `tool_enter` / `tool_exit` /
+  `tool_error` JSON lines on stderr — `0d74f83` + `4bcce20`.
+- **B.1** consolidation — deferred as not-justified; A.5
+  disambiguation already addressed the agent-confusion rationale
+  (`8a56609`).
+- **B.2** `response_format="markdown" | "csv" | "json"` enum on every
+  tabular tool: the three analytics tools (`a9da902`), plus
+  `gsc_get_sitemaps` and `gsc_list_sitemaps_enhanced` (`ab609f3`).
+- **B.5** `get_search_by_page_query`'s JSON `summary` block now
+  suppressed by default when `row_limit <= 50` — `cf34e93`.
+- **B.4** structured error envelopes (`{ok, error, hint, retry_after,
+  tool}`) with status-aware hints rolled out to every tool:
+  analytics (`7a654ca`), sitemap reads (`ab609f3`), site CRUD
+  (`51d8e7e`), URL inspection (`63b0880`), account mutation
+  (`4cda1dc`), sitemap writes (`bdb3b0b`), composed + SF bridge
+  (`fc3ef4c`).
+- **B.7** MCP Inspector dev target via `make inspect` — `aa9e09d`.
+
+Post-rollout review fixes for A.1/A.3-style blockers (truncation
+placement, silent compare_periods truncation, CSV formula injection
+guard, HTTP-date Retry-After parsing) landed in `6443199`.
+
+### Notable idempotent edges preserved (NOT wrapped in envelopes)
+
+- `gsc_add_site` on HTTP 409 → "already added" (idempotent success).
+- `gsc_delete_site` on HTTP 404 → "was not found" (idempotent success).
+- `gsc_delete_sitemap` on pre-check 404 → "already been deleted".
+- Validation-layer errors (bad alias, invalid date, unknown session
+  id, out-of-range numerics) stay as lightweight
+  `{ok: False, error, tool}` dicts where the error string IS the hint.
+
+### Tests
+
+132 (pre-audit) → 308 (at this release). See individual v0.6.x
+commits for per-cluster test breakdowns.
+
+---
+
 ## [0.6.0] — 2026-04-17 — Tranche A remediation
 
 Implements eight of the nine Tranche-A items from the MCP Optimal Design

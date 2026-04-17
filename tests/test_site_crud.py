@@ -12,7 +12,7 @@ import pytest
 from googleapiclient.errors import HttpError
 
 import gsc_server
-from gsc_server import add_site, delete_site, get_site_details
+from gsc_server import gsc_add_site, gsc_delete_site, gsc_get_site_details
 
 
 def _mock_http_error(status: int, message: str = "msg", reason: str = "") -> HttpError:
@@ -31,7 +31,7 @@ class TestAddSite:
             "permissionLevel": "siteOwner"
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await add_site("sc-domain:example.com")
+        out = await gsc_add_site("sc-domain:example.com")
         assert "has been added" in out
         assert "Permission level: siteOwner" in out
 
@@ -41,7 +41,7 @@ class TestAddSite:
         service = MagicMock()
         service.sites.return_value.add.return_value.execute.side_effect = _mock_http_error(409)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await add_site("sc-domain:example.com")
+        out = await gsc_add_site("sc-domain:example.com")
         assert "already added" in out
         assert "Error:" not in out  # Must not render as a B.4 error envelope
 
@@ -51,7 +51,7 @@ class TestAddSite:
             403, message="no access"
         )
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await add_site("sc-domain:example.com")
+        out = await gsc_add_site("sc-domain:example.com")
         assert out.startswith("Error: HTTP 403")
         assert "Hint:" in out
         assert "sc-domain:example.com" in out
@@ -60,7 +60,7 @@ class TestAddSite:
         def _explode():
             raise RuntimeError("boom")
         monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
-        out = await add_site("sc-domain:example.com")
+        out = await gsc_add_site("sc-domain:example.com")
         assert "RuntimeError" in out
         assert "Hint:" in out
 
@@ -70,7 +70,7 @@ class TestDeleteSite:
         service = MagicMock()
         service.sites.return_value.delete.return_value.execute.return_value = None
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_site("sc-domain:example.com")
+        out = await gsc_delete_site("sc-domain:example.com")
         assert "has been removed" in out
 
     async def test_404_idempotent_not_found_message(self, monkeypatch):
@@ -79,7 +79,7 @@ class TestDeleteSite:
         service = MagicMock()
         service.sites.return_value.delete.return_value.execute.side_effect = _mock_http_error(404)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_site("sc-domain:example.com")
+        out = await gsc_delete_site("sc-domain:example.com")
         assert "was not found" in out
         assert "Error:" not in out
 
@@ -89,9 +89,9 @@ class TestDeleteSite:
             403, message="denied"
         )
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_site("sc-domain:example.com")
+        out = await gsc_delete_site("sc-domain:example.com")
         assert out.startswith("Error: HTTP 403")
-        assert "get_active_account" in out  # B.4's 403 hint
+        assert "gsc_get_active_account" in out  # B.4's 403 hint
 
     async def test_429_envelope_surfaces_retry_after(self, monkeypatch):
         resp = MagicMock()
@@ -102,7 +102,7 @@ class TestDeleteSite:
         service = MagicMock()
         service.sites.return_value.delete.return_value.execute.side_effect = http_err
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await delete_site("sc-domain:example.com")
+        out = await gsc_delete_site("sc-domain:example.com")
         assert "Retry-after: 45s" in out
 
 
@@ -118,7 +118,7 @@ class TestGetSiteDetails:
             },
         }
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await get_site_details("sc-domain:example.com")
+        out = await gsc_get_site_details("sc-domain:example.com")
         assert "Permission level: siteOwner" in out
         assert "Verification state: VERIFIED" in out
 
@@ -126,6 +126,6 @@ class TestGetSiteDetails:
         service = MagicMock()
         service.sites.return_value.get.return_value.execute.side_effect = _mock_http_error(404)
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
-        out = await get_site_details("sc-domain:example.com")
+        out = await gsc_get_site_details("sc-domain:example.com")
         assert "HTTP 404" in out
         assert "sc-domain:" in out  # hint names the property

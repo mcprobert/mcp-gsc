@@ -2,7 +2,7 @@
 
 The account tools are all LOCAL (manifest + filesystem ops, no GSC API)
 so there's no HttpError path to cover — only generic exceptions and
-the `add_account` HeadlessOAuthError special-case.
+the `gsc_add_account` HeadlessOAuthError special-case.
 """
 from __future__ import annotations
 
@@ -14,10 +14,10 @@ import pytest
 
 import gsc_server
 from gsc_server import (
-    add_account,
-    list_accounts,
-    remove_account,
-    switch_account,
+    gsc_add_account,
+    gsc_list_accounts,
+    gsc_remove_account,
+    gsc_switch_account,
 )
 
 
@@ -36,9 +36,9 @@ def fake_accounts_home(tmp_path, monkeypatch):
 
 class TestListAccounts:
     async def test_empty_manifest_explains_next_step(self, fake_accounts_home):
-        out = await list_accounts()
+        out = await gsc_list_accounts()
         assert "No accounts configured" in out
-        assert "add_account" in out
+        assert "gsc_add_account" in out
 
     async def test_populated_manifest_renders_active_marker(self, fake_accounts_home):
         Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
@@ -48,7 +48,7 @@ class TestListAccounts:
                 "client-b": {"alias": "client-b", "email": "b@example.com", "added_at": "2026-04-16"},
             },
         }))
-        out = await list_accounts()
+        out = await gsc_list_accounts()
         assert "**client-a**" in out and "**(active)**" in out
         assert "**client-b**" in out
         # Active marker only fires on the active account.
@@ -58,7 +58,7 @@ class TestListAccounts:
         def _explode():
             raise RuntimeError("manifest locked")
         monkeypatch.setattr(gsc_server, "_load_manifest", _explode)
-        out = await list_accounts()
+        out = await gsc_list_accounts()
         assert "RuntimeError" in out
         assert "manifest locked" in out
         assert "Hint:" in out
@@ -69,7 +69,7 @@ class TestAddAccount:
         # `_validate_alias` lowercases first, so case alone doesn't
         # fail — use a genuinely invalid char. Underscore is rejected
         # by the regex ^[a-z0-9][a-z0-9-]*$.
-        out = await add_account("has_underscore")
+        out = await gsc_add_account("has_underscore")
         assert "Invalid alias" in out
         # Alias validation error is NOT wrapped in an envelope — the
         # message is already actionable and includes the regex rule.
@@ -80,9 +80,9 @@ class TestAddAccount:
             "active_account": "existing",
             "accounts": {"existing": {"alias": "existing", "email": "e@x.com"}},
         }))
-        out = await add_account("existing")
+        out = await gsc_add_account("existing")
         assert "already exists" in out
-        assert "remove_account" in out
+        assert "gsc_remove_account" in out
 
     async def test_headless_error_surfaces_verbatim(self, fake_accounts_home, monkeypatch):
         """HeadlessOAuthError already carries a detailed remediation
@@ -96,7 +96,7 @@ class TestAddAccount:
 
         def _raise_headless(*args, **kwargs):
             raise gsc_server.HeadlessOAuthError(
-                "OAuth required for add_account('new'), but GSC_MCP_HEADLESS=1 is set. "
+                "OAuth required for gsc_add_account('new'), but GSC_MCP_HEADLESS=1 is set. "
                 "Run `python gsc_server.py --login` from a desktop session..."
             )
         monkeypatch.setattr(gsc_server, "_start_oauth_flow", _raise_headless)
@@ -107,7 +107,7 @@ class TestAddAccount:
             lambda *a, **kw: MagicMock(),
         )
 
-        out = await add_account("new")
+        out = await gsc_add_account("new")
         assert "GSC_MCP_HEADLESS=1" in out
         # Envelope prefix must NOT be present — agent sees the raw
         # remediation message.
@@ -127,7 +127,7 @@ class TestAddAccount:
             lambda *a, **kw: MagicMock(),
         )
 
-        out = await add_account("new")
+        out = await gsc_add_account("new")
         assert out.startswith("Error: OAuth flow failed:")
         assert "RuntimeError" in out
         assert "port already in use" in out
@@ -139,7 +139,7 @@ class TestAddAccount:
 class TestSwitchAccount:
     async def test_invalid_alias(self, fake_accounts_home):
         # Underscore violates the regex; case alone is lowercased first.
-        out = await switch_account("has_underscore")
+        out = await gsc_switch_account("has_underscore")
         assert "Invalid alias" in out
 
     async def test_unknown_alias_lists_available(self, fake_accounts_home):
@@ -147,7 +147,7 @@ class TestSwitchAccount:
             "active_account": "a",
             "accounts": {"a": {"alias": "a"}, "b": {"alias": "b"}},
         }))
-        out = await switch_account("nonexistent")
+        out = await gsc_switch_account("nonexistent")
         assert "not found" in out
         assert "a, b" in out or "b, a" in out
 
@@ -156,7 +156,7 @@ class TestSwitchAccount:
             "active_account": "a",
             "accounts": {"a": {"alias": "a"}, "b": {"alias": "b", "email": "b@example.com"}},
         }))
-        out = await switch_account("b")
+        out = await gsc_switch_account("b")
         assert "Switched to account 'b'" in out
         assert "b@example.com" in out
 
@@ -164,10 +164,10 @@ class TestSwitchAccount:
         def _explode():
             raise OSError("manifest unreadable")
         monkeypatch.setattr(gsc_server, "_load_manifest", _explode)
-        out = await switch_account("a")
+        out = await gsc_switch_account("a")
         assert "OSError" in out
         assert "manifest unreadable" in out
-        assert "list_accounts" in out  # The hint names the next tool.
+        assert "gsc_list_accounts" in out  # The hint names the next tool.
 
 
 class TestRemoveAccount:
@@ -176,7 +176,7 @@ class TestRemoveAccount:
             "active_account": "a",
             "accounts": {"a": {"alias": "a"}},
         }))
-        out = await remove_account("nonexistent")
+        out = await gsc_remove_account("nonexistent")
         assert "not found" in out
 
     async def test_happy_path_sets_new_active(self, fake_accounts_home):
@@ -188,7 +188,7 @@ class TestRemoveAccount:
         (fake_accounts_home / "accounts" / "a").mkdir()
         (fake_accounts_home / "accounts" / "b").mkdir()
 
-        out = await remove_account("a")
+        out = await gsc_remove_account("a")
         assert "Account 'a' removed" in out
         assert "Active account is now 'b'" in out
 
@@ -199,7 +199,7 @@ class TestRemoveAccount:
         }))
         (fake_accounts_home / "accounts" / "only").mkdir()
 
-        out = await remove_account("only")
+        out = await gsc_remove_account("only")
         assert "No accounts remaining" in out
         assert "legacy token.json" in out
 
@@ -207,6 +207,6 @@ class TestRemoveAccount:
         def _explode():
             raise PermissionError("read only fs")
         monkeypatch.setattr(gsc_server, "_load_manifest", _explode)
-        out = await remove_account("a")
+        out = await gsc_remove_account("a")
         assert "PermissionError" in out
         assert "Hint:" in out

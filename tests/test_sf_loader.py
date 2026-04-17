@@ -27,7 +27,7 @@ from gsc_server import (
     gsc_query_sf_export,
     gsc_get_landing_page_summary,
     gsc_compare_periods_landing_pages,
-    batch_url_inspection,
+    gsc_batch_url_inspection,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -782,7 +782,7 @@ class TestSortLandingPageDiffs:
         assert [r["page"] for r in out] == ["c", "a", "b"]
 
 
-# -------- Fix 3+4: batch_url_inspection validation + auth reorder --------
+# -------- Fix 3+4: gsc_batch_url_inspection validation + auth reorder --------
 
 class _AuthWouldFire(Exception):
     """Raised by a monkeypatched get_gsc_service when validation should have
@@ -812,7 +812,7 @@ class TestBatchUrlInspectionValidation:
         return result["session_id"]
 
     async def test_unknown_session(self):
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session="sf-does-not-exist",
         )
@@ -820,7 +820,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_invalid_dataset_name_path_traversal(self):
         session_id = await self._load_flat_session()
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session=session_id,
             dataset="../../etc/passwd",
@@ -829,7 +829,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_unknown_dataset_in_session(self):
         session_id = await self._load_flat_session()
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session=session_id,
             dataset="nonexistent",
@@ -838,7 +838,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_reject_negative_offset(self):
         session_id = await self._load_flat_session()
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session=session_id,
             dataset="search_console_all",
@@ -848,7 +848,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_reject_limit_zero(self):
         session_id = await self._load_flat_session()
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session=session_id,
             dataset="search_console_all",
@@ -858,7 +858,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_reject_negative_limit(self):
         session_id = await self._load_flat_session()
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             from_session=session_id,
             dataset="search_console_all",
@@ -870,7 +870,7 @@ class TestBatchUrlInspectionValidation:
 
     async def test_empty_urls_returns_before_auth(self):
         """Direct path: empty urls string must fail before the OAuth call."""
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             urls="",
         )
@@ -879,7 +879,7 @@ class TestBatchUrlInspectionValidation:
     async def test_over_ten_direct_urls_returns_before_auth(self):
         """Direct path: >10 URLs must surface the count error before auth."""
         urls = "\n".join(f"https://example.com/p{i}" for i in range(11))
-        result = await batch_url_inspection(
+        result = await gsc_batch_url_inspection(
             site_url="https://example.com/",
             urls=urls,
         )
