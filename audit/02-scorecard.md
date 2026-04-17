@@ -17,13 +17,14 @@ eval harness against `sc-domain:chaserhq.com` (6 shared prompts,
 | Metric | Baseline (a808da4) | v0.6.0 | Δ |
 |---|---:|---:|---:|
 | `tool_definitions_tokens` | 41,736 | 40,272 | **−1,464 (−4%)** |
-| `prompt_tokens` | 134,071 | 119,476 | −14,595 (−11%) |
-| `grand_total_tokens` | 178,522 | 166,096 | **−12,426 (−7%)** |
+| `prompt_tokens` (billed input) | 134,071 | 119,476 | −14,595 (−11%) |
+| `completion_tokens` (billed output) | 2,106 | 3,750 | +1,644 (+78%) |
+| `grand_total_tokens` (billed = input + output) | 136,177 | 123,226 | **−12,951 (−10%)** |
 | `total_tool_calls` | 9 | 7 | −2 (−22%) |
 | `error_count` | 0 | 0 | — |
 
 Full delta in `audit/eval/runs/v050-v060-6prompt-delta.md`. Biggest
-single-prompt win: P7 analytics (−14,436 tokens). Schema-tax drop
+single-prompt win: P7 analytics (−15,404 tokens). Schema-tax drop
 (−1,464 across 6 prompts; live FastMCP schema size moved from 6,956
 → 6,712 tokens per call, verified via `run.py --probe-mcp`)
 confirms A.5 description tightening measurably improves real calls,
@@ -33,6 +34,14 @@ The pre-implementation projection "~2,500–26,000 tokens per session,
 dominated by A.1" still stands; the eval subset didn't include
 enough calls that actually hit the old 1,000-row default to realize
 the top end.
+
+**Accounting note:** `grand_total_tokens` is now the Anthropic-billed
+sum (`prompt_tokens + completion_tokens`). Earlier revisions of this
+doc reported `-12,426 (-7%)` because the runner was double-counting
+tool-definition schemas (already inside `prompt_tokens` every turn)
+and tool-response text (already inside the next turn's
+`prompt_tokens` as `tool_result` blocks). The honest billable delta
+is larger, not smaller.
 
 ---
 

@@ -30,9 +30,9 @@ deferred to v1.0.0 per the original scope.
 **Measured impact (6 shared eval prompts, see
 `audit/eval/runs/v050-v060-6prompt-delta.md`):**
 
-- `grand_total_tokens` −12,426 (−7%)
-- `tool_definitions_tokens` −1,464 (−4%)
-- `error_count` 0 in both
+- `grand_total_tokens` (Anthropic-billed input+output): **−12,951 (−10%)**
+- `tool_definitions_tokens` (live FastMCP schema): −1,464 (−4%)
+- `error_count`: 0 in both
 - Tests: 132 → 144 (12 new: 6 sitemap + 6 OAuth guard including 2
   integration tests for the broad-except re-raise)
 

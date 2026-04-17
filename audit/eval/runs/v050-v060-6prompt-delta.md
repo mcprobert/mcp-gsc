@@ -10,10 +10,10 @@ Baseline: 6 prompts. Compare: 25 prompts. Shared: 6.
 | `prompt_tokens` | 134071 | 119476 | -14595 (-11%) |
 | `completion_tokens` | 2106 | 3750 | +1644 (+78%) |
 | `total_response_tokens` | 609 | 2598 | +1989 (+327%) |
-| `grand_total_tokens` | 178522 | 166096 | -12426 (-7%) |
+| `grand_total_tokens` | 136177 | 123226 | -12951 (-10%) |
 | `total_tool_calls` | 9 | 7 | -2 (-22%) |
 | `wall_clock_ms` | 54712 | 67518 | +12806 (+23%) |
-| `error_count` | 0 | 0 | +0 (+0%) |
+| `error_count` | 0 | 0 | no change |
 
 ## Routing match counts (compare run)
 
@@ -26,12 +26,12 @@ Baseline: 6 prompts. Compare: 25 prompts. Shared: 6.
 
 | ID | Category | Baseline tokens | Compare tokens | Δ | Calls Δ | Routing (compare) |
 |---:|---|---:|---:|---:|---:|---|
-| 7 | analytics | 43817 | 29381 | -14436 | -2 | `different` |
-| 2 | discovery | 25168 | 24465 | -703 | +0 | `exact` |
-| 1 | meta | 24809 | 24379 | -430 | +0 | `exact` |
-| 3 | discovery | 25065 | 25332 | +267 | +0 | `exact` |
-| 17 | sitemap | 25233 | 25579 | +346 | +0 | `exact` |
-| 12 | disambiguation | 34430 | 36960 | +2530 | +0 | `different` |
+| 7 | analytics | 36695 | 21291 | -15404 | -2 | `different` |
+| 2 | discovery | 18130 | 17744 | -386 | +0 | `exact` |
+| 1 | meta | 17829 | 17653 | -176 | +0 | `exact` |
+| 3 | discovery | 18027 | 18434 | +407 | +0 | `exact` |
+| 17 | sitemap | 18177 | 18660 | +483 | +0 | `exact` |
+| 12 | disambiguation | 27319 | 29444 | +2125 | +0 | `different` |
 
 ## Coverage asymmetry
 

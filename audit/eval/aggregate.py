@@ -44,7 +44,15 @@ METRIC_KEYS = [
 
 
 def load_run(path: Path) -> Dict[int, Dict[str, Any]]:
-    """Load a JSONL run file into {prompt_id: record}."""
+    """Load a JSONL run file into {prompt_id: record}.
+
+    Recomputes ``grand_total_tokens`` as ``prompt_tokens + completion_tokens``
+    regardless of what the record stored. Earlier versions of run.py
+    double-counted by adding `tool_definitions_tokens` and
+    `total_response_tokens` (both already live inside the billed
+    `prompt_tokens`). Recomputing on load keeps legacy JSONL files usable
+    without re-running the harness.
+    """
     by_id: Dict[int, Dict[str, Any]] = {}
     with path.open() as f:
         for line in f:
@@ -52,6 +60,9 @@ def load_run(path: Path) -> Dict[int, Dict[str, Any]]:
             if not line:
                 continue
             record = json.loads(line)
+            record["grand_total_tokens"] = (
+                record.get("prompt_tokens", 0) + record.get("completion_tokens", 0)
+            )
             by_id[record["prompt_id"]] = record
     return by_id
 
@@ -60,8 +71,18 @@ def format_delta(old: Optional[int | float], new: Optional[int | float]) -> str:
     if old is None or new is None:
         return "–"
     diff = new - old
-    pct = (diff / old * 100) if old else float("inf") if diff else 0.0
     sign = "+" if diff >= 0 else ""
+    if old == 0:
+        # "+inf%" in a reader-facing table reads as broken. If the baseline
+        # was zero, just report the absolute delta (or "no change" when
+        # both sides are zero).
+        if diff == 0:
+            return "no change"
+        unit_note = "new" if diff > 0 else "regression from zero"
+        if isinstance(new, float) or isinstance(old, float):
+            return f"{sign}{diff:.1f} ({unit_note})"
+        return f"{sign}{diff} ({unit_note})"
+    pct = diff / old * 100
     if isinstance(new, float) or isinstance(old, float):
         return f"{sign}{diff:.1f} ({sign}{pct:.0f}%)"
     return f"{sign}{diff} ({sign}{pct:.0f}%)"

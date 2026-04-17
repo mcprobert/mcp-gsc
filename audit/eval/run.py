@@ -154,9 +154,21 @@ async def _list_and_run(
         )
 
         # If an account was named, drive the server to the right account
-        # before the eval starts (doesn't count against metrics).
+        # before the eval starts (doesn't count against metrics). We
+        # raise if the switch failed so the operator doesn't silently
+        # eval against the wrong account.
         if account:
-            await session.call_tool("switch_account", arguments={"alias": account})
+            switch_response = await session.call_tool(
+                "switch_account", arguments={"alias": account}
+            )
+            if getattr(switch_response, "isError", False):
+                body = "\n".join(
+                    getattr(item, "text", repr(item))
+                    for item in switch_response.content
+                )
+                raise RuntimeError(
+                    f"switch_account({account!r}) failed before eval started: {body}"
+                )
 
         for p in prompts:
             record = await _run_one_prompt(
@@ -211,6 +223,8 @@ async def _run_one_prompt(
     prompt_tokens = 0
     completion_tokens = 0
     error_count = 0
+    incomplete = False
+    final_stop_reason: Optional[str] = None
     final_answer = ""
     start = time.perf_counter()
 
@@ -222,20 +236,33 @@ async def _run_one_prompt(
             tools=tools,
             messages=messages,
         )
-        # Accumulate input / output token usage.
+        # Accumulate per-turn usage. These counts are the CUMULATIVE-over-turns
+        # billable input/output tokens — Anthropic bills input_tokens for every
+        # turn's full messages array (which repeats tool_use / tool_result
+        # blocks from prior turns), so summing across turns reflects what we
+        # actually paid.
         usage = response.usage
         prompt_tokens += usage.input_tokens
         completion_tokens += usage.output_tokens
 
+        final_stop_reason = response.stop_reason
         if response.stop_reason != "tool_use":
             final_answer = "".join(
                 block.text for block in response.content if block.type == "text"
             )
+            # Anthropic stop_reasons other than tool_use / end_turn indicate
+            # we stopped short: max_tokens = answer truncated, pause_turn =
+            # extended-thinking checkpoint. Treat as incomplete so the eval
+            # doesn't silently score a partial answer as success.
+            if response.stop_reason not in ("end_turn", "stop_sequence"):
+                incomplete = True
+                error_count += 1
             break
 
         # Execute each tool_use block, one by one, sequentially.
         assistant_blocks = []
         tool_results_blocks = []
+        transport_failed = False
         for block in response.content:
             assistant_blocks.append(block.model_dump())
             if block.type != "tool_use":
@@ -245,7 +272,6 @@ async def _run_one_prompt(
             tool_start = time.perf_counter()
             try:
                 tool_response = await session.call_tool(tool_name, arguments=tool_args)
-                # tool_response.content is a list of content blocks; join text.
                 response_text_parts = []
                 for item in tool_response.content:
                     # MCP content items typically have a `.text` attribute when
@@ -260,6 +286,21 @@ async def _run_one_prompt(
                 response_chars = len(response_text)
                 response_tokens = _estimate_tokens(response_text)
                 error_str = None
+            except (ConnectionError, BrokenPipeError, EOFError) as e:
+                # Transport-level failure — subprocess dead or pipe broken.
+                # Retrying the same call_tool will only burn turns and API
+                # dollars, so abort both this block loop and the outer turn
+                # loop.
+                sys.stderr.write(
+                    f"[eval] transport failure on {tool_name}: {e!r}. "
+                    "Aborting this prompt's tool loop.\n"
+                )
+                final_answer = f"__TRANSPORT_FAILURE__ {e!r}"
+                error_count += 1
+                incomplete = True
+                final_stop_reason = "transport_failure"
+                transport_failed = True
+                break
             except Exception as e:
                 response_text = f"__TOOL_ERROR__ {e!r}"
                 response_chars = len(response_text)
@@ -285,32 +326,32 @@ async def _run_one_prompt(
                 "is_error": error_str is not None,
             })
 
+        if transport_failed:
+            break
+
         messages.append({"role": "assistant", "content": assistant_blocks})
         messages.append({"role": "user", "content": tool_results_blocks})
     else:
         # Hit max_turns without a final answer.
         final_answer = "__MAX_TURNS_EXCEEDED__"
+        final_stop_reason = "max_turns_exhausted"
+        incomplete = True
+        error_count += 1
 
     wall_clock_ms = int((time.perf_counter() - start) * 1000)
     actual_path = [tc["name"] for tc in tool_calls]
     expected_path = prompt_def.get("expected_tool_path", [])
-    # Inline classify_routing logic (avoids importing schema.py — the
-    # runner stays a single file for easy portability).
-    if not expected_path:
-        routing_match = "unknown"
-    elif expected_path == actual_path:
-        routing_match = "exact"
-    elif set(expected_path).issubset(set(actual_path)):
-        routing_match = "subset"
-    else:
-        routing_match = "different"
+    routing_match = _classify_routing(expected_path, actual_path)
 
-    grand_total = (
-        schema_tokens_est
-        + prompt_tokens
-        + completion_tokens
-        + total_response_tokens
-    )
+    # Honest grand_total: Anthropic bills input_tokens + output_tokens.
+    # Tool schemas are already counted inside prompt_tokens on every turn
+    # the API sends them, and tool_result text is already inside prompt_tokens
+    # on the NEXT turn. Adding schema_tokens_est or total_response_tokens
+    # separately would double-count (previous versions of this runner did).
+    # The sidecar fields are kept so aggregators can still explain *why*
+    # prompt_tokens is what it is.
+    grand_total = prompt_tokens + completion_tokens
+
     return {
         "run_id": run_id,
         "prompt_id": prompt_def["id"],
@@ -319,24 +360,53 @@ async def _run_one_prompt(
         "model": model,
         "temperature": 0.0,
         "prompt_cache": "disabled",
-        "tool_definitions_tokens": schema_tokens_est,
+        "tool_definitions_tokens": schema_tokens_est,  # informational, NOT in grand_total
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
-        "total_response_tokens": total_response_tokens,
+        "total_response_tokens": total_response_tokens,  # informational sidecar
         "grand_total_tokens": grand_total,
         "tool_calls": tool_calls,
         "total_tool_calls": len(tool_calls),
         "expected_tool_path": expected_path,
         "actual_tool_path": actual_path,
         "routing_match": routing_match,
+        "stop_reason": final_stop_reason,
+        "incomplete": incomplete,
         "wall_clock_ms": wall_clock_ms,
         "error_count": error_count,
-        "retry_count": 0,  # Anthropic SDK handles retries internally; not surfaced.
+        # retry_count is always 0 — the Anthropic SDK retries 429/5xx
+        # internally but does not surface the attempt count on responses.
+        "retry_count": 0,
         "final_answer": final_answer,
         "golden_diff": "pending",
     }
+
+
+def _classify_routing(expected: List[str], actual: List[str]) -> str:
+    """Classify actual tool-call sequence against the prompt's expected.
+
+    exact          — same tools in same order.
+    ordered_subset — expected appears as an in-order subsequence of actual.
+    subset         — every expected tool appears somewhere in actual (any order).
+    different      — at least one expected tool is missing.
+    unknown        — no expectation was specified.
+    """
+    if not expected:
+        return "unknown"
+    if expected == actual:
+        return "exact"
+    # Check in-order subsequence: walk actual, matching expected one-at-a-time.
+    i = 0
+    for name in actual:
+        if i < len(expected) and name == expected[i]:
+            i += 1
+    if i == len(expected):
+        return "ordered_subset"
+    if set(expected).issubset(set(actual)):
+        return "subset"
+    return "different"
 
 
 # --- cheap token estimator ---------------------------------------------

@@ -87,6 +87,11 @@ No pre-existing golden corpus. First time through:
 
 ## Cost warning
 
-Each full read-only run makes ~30 Anthropic API calls plus ~30 live
-GSC tool calls. Budget: ~$0.50-$2 per run depending on model and
-tool response sizes. Don't loop this in a CI cron without a cost cap.
+Each full read-only run is ~27 Anthropic prompts, each with 1–6 tool
+turns. Observed per-run cost on `claude-sonnet-4-6` with caching
+disabled: **~$3–$6** (median prompt ~24k input tokens × repeated per
+turn; heavy prompts like P28 pagination single-handedly use ~100k+
+input tokens). Orgs also have a **20M prompt-bytes/hour rate limit**
+which a single full run can exhaust — budget cool-down time between
+baseline and post-change passes. Do not loop this in a CI cron without
+an API-cost cap and a rate-limit backoff.
