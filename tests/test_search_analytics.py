@@ -439,12 +439,87 @@ class TestJsonPossiblyTruncated:
 
 
 # =============================================================================
+# B.5 — include_summary auto-decision (JSON mode only)
+# =============================================================================
+
+
+class TestSummaryAutoInclude:
+    """At row_limit <= 50 the summary aggregates would be misleading
+    (only across returned rows). B.5 suppresses the block by default
+    at that cap and includes it at higher row counts.
+    """
+
+    async def test_summary_omitted_by_default_at_low_row_limit(self, monkeypatch):
+        rows = [
+            {"keys": ["kw a"], "clicks": 10, "impressions": 100, "ctr": 0.10, "position": 3.0},
+        ]
+        captured: dict = {}
+        _patch_service(monkeypatch, _build_mock_service(rows, captured))
+        result = await get_search_by_page_query(
+            site_url="https://example.com/",
+            page_url="https://example.com/foo",
+            row_limit=20,  # <= 50 threshold
+            response_format="json",
+        )
+        assert result["ok"] is True
+        assert "summary" not in result
+
+    async def test_summary_included_by_default_at_high_row_limit(self, monkeypatch):
+        rows = [
+            {"keys": ["kw a"], "clicks": 10, "impressions": 100, "ctr": 0.10, "position": 3.0},
+        ]
+        captured: dict = {}
+        _patch_service(monkeypatch, _build_mock_service(rows, captured))
+        result = await get_search_by_page_query(
+            site_url="https://example.com/",
+            page_url="https://example.com/foo",
+            row_limit=100,  # > 50 threshold
+            response_format="json",
+        )
+        assert result["ok"] is True
+        assert "summary" in result
+        assert result["summary"]["total_clicks"] == 10
+
+    async def test_include_summary_true_overrides_low_row_limit(self, monkeypatch):
+        rows = [
+            {"keys": ["kw a"], "clicks": 1, "impressions": 10, "ctr": 0.1, "position": 1.0},
+        ]
+        captured: dict = {}
+        _patch_service(monkeypatch, _build_mock_service(rows, captured))
+        result = await get_search_by_page_query(
+            site_url="https://example.com/",
+            page_url="https://example.com/foo",
+            row_limit=20,
+            response_format="json",
+            include_summary=True,
+        )
+        assert "summary" in result
+
+    async def test_include_summary_false_overrides_high_row_limit(self, monkeypatch):
+        rows = [
+            {"keys": ["kw a"], "clicks": 1, "impressions": 10, "ctr": 0.1, "position": 1.0},
+        ]
+        captured: dict = {}
+        _patch_service(monkeypatch, _build_mock_service(rows, captured))
+        result = await get_search_by_page_query(
+            site_url="https://example.com/",
+            page_url="https://example.com/foo",
+            row_limit=500,
+            response_format="json",
+            include_summary=False,
+        )
+        assert "summary" not in result
+
+
+# =============================================================================
 # JSON mode — empty and defensive behaviors
 # =============================================================================
 
 
 class TestJsonEmptyAndDefensive:
     async def test_empty_rows_returns_ok_with_zero_summary(self, monkeypatch):
+        # include_summary=True forces the summary block even at the
+        # default row_limit=20 (below the B.5 auto-include threshold).
         captured: dict = {}
         _patch_service(monkeypatch, _build_mock_service([], captured))
 
@@ -452,6 +527,7 @@ class TestJsonEmptyAndDefensive:
             site_url="https://example.com/",
             page_url="https://example.com/foo",
             response_format="json",
+            include_summary=True,
         )
 
         assert result["ok"] is True

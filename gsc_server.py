@@ -1923,6 +1923,9 @@ async def compare_search_periods(
     except Exception as e:
         return f"Error comparing search periods: {str(e)}"
 
+_PAGE_QUERY_SUMMARY_MIN_ROWS = 50
+
+
 @mcp.tool()
 async def get_search_by_page_query(
     site_url: str,
@@ -1930,6 +1933,7 @@ async def get_search_by_page_query(
     days: int = 28,
     row_limit: int = 20,
     response_format: str = "markdown",
+    include_summary: Optional[bool] = None,
 ):
     """Break down GSC queries for a single page. Pick me when you already
     know which URL you want to analyse; use `get_search_analytics` for
@@ -1948,14 +1952,19 @@ async def get_search_by_page_query(
             if total_rows_returned == row_limit, retry with a larger
             row_limit.
         response_format: "markdown" (default, compact) or "json"
-            (structured; ~2× tokens but parseable). Case-insensitive.
+            (structured; parseable for downstream code).
+        include_summary: json-only. When None (default), the
+            `summary` block is included when `row_limit > 50` and
+            omitted below (the summary is misleading when many rows
+            are capped). Pass True to force-include or False to
+            force-omit.
 
     Returns:
         markdown mode (default): str, pre-0.5 byte-compatible.
         json mode: dict with keys `ok, site_url, page_url, days,
-        row_limit, total_rows_returned, possibly_truncated, queries,
-        summary`. `queries` is a list of `{query, clicks, impressions,
-        ctr, position}`. `summary` is
+        row_limit, total_rows_returned, possibly_truncated, queries`.
+        `summary` key is included per the `include_summary` rule above;
+        when present it holds
         `{total_clicks, total_impressions, average_position
         (impression-weighted), average_ctr}`.
         On error: `{ok: False, error, tool}` in json mode, or a
@@ -2079,20 +2088,7 @@ async def get_search_by_page_query(
                 "position": float(row.get("position", 0.0)),
             })
 
-        # Inline aggregation (see NOTE above _period_totals in
-        # gsc_compare_periods_landing_pages — future DRY opportunity).
-        total_clicks = sum(q["clicks"] for q in queries)
-        total_impressions = sum(q["impressions"] for q in queries)
-        if total_impressions > 0:
-            average_ctr = total_clicks / total_impressions
-            average_position = sum(
-                q["position"] * q["impressions"] for q in queries
-            ) / total_impressions
-        else:
-            average_ctr = 0.0
-            average_position = 0.0
-
-        return {
+        result: Dict[str, Any] = {
             "ok": True,
             "site_url": site_url,
             "page_url": page_url,
@@ -2101,13 +2097,34 @@ async def get_search_by_page_query(
             "total_rows_returned": len(queries),
             "possibly_truncated": len(queries) >= effective_row_limit,
             "queries": queries,
-            "summary": {
+        }
+
+        # B.5: summary is suppressed by default when row_limit is low
+        # enough that the aggregates would be misleading (they only
+        # cover returned rows; if rows are capped, the averages are
+        # skewed toward the top-ranked queries). Caller can override.
+        if include_summary is None:
+            include_summary = effective_row_limit > _PAGE_QUERY_SUMMARY_MIN_ROWS
+
+        if include_summary:
+            total_clicks = sum(q["clicks"] for q in queries)
+            total_impressions = sum(q["impressions"] for q in queries)
+            if total_impressions > 0:
+                average_ctr = total_clicks / total_impressions
+                average_position = sum(
+                    q["position"] * q["impressions"] for q in queries
+                ) / total_impressions
+            else:
+                average_ctr = 0.0
+                average_position = 0.0
+            result["summary"] = {
                 "total_clicks": total_clicks,
                 "total_impressions": total_impressions,
                 "average_position": average_position,
                 "average_ctr": average_ctr,
-            },
-        }
+            }
+
+        return result
     except HttpError as e:
         try:
             error_content = json.loads(e.content.decode("utf-8"))
