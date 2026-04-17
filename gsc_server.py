@@ -164,6 +164,115 @@ _active_account: Optional[str] = None
 _RESPONSE_FORMATS = ("markdown", "csv", "json")
 
 
+def _make_error_envelope(
+    *,
+    error: str,
+    hint: str = "",
+    retry_after: Optional[float] = None,
+    tool: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Structured error envelope used by tools that opted into B.4.
+
+    Fields:
+        ok: always False (this is the error branch).
+        error: short message, human-readable, suitable for agent
+            reasoning. Does not include remediation — that's `hint`.
+        hint: one-sentence remediation suggestion. May be empty.
+        retry_after: seconds to wait before retrying, when the
+            error is transient. None for non-transient errors.
+        tool: name of the tool that produced the envelope.
+    """
+    return {
+        "ok": False,
+        "error": error,
+        "hint": hint,
+        "retry_after": retry_after,
+        "tool": tool,
+    }
+
+
+def _http_error_envelope(
+    e: HttpError,
+    *,
+    tool: str,
+    site_url: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Map a googleapiclient ``HttpError`` to an error envelope with
+    status-aware hints so agents can recover without a retry storm.
+    """
+    try:
+        content = json.loads(e.content.decode("utf-8"))
+        message = content.get("error", {}).get("message", str(e))
+    except Exception:
+        message = str(e)
+
+    status = getattr(e.resp, "status", 0)
+    hint = ""
+    retry_after: Optional[float] = None
+
+    if status == 401:
+        hint = (
+            "Unauthorised. Re-authenticate with `add_account` / "
+            "`switch_account`, or set GSC_OAUTH_CLIENT_SECRETS_FILE."
+        )
+    elif status == 403:
+        site_part = f" Verify `{site_url}` is shared with the active account." if site_url else ""
+        hint = (
+            f"Permission denied. Check `get_active_account` and "
+            f"`list_properties` first.{site_part}"
+        )
+    elif status == 404:
+        if site_url:
+            hint = (
+                f"Not found. Verify `site_url={site_url!r}` matches GSC "
+                f"exactly (domain properties need the `sc-domain:` prefix)."
+            )
+        else:
+            hint = "Not found. Check the resource identifier was copied exactly."
+    elif status == 429:
+        hint = "Rate limited by GSC. Wait then retry."
+        try:
+            retry_after = float(getattr(e.resp, "get", lambda *_: 60)("retry-after", 60))
+        except (TypeError, ValueError):
+            retry_after = 60.0
+    elif status in (500, 503):
+        hint = "GSC server error. Retry after a short backoff."
+        retry_after = 30.0
+
+    return _make_error_envelope(
+        error=f"HTTP {status}: {message}",
+        hint=hint,
+        retry_after=retry_after,
+        tool=tool,
+    )
+
+
+def _format_error(
+    envelope: Dict[str, Any],
+    *,
+    response_format: str = "markdown",
+) -> Any:
+    """Render an error envelope per response_format.
+
+    json: the envelope dict verbatim.
+    markdown / csv: a string starting with ``Error:`` followed by the
+    hint and retry_after if present — human-readable and parseable by
+    agent text routing.
+    """
+    fmt = str(response_format or "").strip().lower()
+    if fmt == "json":
+        return envelope
+    error = envelope.get("error", "")
+    hint = envelope.get("hint", "")
+    retry_after = envelope.get("retry_after")
+    parts = [f"Error: {error}"]
+    if hint:
+        parts.append(f"Hint: {hint}")
+    if retry_after:
+        parts.append(f"Retry-after: {retry_after:.0f}s")
+    return "\n".join(parts)
+
+
 def _format_table(
     rows: List[Dict[str, Any]],
     columns: List[Dict[str, str]],
@@ -1026,8 +1135,20 @@ async def get_search_analytics(
                 "row_limit": row_limit,
             },
         )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="get_search_analytics", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error retrieving search analytics: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="get_search_analytics",
+            ),
+            response_format=response_format,
+        )
 
 @mcp.tool()
 async def get_site_details(site_url: str) -> str:
@@ -1783,8 +1904,20 @@ async def get_advanced_search_analytics(
                 "next_start_row": start_row + row_limit if truncated else None,
             },
         )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="get_advanced_search_analytics", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error retrieving advanced search analytics: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="get_advanced_search_analytics",
+            ),
+            response_format=response_format,
+        )
 
 @mcp.tool()
 async def compare_search_periods(
@@ -1920,8 +2053,20 @@ async def compare_search_periods(
                 "total_matched": len(comparison_data),
             },
         )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="compare_search_periods", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error comparing search periods: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="compare_search_periods",
+            ),
+            response_format=response_format,
+        )
 
 _PAGE_QUERY_SUMMARY_MIN_ROWS = 50
 
