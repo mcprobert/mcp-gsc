@@ -271,26 +271,43 @@ touch every tool and need an eval-harness baseline to verify.)
 
 ## Tranche B — Structural improvements (target 1–2 weeks)
 
-### B.1 — Consolidate the three analytics tools
+### B.1 — Consolidate the three analytics tools — ⏳ **deferred as not-justified**
 
-- **What**: deprecate `get_search_analytics` and collapse into
+**Decision (2026-04-17, post Tranche A):** do not consolidate. The
+premise — that agents couldn't disambiguate between
+`get_search_analytics`, `get_advanced_search_analytics`, and
+`get_search_by_page_query` — was addressed by A.5, which added
+"Pick me when…" guidance to each tool's docstring. The v0.6.0 eval
+harness run against `sc-domain:chaserhq.com` shows the agent
+routes correctly between the three tools in every case where we
+can judge ground truth; "different" routings map to defensibly-valid
+choices (e.g. agent correctly picks `get_search_analytics` for
+"top 100 queries" overviews rather than the more powerful
+`get_advanced_search_analytics`).
+
+Had we shipped B.1 after A.5:
+- It would undo A.5's disambiguation win.
+- It would be a breaking change for clients pinning
+  `get_search_analytics`.
+- The single "kept" tool would grow more parameters, not fewer,
+  to cover both overview and advanced workflows.
+- Schema-tax saving is ~200 tokens — real but marginal relative to
+  the routing-accuracy cost.
+
+**Revisit if:** either tool's routing accuracy degrades in future
+eval runs, OR a new use case genuinely requires one unified analytics
+tool with a mode parameter.
+
+Original B.1 scope retained below for history:
+
+- ~~What: deprecate `get_search_analytics` and collapse into
   `get_advanced_search_analytics` (the superset). Keep
   `get_search_by_page_query` separate because the per-page shape is a
   distinct workflow, but route it through the consolidated tool's
-  response-shaping helper.
-- **Why**: scorecard criteria "Tool consolidation" (2→4) and
+  response-shaping helper.~~
+- ~~Why: scorecard criteria "Tool consolidation" (2→4) and
   "Disambiguation" (1→5). Removes the agent's "which one do I pick?"
-  failure mode.
-- **Before → After**: 2 tools instead of 3 for property-level analytics.
-  Description-token reclaim: ~345 tokens (description of the removed
-  tool) minus ~150 tokens (added guidance on the kept tool). Net ~200.
-- **Dependencies**: requires B.3's shared `_format_response` helper
-  landing first so the two-tool surface can share output logic.
-- **Test strategy**: add eval-harness prompts that previously would have
-  called `get_search_analytics`; verify the agent routes to
-  `get_advanced_search_analytics` with sensible defaults.
-- **Risk & rollback**: breaking for any config pinning the legacy name.
-  Mitigate with the same hidden-router pattern from A.4.
+  failure mode.~~
 
 ### B.2 — Add `response_format` enum (`csv` | `markdown` | `json`) to all tabular tools
 
