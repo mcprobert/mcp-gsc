@@ -1,0 +1,6 @@
+# Keep reproducibility scripts tracked; ignore only their generated
+# JSON outputs (regenerable via `.venv/bin/python audit/_work/tokenize_tools.py`
+# and `audit/_work/sample_texts.py`).
+_work/tool_tokens.json
+_work/sample_tokens.json
+*.pyc

@@ -1,4 +1,5 @@
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+import asyncio
 import os
 import json
 import re
@@ -6,9 +7,48 @@ import shutil
 import csv
 import heapq
 import math
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
+
+URL_INSPECTION_PACING_SEC = 0.1
+
+
+class HeadlessOAuthError(RuntimeError):
+    """Raised when an interactive OAuth flow would block a headless server."""
+
+
+def _start_oauth_flow(flow: "InstalledAppFlow", *, context: str):
+    """Run the InstalledAppFlow local-server handshake with a headless guard.
+
+    ``flow.run_local_server(port=0)`` opens a browser and blocks until
+    the redirect URL is hit. In any headless MCP context (Claude Desktop
+    subprocess without browser access, SSH, CI) that would hang the
+    server indefinitely.
+
+    If ``GSC_MCP_HEADLESS=1`` is set we raise a :class:`HeadlessOAuthError`
+    with remediation instructions instead. Otherwise we print a warning
+    to stderr before starting the flow so users see *why* the server
+    appears to stall.
+    """
+    headless = os.environ.get("GSC_MCP_HEADLESS", "").strip().lower() in ("1", "true", "yes")
+    if headless:
+        raise HeadlessOAuthError(
+            f"OAuth required for {context}, but GSC_MCP_HEADLESS=1 is set. "
+            "Run `python gsc_server.py --login` from a desktop session "
+            "(or any environment that can open a browser) to authorise, "
+            "then re-start the MCP server with GSC_MCP_HEADLESS unset or "
+            "with the cached token.json in place."
+        )
+    print(
+        f"[gsc-mcp] Opening browser for Google OAuth ({context}). "
+        "If no browser opens within ~30s, set GSC_MCP_HEADLESS=1 and "
+        "complete the login flow from a desktop session instead.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return flow.run_local_server(port=0)
 
 import google.auth
 from google.auth.transport.requests import Request
@@ -444,10 +484,15 @@ def get_gsc_service():
     if not SKIP_OAUTH:
         try:
             return get_gsc_service_oauth()
+        except HeadlessOAuthError:
+            # Environment cannot complete an interactive OAuth flow; surface
+            # the remediation message rather than falling through to the
+            # service-account path (which will fail with a less useful error).
+            raise
         except Exception as e:
-            # If OAuth fails, try service account
-            print(f"OAuth authentication failed: {str(e)}")
-            pass
+            # If OAuth fails, try service account. stderr, not stdout — stdout
+            # on an MCP stdio transport carries JSON-RPC frames.
+            print(f"OAuth authentication failed: {str(e)}", file=sys.stderr, flush=True)
     
     # Try service account authentication
     for cred_path in POSSIBLE_CREDENTIAL_PATHS:
@@ -516,7 +561,7 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
 
             # Start OAuth flow (use OAUTH_SCOPES to request email for account detection)
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = _start_oauth_flow(flow, context="token refresh / initial login")
 
             # Save the credentials for future use
             os.makedirs(os.path.dirname(token_file), exist_ok=True)
@@ -527,26 +572,24 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
     return build("searchconsole", "v1", credentials=creds)
 
 @mcp.tool()
-async def list_properties(name_contains: Optional[str] = None) -> str:
-    """
-    Retrieves and returns the user's Search Console properties.
+async def list_properties(
+    name_contains: Optional[str] = None,
+    limit: int = 50,
+) -> str:
+    """List the GSC properties the active account can see.
 
     Args:
-        name_contains: Optional case-insensitive substring filter on the site URL.
-            Useful when an account has many verified properties and you want
-            just the one matching a client name (e.g. name_contains='whitehat').
+        name_contains: Optional case-insensitive substring filter on the
+            site URL (e.g. `name_contains='whitehat'`). Use this first on
+            agency accounts with many properties.
+        limit: Max properties to return (default 50; clamped to [1, 1000]).
     """
     try:
+        limit = max(1, min(int(limit), 1000))
+
         service = get_gsc_service()
         site_list = service.sites().list().execute()
 
-        # site_list is typically something like:
-        # {
-        #   "siteEntry": [
-        #       {"siteUrl": "...", "permissionLevel": "..."},
-        #       ...
-        #   ]
-        # }
         sites = site_list.get("siteEntry", [])
 
         if name_contains:
@@ -558,12 +601,24 @@ async def list_properties(name_contains: Optional[str] = None) -> str:
                 return f"No Search Console properties matching {name_contains!r}."
             return "No Search Console properties found."
 
+        total_available = len(sites)
+        truncated = total_available > limit
+        shown_sites = sites[:limit]
+
         # Format the results for easy reading
         lines = []
-        for site in sites:
+        for site in shown_sites:
             site_url = site.get("siteUrl", "Unknown")
             permission = site.get("permissionLevel", "Unknown permission")
             lines.append(f"- {site_url} ({permission})")
+
+        if truncated:
+            lines.append("")
+            lines.append(
+                f"⚠ Showing first {limit} of {total_available} properties. "
+                f"Pass `name_contains='…'` to filter or raise `limit` "
+                f"(max 1000) to see more."
+            )
 
         return "\n".join(lines)
     except FileNotFoundError as e:
@@ -684,67 +739,78 @@ async def delete_site(site_url: str) -> str:
         return f"Error removing site: {str(e)}"
 
 @mcp.tool()
-async def get_search_analytics(site_url: str, days: int = 28, dimensions: str = "query") -> str:
-    """
-    Get search analytics data for a specific property.
-    
+async def get_search_analytics(
+    site_url: str,
+    days: int = 28,
+    dimensions: str = "query",
+    row_limit: int = 100,
+) -> str:
+    """Overview of a GSC property's top rows. Pick me for a single-dimension
+    summary; use `get_advanced_search_analytics` for sorting/filtering, or
+    `get_search_by_page_query` to break queries down for one page.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        days: Number of days to look back (default: 28)
-        dimensions: Dimensions to group by (default: query). Options: query, page, device, country, date
-                   You can provide multiple dimensions separated by comma (e.g., "query,page")
+        site_url: GSC site URL (exact match; for domain properties use `sc-domain:example.com`).
+        days: Look-back window (default 28, clamped to min 1).
+        dimensions: Comma-separated GSC dimensions (default `query`; options: query, page, device, country, date).
+        row_limit: Max rows returned (default 100; clamped to [1, 25000]).
     """
     try:
+        # Clamp inputs so the API request is always well-formed.
+        days = max(int(days), 1)
+        row_limit = max(1, min(int(row_limit), 25000))
+
         service = get_gsc_service()
-        
+
         # Calculate date range
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
+
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
+
         # Build request
         request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
             "dimensions": dimension_list,
-            "rowLimit": 20  # Limit to top 20 results
+            "rowLimit": row_limit,
         }
-        
+
         # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
-        if not response.get("rows"):
+
+        rows = response.get("rows") or []
+        if not rows:
             return f"No search analytics data found for {site_url} in the last {days} days."
-        
+
         # Format results
         result_lines = [f"Search analytics for {site_url} (last {days} days):"]
         result_lines.append("\n" + "-" * 80 + "\n")
-        
+
         # Create header based on dimensions
-        header = []
-        for dim in dimension_list:
-            header.append(dim.capitalize())
+        header = [dim.capitalize() for dim in dimension_list]
         header.extend(["Clicks", "Impressions", "CTR", "Position"])
         result_lines.append(" | ".join(header))
         result_lines.append("-" * 80)
-        
+
         # Add data rows
-        for row in response.get("rows", []):
-            data = []
-            # Add dimension values
-            for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
-            
-            # Add metrics
+        for row in rows:
+            data = [dim_value[:100] for dim_value in row.get("keys", [])]
             data.append(str(row.get("clicks", 0)))
             data.append(str(row.get("impressions", 0)))
             data.append(f"{row.get('ctr', 0) * 100:.2f}%")
             data.append(f"{row.get('position', 0):.1f}")
-            
             result_lines.append(" | ".join(data))
-        
+
+        if len(rows) >= row_limit:
+            result_lines.append("-" * 80)
+            result_lines.append(
+                f"⚠ Showing {row_limit} of possibly-more rows. Pass a larger "
+                f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
+                f"with `start_row` to paginate."
+            )
+
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error retrieving search analytics: {str(e)}"
@@ -833,13 +899,18 @@ async def get_sitemaps(site_url: str) -> str:
                 except:
                     pass
             
-            status = "Valid"
-            if "errors" in sitemap and sitemap["errors"] > 0:
-                status = "Has errors"
-            
-            # Get counts
-            warnings = sitemap.get("warnings", 0)
-            errors = sitemap.get("errors", 0)
+            # GSC Sitemaps API returns errors/warnings as strings
+            # (e.g. "0", "7"), so coerce before any numeric compare.
+            try:
+                errors = int(sitemap.get("errors", 0) or 0)
+            except (TypeError, ValueError):
+                errors = 0
+            try:
+                warnings = int(sitemap.get("warnings", 0) or 0)
+            except (TypeError, ValueError):
+                warnings = 0
+
+            status = "Has errors" if errors > 0 else "Valid"
             
             # Get contents if available
             indexed_urls = "N/A"
@@ -857,12 +928,14 @@ async def get_sitemaps(site_url: str) -> str:
 
 @mcp.tool()
 async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
-    """
-    Enhanced URL inspection to check indexing status and rich results in Google.
-    
+    """Inspect a single URL's indexing status + rich results in Google.
+    Pick me for one URL; use `batch_url_inspection` for up to 10 URLs
+    or `check_indexing_issues` to bucket several URLs by problem type.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match, for domain properties use format: sc-domain:example.com)
-        page_url: The specific URL to inspect
+        site_url: GSC site URL (exact match; `sc-domain:example.com`
+            for domain properties).
+        page_url: The URL to inspect.
     """
     try:
         service = get_gsc_service()
@@ -982,35 +1055,30 @@ async def batch_url_inspection(
     offset: int = 0,
     limit: int = 10,
 ) -> str:
-    """
-    Inspect multiple URLs in batch (within API limits).
+    """Inspect up to 10 URLs in batch (URL Inspection API quota limit).
+    Pick me when you have several URLs and want the same 4-field
+    per-URL output; use `inspect_url_enhanced` for a single URL with
+    full detail, or `check_indexing_issues` to bucket URLs by problem
+    type.
 
     Two ways to supply URLs:
-      1. Pass a newline-separated list in `urls` (original behavior). The
-         tool errors if more than 10 URLs are supplied.
-      2. Pass `from_session` pointing at a session loaded via
-         gsc_load_from_sf_export. The 'address' column of the specified
-         dataset is used as the URL source. Use `offset`/`limit` to
-         paginate — each call still processes at most 10 URLs to respect
-         the URL Inspection API quota.
+    1. Newline-separated `urls` (max 10; tool errors beyond that).
+    2. `from_session` pointing at a session loaded via
+       `gsc_load_from_sf_export`; the `address` column of `dataset`
+       is the URL source. Use `offset`/`limit` to paginate — each
+       call still processes at most 10 URLs.
 
     Args:
-        site_url: The URL of the site in Search Console (exact match, or
-            sc-domain:example.com for domain properties).
-        urls: Newline-separated URL list. Optional when `from_session` is
-            set. When supplied directly, the tool errors if >10 URLs are
-            provided.
-        from_session: Optional SF session id. When set, URLs stream from
-            the session's dataset instead of `urls`.
-        dataset: Session-path only. Dataset name within the SF session
-            (default 'search_console_all'). Must match ^[a-z0-9_]+$ and
-            contain an 'address' column.
-        offset: Session-path only. Number of address rows to skip before
-            taking the next slice. Must be >= 0. Ignored when `urls` is
-            supplied directly.
-        limit: Session-path only. Max URLs to process this call. Must be
-            1-10; values > 10 are clamped to 10 with a note in the
-            response. Ignored when `urls` is supplied directly.
+        site_url: GSC site URL (exact match; `sc-domain:example.com`
+            for domain properties).
+        urls: Newline-separated URLs (optional when `from_session` set).
+        from_session: SF session id; URLs come from session dataset.
+        dataset: Session dataset name (default 'search_console_all';
+            must match ^[a-z0-9_]+$ and contain 'address' column).
+        offset: Rows to skip in session dataset (>= 0). Ignored in
+            direct-URL mode.
+        limit: Max URLs per call. Must be 1–10; values > 10 are
+            clamped to 10. Ignored in direct-URL mode.
     """
     try:
         # --- Phase 1: resolve URL list (no network) ---
@@ -1079,16 +1147,17 @@ async def batch_url_inspection(
 
         # Process each URL
         results = []
-        
-        for page_url in url_list:
-            # Build request
+
+        for i, page_url in enumerate(url_list):
+            if i > 0 and URL_INSPECTION_PACING_SEC > 0:
+                await asyncio.sleep(URL_INSPECTION_PACING_SEC)
+
             request = {
                 "inspectionUrl": page_url,
                 "siteUrl": site_url
             }
-            
+
             try:
-                # Execute request with a small delay to avoid rate limits
                 response = service.urlInspection().index().inspect(body=request).execute()
                 
                 if not response or "inspectionResult" not in response:
@@ -1133,12 +1202,16 @@ async def batch_url_inspection(
 
 @mcp.tool()
 async def check_indexing_issues(site_url: str, urls: str) -> str:
-    """
-    Check for specific indexing issues across multiple URLs.
-    
+    """Bucket up to 10 URLs by indexing problem (not-indexed, canonical
+    conflict, robots-blocked, fetch failure, indexed). Pick me when you
+    want a triage summary across several URLs; use `inspect_url_enhanced`
+    for one URL in full detail, or `batch_url_inspection` for uniform
+    per-URL output.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match, for domain properties use format: sc-domain:example.com)
-        urls: List of URLs to check, one per line
+        site_url: GSC site URL (exact match; `sc-domain:example.com`
+            for domain properties).
+        urls: Newline-separated URLs (max 10).
     """
     try:
         service = get_gsc_service()
@@ -1162,15 +1235,16 @@ async def check_indexing_issues(site_url: str, urls: str) -> str:
         }
         
         # Process each URL
-        for page_url in url_list:
-            # Build request
+        for i, page_url in enumerate(url_list):
+            if i > 0 and URL_INSPECTION_PACING_SEC > 0:
+                await asyncio.sleep(URL_INSPECTION_PACING_SEC)
+
             request = {
                 "inspectionUrl": page_url,
                 "siteUrl": site_url
             }
-            
+
             try:
-                # Execute request
                 response = service.urlInspection().index().inspect(body=request).execute()
                 
                 if not response or "inspectionResult" not in response:
@@ -1332,56 +1406,62 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
 
 @mcp.tool()
 async def get_advanced_search_analytics(
-    site_url: str, 
-    start_date: str = None, 
-    end_date: str = None, 
-    dimensions: str = "query", 
+    site_url: str,
+    start_date: str = None,
+    end_date: str = None,
+    dimensions: str = "query",
     search_type: str = "WEB",
-    row_limit: int = 1000,
+    row_limit: int = 100,
     start_row: int = 0,
     sort_by: str = "clicks",
     sort_direction: str = "descending",
     filter_dimension: str = None,
-    filter_operator: str = "contains", 
-    filter_expression: str = None
+    filter_operator: str = "contains",
+    filter_expression: str = None,
 ) -> str:
-    """
-    Get advanced search analytics data with sorting, filtering, and pagination.
-    
+    """GSC search analytics with sorting, filtering, and pagination. Pick me
+    when you need more than a plain top-N summary; use `get_search_analytics`
+    for a quick overview or `get_search_by_page_query` to break one page
+    down by query.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        start_date: Start date in YYYY-MM-DD format (defaults to 28 days ago)
-        end_date: End date in YYYY-MM-DD format (defaults to today)
-        dimensions: Dimensions to group by, comma-separated (e.g., "query,page,device")
-        search_type: Type of search results (WEB, IMAGE, VIDEO, NEWS, DISCOVER)
-        row_limit: Maximum number of rows to return (max 25000)
-        start_row: Starting row for pagination
-        sort_by: Metric to sort by (clicks, impressions, ctr, position)
-        sort_direction: Sort direction (ascending or descending)
-        filter_dimension: Dimension to filter on (query, page, country, device)
-        filter_operator: Filter operator (contains, equals, notContains, notEquals)
-        filter_expression: Filter expression value
+        site_url: GSC site URL (exact match).
+        start_date: YYYY-MM-DD (defaults to 28 days ago).
+        end_date: YYYY-MM-DD (defaults to today).
+        dimensions: Comma-separated (e.g. "query,page,device").
+        search_type: WEB, IMAGE, VIDEO, NEWS, or DISCOVER.
+        row_limit: Rows per page (default 100; clamped to [1, 25000]).
+            Pass `row_limit=1000` for large pulls; paginate via
+            `start_row` for more.
+        start_row: Starting row for pagination.
+        sort_by: clicks | impressions | ctr | position.
+        sort_direction: ascending | descending.
+        filter_dimension: query | page | country | device.
+        filter_operator: contains | equals | notContains | notEquals.
+        filter_expression: value to filter on.
     """
     try:
+        row_limit = max(1, min(int(row_limit), 25000))
+
         service = get_gsc_service()
-        
+
         # Calculate date range if not provided
         if not end_date:
             end_date = datetime.now().date().strftime("%Y-%m-%d")
         if not start_date:
             start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
-        
+
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
+
         # Build request
         request = {
             "startDate": start_date,
             "endDate": end_date,
             "dimensions": dimension_list,
-            "rowLimit": min(row_limit, 25000),  # Cap at API maximum
+            "rowLimit": row_limit,
             "startRow": start_row,
-            "searchType": search_type.upper()
+            "searchType": search_type.upper(),
         }
         
         # Add sorting
@@ -1421,13 +1501,28 @@ async def get_advanced_search_analytics(
                    f"- Search type: {search_type}\n"
                    f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'" if filter_dimension else "- No filter applied")
         
-        # Format results
-        result_lines = [f"Search analytics for {site_url}:"]
+        # Loud truncation warning goes at the TOP so agents can't skim past
+        # it. A tail nudge is also emitted further below (belt and braces)
+        # since agents vary in whether they read from the top or bottom.
+        rows_returned = len(response.get("rows", []))
+        truncated = rows_returned >= row_limit
+
+        result_lines: List[str] = []
+        if truncated:
+            result_lines.append(
+                f"⚠ TRUNCATED: returned {rows_returned} rows and hit "
+                f"`row_limit={row_limit}`. There may be more data. Pass a "
+                f"larger `row_limit` (max 25000) or paginate via "
+                f"`start_row={start_row + row_limit}`."
+            )
+            result_lines.append("")
+
+        result_lines.append(f"Search analytics for {site_url}:")
         result_lines.append(f"Date range: {start_date} to {end_date}")
         result_lines.append(f"Search type: {search_type}")
         if filter_dimension:
             result_lines.append(f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'")
-        result_lines.append(f"Showing rows {start_row+1} to {start_row+len(response.get('rows', []))} (sorted by {sort_by} {sort_direction})")
+        result_lines.append(f"Showing rows {start_row+1} to {start_row+rows_returned} (sorted by {sort_by} {sort_direction})")
         result_lines.append("\n" + "-" * 80 + "\n")
         
         # Create header based on dimensions
@@ -1453,12 +1548,11 @@ async def get_advanced_search_analytics(
             
             result_lines.append(" | ".join(data))
         
-        # Add pagination info if there might be more results
-        if len(response.get("rows", [])) == row_limit:
+        if truncated:
             next_start = start_row + row_limit
             result_lines.append("\nThere may be more results available. To see the next page, use:")
             result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
-        
+
         return "\n".join(result_lines)
     except Exception as e:
         return f"Error retrieving advanced search analytics: {str(e)}"
@@ -1471,39 +1565,45 @@ async def compare_search_periods(
     period2_start: str,
     period2_end: str,
     dimensions: str = "query",
-    limit: int = 10
+    limit: int = 10,
+    *,
+    upstream_row_limit: int = 500,
 ) -> str:
-    """
-    Compare search analytics data between two time periods.
-    
+    """Compare GSC analytics between two time periods.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        period1_start: Start date for period 1 (YYYY-MM-DD)
-        period1_end: End date for period 1 (YYYY-MM-DD)
-        period2_start: Start date for period 2 (YYYY-MM-DD)
-        period2_end: End date for period 2 (YYYY-MM-DD)
-        dimensions: Dimensions to group by (default: query)
-        limit: Number of top results to compare (default: 10)
+        site_url: GSC site URL (exact match).
+        period1_start: Start date for period 1 (YYYY-MM-DD).
+        period1_end: End date for period 1 (YYYY-MM-DD).
+        period2_start: Start date for period 2 (YYYY-MM-DD).
+        period2_end: End date for period 2 (YYYY-MM-DD).
+        dimensions: Dimensions to group by (default: query).
+        limit: Number of top-N results to return after the diff (default 10).
+        upstream_row_limit: Per-period rows pulled from GSC before the
+            join (default 500; clamped to [1, 25000]). Raise this if
+            long-tail queries aren't matching between periods.
     """
     try:
+        upstream_row_limit = max(1, min(int(upstream_row_limit), 25000))
+
         service = get_gsc_service()
-        
+
         # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
-        
+
         # Build requests for both periods
         period1_request = {
             "startDate": period1_start,
             "endDate": period1_end,
             "dimensions": dimension_list,
-            "rowLimit": 1000  # Get more to ensure we can match items between periods
+            "rowLimit": upstream_row_limit,
         }
-        
+
         period2_request = {
             "startDate": period2_start,
             "endDate": period2_end,
             "dimensions": dimension_list,
-            "rowLimit": 1000
+            "rowLimit": upstream_row_limit,
         }
         
         # Execute requests
@@ -1602,58 +1702,37 @@ async def get_search_by_page_query(
     row_limit: int = 20,
     response_format: str = "markdown",
 ):
-    """
-    Get search analytics data for a specific page, broken down by query.
-
-    By default returns a formatted markdown string (backward compatible with
-    pre-0.5 output). Pass response_format="json" to get a structured dict
-    with per-query rows and an impression-weighted summary block.
+    """Break down GSC queries for a single page. Pick me when you already
+    know which URL you want to analyse; use `get_search_analytics` for
+    a property-wide overview or `get_advanced_search_analytics` for
+    filtered/paginated analytics.
 
     Args:
-        site_url: The URL of the site in Search Console (must be exact match).
-        page_url: The specific page URL to analyze. Must match the GSC `page`
-            dimension exactly — typically the full URL (with scheme and host),
-            not a path.
-        days: Number of days to look back (default 28; clamped to min 1).
-        row_limit: Max query rows to return (default 20; clamped to
-            [1, 25000]). Pass 500 or 1000 on pages ranking for many queries
-            to avoid silent impression undercounts. Note that summary
-            aggregates (in json mode) are only accurate across returned
-            rows — if total_rows_returned == row_limit the data is still
-            capped and you should raise row_limit and retry.
-        response_format: "markdown" (default) or "json". Accepted
-            case-insensitively; whitespace is stripped.
+        site_url: GSC site URL (exact match).
+        page_url: Full page URL (scheme + host + path) matching the GSC
+            `page` dimension exactly.
+        days: Look-back window (default 28; clamped to min 1).
+        row_limit: Max query rows (default 20; clamped to [1, 25000]).
+            Raise to 500–1000 on pages ranking for many queries to
+            avoid silent impression undercounts. Summary aggregates
+            in json mode are only accurate across returned rows —
+            if total_rows_returned == row_limit, retry with a larger
+            row_limit.
+        response_format: "markdown" (default, compact) or "json"
+            (structured; ~2× tokens but parseable). Case-insensitive.
 
     Returns:
-        When response_format="markdown" (default): a formatted str.
-        Matches the pre-0.5 output byte-for-byte for normal inputs. On
-        error, returns a string prefixed "Error retrieving page query
-        data: ...".
-
-        When response_format="json": a Dict[str, Any] with shape:
-            {
-                "ok": True,
-                "site_url": str,
-                "page_url": str,
-                "days": int,              # effective value after clamping
-                "row_limit": int,         # effective value after clamping
-                "total_rows_returned": int,
-                "possibly_truncated": bool,   # True when rows >= row_limit
-                "queries": [
-                    {"query": str, "clicks": int, "impressions": int,
-                     "ctr": float, "position": float},
-                    ...
-                ],
-                "summary": {
-                    "total_clicks": int,
-                    "total_impressions": int,
-                    "average_position": float,   # impression-weighted
-                    "average_ctr": float,        # clicks / impressions
-                },
-            }
-        On error: {"ok": False, "error": str, "tool":
-        "get_search_by_page_query"}. Invalid response_format values
-        always return a string error (the conservative default).
+        markdown mode (default): str, pre-0.5 byte-compatible.
+        json mode: dict with keys `ok, site_url, page_url, days,
+        row_limit, total_rows_returned, possibly_truncated, queries,
+        summary`. `queries` is a list of `{query, clicks, impressions,
+        ctr, position}`. `summary` is
+        `{total_clicks, total_impressions, average_position
+        (impression-weighted), average_ctr}`.
+        On error: `{ok: False, error, tool}` in json mode, or a
+        string prefixed `"Error retrieving page query data: ..."` in
+        markdown mode. Invalid response_format always returns a string
+        error (conservative default).
     """
     fmt = str(response_format).strip().lower()
     if fmt not in ("markdown", "json"):
@@ -1825,30 +1904,27 @@ async def gsc_get_landing_page_summary(
     country: Optional[str] = None,
     device: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Server-side aggregated summary of top landing pages for a GSC property.
-
-    Returns a compact dict (≤~3k tokens) instead of the markdown table that
-    get_search_analytics produces, so callers can ingest top-N page data
-    without blowing the context window. Flags striking-distance pages and
-    high-impression/low-CTR pages.
-
-    Makes TWO API calls: one for site totals and site-average CTR, one for
-    the top-N page rows. Site totals cannot be derived from the capped
-    per-page response because the long tail gets excluded.
+    """Compact top-N landing pages for a GSC property with striking-distance
+    and high-impression/low-CTR flags. Returns a dict (~2k tokens) so
+    callers can ingest many pages without blowing context. Makes 2 API
+    calls (site totals + top-N rows).
 
     Args:
-        site_url: The GSC site URL (exact match; for domain properties use sc-domain:example.com).
-        start_date: Start of the window. Accepts 'today', 'yesterday', 'Ndaysago', or YYYY-MM-DD.
-        end_date: End of the window. Same format as start_date.
-        top_n: Number of landing pages to return (default 25).
-        striking_distance_range: Two-item [min, max] tuple/array for the
-            striking-distance flag (default (11.0, 20.0)). Must be finite
-            with min <= max. Accepts Python tuples or JSON lists.
-        high_impression_min: Minimum impressions for the high-impression/low-CTR flag (default 500).
-        low_ctr_ratio: A page is flagged low-CTR when its CTR is below site_avg_ctr * low_ctr_ratio (default 0.5).
+        site_url: GSC site URL (exact match; `sc-domain:example.com` for
+            domain properties).
+        start_date: Window start. Accepts 'today', 'yesterday',
+            'Ndaysago', or YYYY-MM-DD.
+        end_date: Window end, same format as start_date.
+        top_n: Number of landing pages (default 25).
+        striking_distance_range: [min, max] position band for the
+            striking-distance flag (default (11.0, 20.0)). Must be
+            finite with min <= max.
+        high_impression_min: Min impressions for the high-impression/
+            low-CTR flag (default 500).
+        low_ctr_ratio: CTR below site_avg_ctr * this ratio flags the
+            page (default 0.5).
         country: Optional ISO-3166 country filter (e.g. 'gbr').
-        device: Optional device filter ('DESKTOP' | 'MOBILE' | 'TABLET').
+        device: Optional 'DESKTOP' | 'MOBILE' | 'TABLET' filter.
     """
     try:
         # Validate striking_distance_range up front so the error surfaces
@@ -2001,30 +2077,25 @@ async def gsc_compare_periods_landing_pages(
     sort_by: str = "clicks_delta",
     sort_direction: str = "asc",
 ) -> Dict[str, Any]:
-    """
-    Landing-page-keyed period-vs-period comparison with explicit delta columns
-    and a decay_flag suitable for content-rot detection.
-
-    Queries GSC twice (one per period) with dimensions=['page'], joins on page
-    URL, computes deltas, filters by min_impressions (OR across periods so
-    both decayers and new winners survive), and returns a sorted list.
-
-    Sort is configurable so the same primitive serves both audit flows:
-      - Content rot / decay:  sort_by='clicks_delta',  sort_direction='asc'  (default)
-      - Top risers:           sort_by='clicks_delta',  sort_direction='desc'
+    """Landing-page period-vs-period diff with decay_flag for content-rot
+    detection. 2 API calls (one per period), join on page URL, sort
+    by a chosen delta column. Use `sort_by='clicks_delta'` +
+    `sort_direction='asc'` for decayers (default); `desc` for risers.
 
     Args:
         site_url: GSC site URL.
-        period_a_start/end: Start/end dates for the earlier period. Accepts
-            'today'/'yesterday'/'Ndaysago'/YYYY-MM-DD.
-        period_b_start/end: Start/end dates for the later period.
-        min_impressions: Keep rows where period_a OR period_b impressions >= this.
-        limit: Max rows to return after sorting.
-        decay_threshold_pct: clicks_pct threshold for decay_flag (default -0.20
-            i.e. 20% click drop). Flag also requires position to have worsened.
-        sort_by: one of 'clicks_delta', 'clicks_pct', 'impressions_delta',
-            'impressions_pct', 'position_delta', 'ctr_delta'.
-        sort_direction: 'asc' or 'desc' (case-insensitive; normalized in the response).
+        period_a_start / period_a_end: Earlier window; accepts 'today',
+            'yesterday', 'Ndaysago', or YYYY-MM-DD.
+        period_b_start / period_b_end: Later window, same format.
+        min_impressions: Keep rows where period_a OR period_b
+            impressions >= this (default 100).
+        limit: Max rows after sorting (default 50).
+        decay_threshold_pct: clicks_pct threshold for decay_flag
+            (default -0.20 = 20% click drop; flag also requires
+            position to have worsened).
+        sort_by: `clicks_delta`, `clicks_pct`, `impressions_delta`,
+            `impressions_pct`, `position_delta`, or `ctr_delta`.
+        sort_direction: 'asc' or 'desc' (case-insensitive).
     """
     try:
         if limit < 1:
@@ -2579,7 +2650,10 @@ async def add_account(alias: str) -> str:
         # Run OAuth flow
         try:
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
-            creds = flow.run_local_server(port=0)
+            creds = _start_oauth_flow(flow, context=f"add_account('{alias}')")
+        except HeadlessOAuthError as e:
+            shutil.rmtree(acct_dir, ignore_errors=True)
+            return str(e)
         except Exception as e:
             # Clean up partial directory on OAuth failure
             shutil.rmtree(acct_dir, ignore_errors=True)

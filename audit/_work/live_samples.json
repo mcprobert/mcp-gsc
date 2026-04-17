@@ -1,0 +1,69 @@
+{
+  "note": "Live responses from sc-domain:chaserhq.com on 2026-04-17. All identifying data redacted for audit publication in 01-discovery.md. Raw captures kept here for token-counting only.",
+  "property_tested": "sc-domain:chaserhq.com",
+  "active_account": "chaser",
+  "captured_at": "2026-04-17T14:16:44Z",
+  "samples": {
+    "list_properties_all": {
+      "shape": "str",
+      "rows": 17,
+      "paginated": false,
+      "note": "Returned all 17 verified properties unpaginated. Unbounded for agency accounts."
+    },
+    "get_performance_overview_28d": {
+      "shape": "str (markdown)",
+      "row_count_effective": 28,
+      "notes": "Totals header + per-day rows"
+    },
+    "get_search_analytics_28d_query": {
+      "shape": "str (markdown table, 20 rows fixed default)",
+      "row_count_effective": 20,
+      "notes": "Hardcoded rowLimit=20 (gsc_server.py:712); no parameter to override in this tool"
+    },
+    "get_advanced_search_analytics_100": {
+      "shape": "str (markdown, 100 rows)",
+      "row_count_effective": 100,
+      "notes": "Pagination cursor nudge at end: 'To see the next page, use: start_row: 100, row_limit: 100'"
+    },
+    "get_search_by_page_query_markdown_20": {
+      "shape": "str (markdown, 20 rows + TOTAL row)",
+      "row_count_effective": 20,
+      "notes": "Backward-compatible pre-0.5 output"
+    },
+    "get_search_by_page_query_json_20": {
+      "shape": "dict",
+      "row_count_effective": 20,
+      "notes": "Opt-in structured output with summary block"
+    },
+    "inspect_url_enhanced_single": {
+      "shape": "str (markdown, verbose multi-section)",
+      "notes": "Includes 'Search Console Link' with embedded tracking params + large referring-URL list"
+    },
+    "gsc_get_landing_page_summary_25": {
+      "shape": "dict",
+      "row_count_effective": 25,
+      "notes": "Compact per-page metrics + flags"
+    },
+    "gsc_health_check": {
+      "shape": "dict",
+      "notes": "ok:true, returns sitemap counts, manual_actions/security_issues explicitly 'not available'"
+    },
+    "get_sitemaps": {
+      "shape": "str (ERROR)",
+      "error": "Error retrieving sitemaps: '>' not supported between instances of 'str' and 'int'",
+      "note": "LIVE BUG. Terse error. 1:1 wrapper. See gsc_server.py:798 context."
+    },
+    "list_sitemaps_enhanced": {
+      "shape": "str (markdown table, 5 rows)",
+      "row_count_effective": 5
+    },
+    "get_site_details": {
+      "shape": "str (2 lines)",
+      "notes": "Only shows permission level; very low info density"
+    },
+    "compare_search_periods_10": {
+      "shape": "str (markdown, 10 rows)",
+      "row_count_effective": 10
+    }
+  }
+}
