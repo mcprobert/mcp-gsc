@@ -149,3 +149,79 @@ class TestFormatError:
         assert _format_error(env, response_format="csv") == _format_error(
             env, response_format="markdown"
         )
+
+    def test_unknown_format_returns_validation_error(self):
+        # Matches _format_table's rejection behaviour — both helpers
+        # agree on what counts as a valid response_format.
+        env = _make_error_envelope(error="x")
+        out = _format_error(env, response_format="xml")
+        assert isinstance(out, str)
+        assert out.startswith("Error: response_format must be one of")
+
+
+class TestRetryAfterParsing:
+    """B.4 now accepts both numeric and HTTP-date Retry-After headers."""
+
+    def test_numeric_seconds(self):
+        resp = MagicMock()
+        resp.status = 429
+        resp.get = MagicMock(side_effect=lambda k, d=None: "45" if k == "retry-after" else d)
+        env = _http_error_envelope(
+            HttpError(resp=resp, content=b'{"error": {"message": "slow"}}'),
+            tool="x",
+        )
+        assert env["retry_after"] == 45.0
+
+    def test_http_date_form(self):
+        # RFC 7231 allows an HTTP-date. Pick a date guaranteed to be
+        # in the future so the parser returns a positive delta.
+        from email.utils import format_datetime
+        from datetime import datetime, timezone, timedelta
+        future = datetime.now(tz=timezone.utc) + timedelta(seconds=20)
+        date_str = format_datetime(future)
+        resp = MagicMock()
+        resp.status = 429
+        resp.get = MagicMock(side_effect=lambda k, d=None: date_str if k == "retry-after" else d)
+        env = _http_error_envelope(
+            HttpError(resp=resp, content=b'{"error": {"message": "slow"}}'),
+            tool="x",
+        )
+        # Within the ±2s tolerance of the parse vs clock skew.
+        assert 15.0 <= env["retry_after"] <= 25.0
+
+    def test_unparseable_falls_back_to_60(self):
+        resp = MagicMock()
+        resp.status = 429
+        resp.get = MagicMock(side_effect=lambda k, d=None: "not a number or date" if k == "retry-after" else d)
+        env = _http_error_envelope(
+            HttpError(resp=resp, content=b'{"error": {"message": "slow"}}'),
+            tool="x",
+        )
+        assert env["retry_after"] == 60.0
+
+
+class TestUnknownStatus:
+    def test_status_0_renders_as_unknown(self):
+        resp = MagicMock()
+        resp.status = 0
+        resp.get = MagicMock(return_value=None)
+        env = _http_error_envelope(
+            HttpError(resp=resp, content=b'{"error": {"message": "transport dead"}}'),
+            tool="x",
+        )
+        # Literal "HTTP 0" is misleading — HTTP has no status 0.
+        assert "HTTP 0" not in env["error"]
+        assert "unknown" in env["error"].lower()
+
+    def test_status_none_renders_as_unknown(self):
+        # Real googleapiclient transport failures sometimes surface with
+        # a None/0 status. Either should render as "unknown" rather than
+        # "HTTP 0" / "HTTP None".
+        resp = MagicMock()
+        resp.status = None
+        resp.get = MagicMock(return_value=None)
+        env = _http_error_envelope(
+            HttpError(resp=resp, content=b'{"error": {"message": "weird"}}'),
+            tool="x",
+        )
+        assert "unknown" in env["error"].lower()

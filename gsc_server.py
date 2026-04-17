@@ -206,7 +206,13 @@ def _http_error_envelope(
     except Exception:
         message = str(e)
 
-    status = getattr(e.resp, "status", 0)
+    status = getattr(e.resp, "status", None)
+    # getattr returns the attribute's value — if it's literally 0, treat
+    # that as "unknown" (HTTP has no status 0; it usually indicates a
+    # transport-layer failure surfaced without a proper code).
+    if not status:
+        status = None
+
     hint = ""
     retry_after: Optional[float] = None
 
@@ -216,7 +222,7 @@ def _http_error_envelope(
             "`switch_account`, or set GSC_OAUTH_CLIENT_SECRETS_FILE."
         )
     elif status == 403:
-        site_part = f" Verify `{site_url}` is shared with the active account." if site_url else ""
+        site_part = f" Verify `{site_url!r}` is shared with the active account." if site_url else ""
         hint = (
             f"Permission denied. Check `get_active_account` and "
             f"`list_properties` first.{site_part}"
@@ -231,20 +237,45 @@ def _http_error_envelope(
             hint = "Not found. Check the resource identifier was copied exactly."
     elif status == 429:
         hint = "Rate limited by GSC. Wait then retry."
-        try:
-            retry_after = float(getattr(e.resp, "get", lambda *_: 60)("retry-after", 60))
-        except (TypeError, ValueError):
-            retry_after = 60.0
+        retry_after = _parse_retry_after(e.resp)
     elif status in (500, 503):
         hint = "GSC server error. Retry after a short backoff."
         retry_after = 30.0
 
+    status_text = f"HTTP {status}" if status else "HTTP (unknown status)"
     return _make_error_envelope(
-        error=f"HTTP {status}: {message}",
+        error=f"{status_text}: {message}",
         hint=hint,
         retry_after=retry_after,
         tool=tool,
     )
+
+
+def _parse_retry_after(resp: Any) -> float:
+    """Parse an HTTP ``Retry-After`` header, accepting seconds or an
+    HTTP-date (RFC 7231). Falls back to 60s for anything unparseable.
+    """
+    try:
+        raw = resp.get("retry-after")
+    except Exception:
+        raw = None
+    if raw is None:
+        return 60.0
+    # Number-of-seconds form first (cheap).
+    try:
+        return max(0.0, min(float(raw), 3600.0))
+    except (TypeError, ValueError):
+        pass
+    # HTTP-date form. `email.utils.parsedate_to_datetime` is stdlib.
+    try:
+        from email.utils import parsedate_to_datetime
+        when = parsedate_to_datetime(raw)
+        if when is None:
+            return 60.0
+        delta = (when - datetime.now(tz=when.tzinfo)).total_seconds()
+        return max(0.0, min(delta, 3600.0))
+    except Exception:
+        return 60.0
 
 
 def _format_error(
@@ -258,8 +289,17 @@ def _format_error(
     markdown / csv: a string starting with ``Error:`` followed by the
     hint and retry_after if present — human-readable and parseable by
     agent text routing.
+
+    Unknown ``response_format`` values return a validation-style error
+    string matching :func:`_format_table`'s behaviour so the two helpers
+    stay consistent.
     """
     fmt = str(response_format or "").strip().lower()
+    if fmt not in _RESPONSE_FORMATS:
+        return (
+            f"Error: response_format must be one of {_RESPONSE_FORMATS}; "
+            f"got {response_format!r}."
+        )
     if fmt == "json":
         return envelope
     error = envelope.get("error", "")
@@ -372,13 +412,20 @@ def _format_table(
         for row in rows
     ]
 
+    # The truncation warning MUST precede any other context lines so
+    # agents can't skim past it (A.1's original invariant; the B.2
+    # review caught this regression when the ordering flipped).
+    effective_hint = truncation_hint
+    if truncated and not effective_hint:
+        effective_hint = "Result was truncated; no hint provided by the caller."
+
     if fmt == "markdown":
         lines: List[str] = []
+        if truncated:
+            lines.append(f"⚠ TRUNCATED: {effective_hint}")
+            lines.append("")
         if header_lines:
             lines.extend(header_lines)
-            lines.append("")
-        if truncated and truncation_hint:
-            lines.append(f"⚠ TRUNCATED: {truncation_hint}")
             lines.append("")
         lines.append(" | ".join(headers))
         lines.append(" | ".join("---" for _ in headers))
@@ -387,18 +434,27 @@ def _format_table(
         return "\n".join(lines)
 
     # csv — RFC-4180-ish: comma separator, CRLF newlines, quote cells
-    # that contain comma / quote / newline.
+    # that contain comma / quote / newline. Cells that begin with a
+    # spreadsheet-formula trigger (=, +, -, @, tab, CR) get a leading
+    # apostrophe prepended so Excel/Sheets don't treat them as
+    # formulas — OWASP CSV-injection mitigation.
+    _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
+
     def _csv_quote(cell: str) -> str:
+        if cell and cell[0] in _FORMULA_TRIGGERS:
+            cell = "'" + cell
         if any(ch in cell for ch in (",", '"', "\n", "\r")):
             return '"' + cell.replace('"', '""') + '"'
         return cell
 
     lines = []
+    if truncated:
+        # Truncation first in CSV too — downstream parsers that skip
+        # `#`-comments will still log the warning, agents reading the
+        # raw stream see it before any data rows.
+        lines.append(f"# TRUNCATED: {effective_hint}")
     if header_lines:
-        # csv comment prefix so downstream parsers can skip easily.
         lines.extend(f"# {line}" for line in header_lines)
-    if truncated and truncation_hint:
-        lines.append(f"# TRUNCATED: {truncation_hint}")
     lines.append(",".join(_csv_quote(h) for h in headers))
     for row in data_rows:
         lines.append(",".join(_csv_quote(c) for c in row))
@@ -2013,7 +2069,14 @@ async def compare_search_periods(
 
         # Sort by absolute click difference descending.
         comparison_data.sort(key=lambda r: abs(r["click_diff"]), reverse=True)
+        total_matched = len(comparison_data)
         rows = comparison_data[:limit]
+        truncated = total_matched > limit
+        truncation_hint = (
+            f"{total_matched} matched queries across both periods; only the top "
+            f"{limit} are shown. Raise `limit` (default 10) or narrow the date "
+            f"range to see more." if truncated else ""
+        )
 
         columns: List[Dict[str, str]] = [
             {"key": dim, "display": dim.capitalize(), "type": "str"}
@@ -2042,7 +2105,8 @@ async def compare_search_periods(
             columns,
             response_format=response_format,
             header_lines=header_lines,
-            truncated=False,
+            truncated=truncated,
+            truncation_hint=truncation_hint,
             meta={
                 "site_url": site_url,
                 "period1": {"start": period1_start, "end": period1_end},
@@ -2050,7 +2114,7 @@ async def compare_search_periods(
                 "dimensions": dimension_list,
                 "limit": limit,
                 "upstream_row_limit": upstream_row_limit,
-                "total_matched": len(comparison_data),
+                "total_matched": total_matched,
             },
         )
     except HttpError as e:
@@ -2271,14 +2335,15 @@ async def get_search_by_page_query(
 
         return result
     except HttpError as e:
-        try:
-            error_content = json.loads(e.content.decode("utf-8"))
-            message = error_content.get("error", {}).get("message", str(e))
-        except Exception:
-            message = str(e)
-        return {"ok": False, "error": message, "tool": "get_search_by_page_query"}
+        return _http_error_envelope(
+            e, tool="get_search_by_page_query", site_url=site_url
+        )
     except Exception as e:
-        return {"ok": False, "error": str(e), "tool": "get_search_by_page_query"}
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+            tool="get_search_by_page_query",
+        )
 
 
 # --- Aggregated landing-page tools (Adds 2 + 3) ---

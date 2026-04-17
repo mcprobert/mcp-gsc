@@ -52,6 +52,31 @@ class TestMarkdown:
         # Must appear BEFORE the table header so agents can't skim past.
         assert out.index("⚠ TRUNCATED") < out.index("Query | Clicks")
 
+    def test_truncation_warning_precedes_header_lines(self):
+        # A.1 invariant: when both header_lines and truncation are
+        # present, the warning must be line 1. The B.2 review caught
+        # a regression that inverted this.
+        out = _format_table(
+            ROWS, COLUMNS,
+            response_format="markdown",
+            header_lines=["Search analytics for sc-domain:example.com"],
+            truncated=True,
+            truncation_hint="raise row_limit.",
+        )
+        assert out.startswith("⚠ TRUNCATED:")
+        assert out.index("⚠ TRUNCATED") < out.index("Search analytics for")
+
+    def test_truncation_without_hint_still_warns(self):
+        # Latent-bug guard: if a caller sets truncated=True but forgets
+        # a hint, previous code silently dropped the warning.
+        out = _format_table(
+            ROWS, COLUMNS,
+            response_format="markdown",
+            truncated=True,
+            truncation_hint="",
+        )
+        assert "⚠ TRUNCATED" in out
+
     def test_no_truncation_warning_when_not_truncated(self):
         out = _format_table(
             ROWS, COLUMNS,
@@ -86,6 +111,40 @@ class TestCsv:
             header_lines=["Period: 28 days"],
         )
         assert out.startswith("# Period: 28 days\r\n")
+
+    def test_truncation_comment_precedes_header_comments(self):
+        out = _format_table(
+            ROWS, COLUMNS,
+            response_format="csv",
+            header_lines=["Period: 28 days"],
+            truncated=True,
+            truncation_hint="raise row_limit.",
+        )
+        assert out.startswith("# TRUNCATED: raise row_limit.\r\n# Period: 28 days\r\n")
+
+    def test_csv_escapes_formula_triggers_with_leading_quote(self):
+        # OWASP CSV-injection mitigation: cells starting with =, +, -,
+        # @, tab, or CR are prefixed with ' so Excel/Sheets don't
+        # interpret them as formulas.
+        rows = [
+            {"query": "=SUM(A:A)", "clicks": 1, "ctr": 0.1, "position": 1.0},
+            {"query": "+evil()", "clicks": 1, "ctr": 0.1, "position": 1.0},
+            {"query": "@cmd", "clicks": 1, "ctr": 0.1, "position": 1.0},
+            {"query": "-minus", "clicks": 1, "ctr": 0.1, "position": 1.0},
+        ]
+        out = _format_table(rows, COLUMNS, response_format="csv")
+        # Every formula-trigger row now starts with a single quote.
+        assert "'=SUM(A:A)" in out
+        assert "'+evil()" in out
+        assert "'@cmd" in out
+        assert "'-minus" in out
+
+    def test_csv_normal_cells_unchanged_by_formula_guard(self):
+        rows = [{"query": "normal text", "clicks": 1, "ctr": 0.1, "position": 1.0}]
+        out = _format_table(rows, COLUMNS, response_format="csv")
+        # No stray apostrophes on ordinary text.
+        assert "normal text" in out
+        assert "'normal" not in out
 
 
 class TestJson:

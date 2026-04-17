@@ -581,10 +581,14 @@ class TestJsonEmptyAndDefensive:
 
 class TestJsonErrorPaths:
     async def test_http_error_returns_error_dict_with_parsed_message(self, monkeypatch):
+        # Post-B.4 migration: the envelope now includes status-aware
+        # prefix ("HTTP 400: ...") and may carry a hint/retry_after.
+        # The parsed message still appears in the error field.
         error_body = b'{"error": {"message": "Invalid site URL", "code": 400}}'
         resp = MagicMock()
         resp.status = 400
         resp.reason = "Bad Request"
+        resp.get = MagicMock(return_value=None)
         http_error = HttpError(resp=resp, content=error_body)
 
         service = MagicMock()
@@ -598,10 +602,13 @@ class TestJsonErrorPaths:
         )
 
         assert result["ok"] is False
-        assert result["error"] == "Invalid site URL"
+        assert "Invalid site URL" in result["error"]
+        assert "HTTP 400" in result["error"]
         assert result["tool"] == "get_search_by_page_query"
 
     async def test_generic_exception_returns_error_dict(self, monkeypatch):
+        # Post-B.4: generic exceptions surface with the exception type
+        # name prefix ("RuntimeError: boom") and a hint field.
         def _explode():
             raise RuntimeError("boom")
 
@@ -614,8 +621,11 @@ class TestJsonErrorPaths:
         )
 
         assert result["ok"] is False
-        assert result["error"] == "boom"
+        assert "boom" in result["error"]
+        assert "RuntimeError" in result["error"]
         assert result["tool"] == "get_search_by_page_query"
+        # Hint now present thanks to the envelope helpers.
+        assert "hint" in result
 
     async def test_invalid_days_type_returns_error_dict(self, monkeypatch):
         """int('abc') inside try block must be caught and return a dict error
