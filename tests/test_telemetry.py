@@ -121,3 +121,90 @@ class TestLogNeverReachesStdout:
         captured = capsys.readouterr()
         assert captured.err.strip()
         assert captured.out == ""
+
+
+class TestHotPathToolsEmitTelemetry:
+    """Sanity-check that the B.6 rollout wraps actually emit events.
+
+    We don't duplicate the full _instrument tests — we just confirm that
+    when an instrumented tool runs with telemetry enabled, at least one
+    tool_enter/tool_exit pair lands on stderr with the expected tool name.
+    """
+
+    async def _run_with_mocked_service(self, mod, tool_fn_name, tool_args, *, rows=None):
+        """Build a mock service whose searchanalytics().query().execute()
+        returns a canned rows response, then invoke the given tool."""
+        from unittest.mock import MagicMock
+
+        service = MagicMock()
+        service.searchanalytics.return_value.query.return_value.execute.return_value = {
+            "rows": rows if rows is not None else []
+        }
+        service.sites.return_value.list.return_value.execute.return_value = {
+            "siteEntry": [{"siteUrl": "sc-domain:example.com", "permissionLevel": "siteOwner"}]
+        }
+
+        # Monkey-patch get_gsc_service on the reloaded module.
+        mod.get_gsc_service = lambda: service  # type: ignore[assignment]
+
+        fn = getattr(mod, tool_fn_name)
+        return await fn(**tool_args)
+
+    @pytest.mark.asyncio
+    async def test_list_properties_emits_enter_and_exit(self, monkeypatch, capsys):
+        mod = _reload_with_env(monkeypatch, "1")
+        await self._run_with_mocked_service(mod, "list_properties", {})
+        lines = [
+            json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
+            if line.startswith("{")
+        ]
+        events_for_tool = [l for l in lines if l.get("tool") == "list_properties"]
+        # Must have at least tool_enter + tool_exit.
+        event_types = {e["event"] for e in events_for_tool}
+        assert "tool_enter" in event_types
+        assert "tool_exit" in event_types
+
+    @pytest.mark.asyncio
+    async def test_get_search_analytics_emits_and_records_args(self, monkeypatch, capsys):
+        mod = _reload_with_env(monkeypatch, "1")
+        await self._run_with_mocked_service(
+            mod,
+            "get_search_analytics",
+            {"site_url": "sc-domain:example.com", "days": 14, "row_limit": 50},
+        )
+        lines = [
+            json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
+            if line.startswith("{")
+        ]
+        enter = next(l for l in lines if l["event"] == "tool_enter" and l["tool"] == "get_search_analytics")
+        # Initial fields passed to _instrument must appear on the enter event.
+        assert enter["site_url"] == "sc-domain:example.com"
+        assert enter["days"] == 14
+        assert enter["row_limit"] == 50
+
+    @pytest.mark.asyncio
+    async def test_tool_error_fires_before_envelope_conversion(self, monkeypatch, capsys):
+        """When an instrumented body raises, _instrument must log
+        tool_error before the outer except converts the exception into
+        a user-facing envelope string. Otherwise telemetry thinks every
+        envelope-returning exception was a success."""
+        mod = _reload_with_env(monkeypatch, "1")
+        from unittest.mock import MagicMock
+
+        service = MagicMock()
+        service.sites.return_value.list.return_value.execute.side_effect = RuntimeError("boom")
+        mod.get_gsc_service = lambda: service  # type: ignore[assignment]
+
+        out = await mod.list_properties()
+        # User saw the envelope-converted string...
+        assert "RuntimeError" in out or "boom" in out or "Error" in out
+
+        # ...but telemetry saw the raw error.
+        lines = [
+            json.loads(line) for line in capsys.readouterr().err.strip().splitlines()
+            if line.startswith("{")
+        ]
+        tool_errors = [l for l in lines if l["event"] == "tool_error" and l["tool"] == "list_properties"]
+        assert tool_errors, "tool_error must fire before the envelope swallows the exception"
+        assert tool_errors[0]["error_type"] == "RuntimeError"
+        assert tool_errors[0]["ok"] is False

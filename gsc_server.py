@@ -949,42 +949,43 @@ async def list_properties(
         limit: Max properties to return (default 50; clamped to [1, 1000]).
     """
     try:
-        limit = max(1, min(int(limit), 1000))
+        async with _instrument("list_properties", name_contains=name_contains, limit=limit):
+            limit = max(1, min(int(limit), 1000))
 
-        service = get_gsc_service()
-        site_list = service.sites().list().execute()
+            service = get_gsc_service()
+            site_list = service.sites().list().execute()
 
-        sites = site_list.get("siteEntry", [])
+            sites = site_list.get("siteEntry", [])
 
-        if name_contains:
-            needle = name_contains.lower()
-            sites = [s for s in sites if needle in s.get("siteUrl", "").lower()]
-
-        if not sites:
             if name_contains:
-                return f"No Search Console properties matching {name_contains!r}."
-            return "No Search Console properties found."
+                needle = name_contains.lower()
+                sites = [s for s in sites if needle in s.get("siteUrl", "").lower()]
 
-        total_available = len(sites)
-        truncated = total_available > limit
-        shown_sites = sites[:limit]
+            if not sites:
+                if name_contains:
+                    return f"No Search Console properties matching {name_contains!r}."
+                return "No Search Console properties found."
 
-        # Format the results for easy reading
-        lines = []
-        for site in shown_sites:
-            site_url = site.get("siteUrl", "Unknown")
-            permission = site.get("permissionLevel", "Unknown permission")
-            lines.append(f"- {site_url} ({permission})")
+            total_available = len(sites)
+            truncated = total_available > limit
+            shown_sites = sites[:limit]
 
-        if truncated:
-            lines.append("")
-            lines.append(
-                f"⚠ Showing first {limit} of {total_available} properties. "
-                f"Pass `name_contains='…'` to filter or raise `limit` "
-                f"(max 1000) to see more."
-            )
+            # Format the results for easy reading
+            lines = []
+            for site in shown_sites:
+                site_url = site.get("siteUrl", "Unknown")
+                permission = site.get("permissionLevel", "Unknown permission")
+                lines.append(f"- {site_url} ({permission})")
 
-        return "\n".join(lines)
+            if truncated:
+                lines.append("")
+                lines.append(
+                    f"⚠ Showing first {limit} of {total_available} properties. "
+                    f"Pass `name_contains='…'` to filter or raise `limit` "
+                    f"(max 1000) to see more."
+                )
+
+            return "\n".join(lines)
     except FileNotFoundError as e:
         return (
             "Error: Service account credentials file not found.\n\n"
@@ -1084,74 +1085,75 @@ async def get_search_analytics(
             for downstream parsing) | `json` (dict with typed rows).
     """
     try:
-        days = max(int(days), 1)
-        row_limit = max(1, min(int(row_limit), 25000))
+        async with _instrument("get_search_analytics", site_url=site_url, days=days, row_limit=row_limit):
+            days = max(int(days), 1)
+            row_limit = max(1, min(int(row_limit), 25000))
 
-        service = get_gsc_service()
+            service = get_gsc_service()
 
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+            end_date = datetime.now().date()
+            start_date = end_date - timedelta(days=days)
 
-        dimension_list = [d.strip() for d in dimensions.split(",")]
+            dimension_list = [d.strip() for d in dimensions.split(",")]
 
-        request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": dimension_list,
-            "rowLimit": row_limit,
-        }
-
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-
-        raw_rows = response.get("rows") or []
-        if not raw_rows:
-            return f"No search analytics data found for {site_url} in the last {days} days."
-
-        # Shape rows into dicts keyed by column name for the shared helper.
-        rows = []
-        for r in raw_rows:
-            row_dict: Dict[str, Any] = {}
-            for i, dim in enumerate(dimension_list):
-                keys = r.get("keys", [])
-                row_dict[dim] = keys[i][:100] if i < len(keys) else ""
-            row_dict["clicks"] = r.get("clicks", 0)
-            row_dict["impressions"] = r.get("impressions", 0)
-            row_dict["ctr"] = r.get("ctr", 0)
-            row_dict["position"] = r.get("position", 0)
-            rows.append(row_dict)
-
-        columns = [
-            {"key": dim, "display": dim.capitalize(), "type": "str"}
-            for dim in dimension_list
-        ]
-        columns.extend([
-            {"key": "clicks", "display": "Clicks", "type": "int"},
-            {"key": "impressions", "display": "Impressions", "type": "int"},
-            {"key": "ctr", "display": "CTR", "type": "pct"},
-            {"key": "position", "display": "Position", "type": "float"},
-        ])
-
-        truncated = len(rows) >= row_limit
-        truncation_hint = (
-            f"Showing {row_limit} rows of possibly-more. Pass a larger "
-            f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
-            f"with `start_row` to paginate."
-        )
-
-        return _format_table(
-            rows,
-            columns,
-            response_format=response_format,
-            header_lines=[f"Search analytics for {site_url} (last {days} days)"],
-            truncated=truncated,
-            truncation_hint=truncation_hint,
-            meta={
-                "site_url": site_url,
-                "days": days,
+            request = {
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
                 "dimensions": dimension_list,
-                "row_limit": row_limit,
-            },
-        )
+                "rowLimit": row_limit,
+            }
+
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+
+            raw_rows = response.get("rows") or []
+            if not raw_rows:
+                return f"No search analytics data found for {site_url} in the last {days} days."
+
+            # Shape rows into dicts keyed by column name for the shared helper.
+            rows = []
+            for r in raw_rows:
+                row_dict: Dict[str, Any] = {}
+                for i, dim in enumerate(dimension_list):
+                    keys = r.get("keys", [])
+                    row_dict[dim] = keys[i][:100] if i < len(keys) else ""
+                row_dict["clicks"] = r.get("clicks", 0)
+                row_dict["impressions"] = r.get("impressions", 0)
+                row_dict["ctr"] = r.get("ctr", 0)
+                row_dict["position"] = r.get("position", 0)
+                rows.append(row_dict)
+
+            columns = [
+                {"key": dim, "display": dim.capitalize(), "type": "str"}
+                for dim in dimension_list
+            ]
+            columns.extend([
+                {"key": "clicks", "display": "Clicks", "type": "int"},
+                {"key": "impressions", "display": "Impressions", "type": "int"},
+                {"key": "ctr", "display": "CTR", "type": "pct"},
+                {"key": "position", "display": "Position", "type": "float"},
+            ])
+
+            truncated = len(rows) >= row_limit
+            truncation_hint = (
+                f"Showing {row_limit} rows of possibly-more. Pass a larger "
+                f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
+                f"with `start_row` to paginate."
+            )
+
+            return _format_table(
+                rows,
+                columns,
+                response_format=response_format,
+                header_lines=[f"Search analytics for {site_url} (last {days} days)"],
+                truncated=truncated,
+                truncation_hint=truncation_hint,
+                meta={
+                    "site_url": site_url,
+                    "days": days,
+                    "dimensions": dimension_list,
+                    "row_limit": row_limit,
+                },
+            )
     except HttpError as e:
         return _format_error(
             _http_error_envelope(e, tool="get_search_analytics", site_url=site_url),
@@ -1329,10 +1331,14 @@ async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
             "inspectionUrl": page_url,
             "siteUrl": site_url
         }
-        
-        # Execute request
-        response = service.urlInspection().index().inspect(body=request).execute()
-        
+
+        async with _instrument(
+            "inspect_url_enhanced",
+            site_url=site_url,
+            page_url=page_url,
+        ):
+            response = service.urlInspection().index().inspect(body=request).execute()
+
         if not response or "inspectionResult" not in response:
             return f"No inspection data found for {page_url}."
         
@@ -1767,18 +1773,23 @@ async def get_performance_overview(site_url: str, days: int = 28) -> str:
             "dimensions": [],  # No dimensions for totals
             "rowLimit": 1
         }
-        
-        total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
-        
-        # Get by date for trend
-        date_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["date"],
-            "rowLimit": days
-        }
-        
-        date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
+
+        async with _instrument(
+            "get_performance_overview",
+            site_url=site_url,
+            days=days,
+        ):
+            total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
+
+            # Get by date for trend
+            date_request = {
+                "startDate": start_date.strftime("%Y-%m-%d"),
+                "endDate": end_date.strftime("%Y-%m-%d"),
+                "dimensions": ["date"],
+                "rowLimit": days
+            }
+
+            date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
         
         # Format results
         result_lines = [f"Performance Overview for {site_url} (last {days} days):"]
@@ -1906,7 +1917,14 @@ async def get_advanced_search_analytics(
             }
             request["dimensionFilterGroups"] = [filter_group]
 
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        async with _instrument(
+            "get_advanced_search_analytics",
+            site_url=site_url,
+            row_limit=row_limit,
+            start_row=start_row,
+            dimensions=dimensions,
+        ):
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
         raw_rows = response.get("rows") or []
 
         if not raw_rows:
@@ -2052,8 +2070,14 @@ async def compare_search_periods(
             "rowLimit": upstream_row_limit,
         }
 
-        period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-        period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+        async with _instrument(
+            "compare_search_periods",
+            site_url=site_url,
+            upstream_row_limit=upstream_row_limit,
+            dimensions=dimensions,
+        ):
+            period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
+            period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
 
         period1_rows = period1_response.get("rows", []) or []
         period2_rows = period2_response.get("rows", []) or []
@@ -2250,8 +2274,14 @@ async def get_search_by_page_query(
                 "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
             }
 
-            # Execute request
-            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+            async with _instrument(
+                "get_search_by_page_query",
+                site_url=site_url,
+                page_url=page_url,
+                mode="markdown",
+                row_limit=effective_row_limit,
+            ):
+                response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
 
             if not response.get("rows"):
                 return f"No search data found for page {page_url} in the last {effective_days} days."
@@ -2312,7 +2342,14 @@ async def get_search_by_page_query(
             "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
         }
 
-        response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        async with _instrument(
+            "get_search_by_page_query",
+            site_url=site_url,
+            page_url=page_url,
+            mode="json",
+            row_limit=effective_row_limit,
+        ):
+            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
 
         queries: List[Dict[str, Any]] = []
         for row in response.get("rows", []) or []:
@@ -2624,8 +2661,14 @@ async def gsc_compare_periods_landing_pages(
             resp = service.searchanalytics().query(siteUrl=site_url, body=req).execute()
             return resp.get("rows", [])
 
-        a_rows = _query(a_start, a_end)
-        b_rows = _query(b_start, b_end)
+        async with _instrument(
+            "gsc_compare_periods_landing_pages",
+            site_url=site_url,
+            period_a=f"{a_start}..{a_end}",
+            period_b=f"{b_start}..{b_end}",
+        ):
+            a_rows = _query(a_start, a_end)
+            b_rows = _query(b_start, b_end)
 
         # Index by page URL (single-dim 'keys' tuple). Reuses the pattern from
         # compare_search_periods at gsc_server.py:1155-1156.
@@ -3175,10 +3218,12 @@ async def get_active_account() -> str:
     Shows the currently active Google account alias and email.
     All GSC operations use the active account's credentials.
     """
-    async with _instrument("get_active_account"):
-        try:
+    # Instrumentation wraps the body ONLY — exception handling sits
+    # outside so _instrument sees the original exception (tool_error
+    # log emitted) before we convert it to a user-facing string.
+    try:
+        async with _instrument("get_active_account"):
             global _active_account
-            # Lazy init
             if _active_account is None:
                 manifest = _load_manifest()
                 _active_account = manifest.get("active_account")
@@ -3193,8 +3238,8 @@ async def get_active_account() -> str:
 
             email = acct.get("email") or "unknown"
             return f"Active account: **{_active_account}** ({email})"
-        except Exception as e:
-            return f"Error getting active account: {str(e)}"
+    except Exception as e:
+        return f"Error getting active account: {str(e)}"
 
 
 @mcp.tool()
