@@ -38,6 +38,18 @@ except ImportError:  # pragma: no cover — hinted to the user, not caught.
     )
     raise
 
+# Load a project-local .env (if present) before constructing the client.
+# The .env file is gitignored; put ANTHROPIC_API_KEY=... in `gsc-mcp/.env`.
+try:
+    from dotenv import load_dotenv
+    _DOTENV_PATH = Path(__file__).resolve().parents[2] / ".env"
+    if _DOTENV_PATH.exists():
+        load_dotenv(_DOTENV_PATH)
+except ImportError:
+    # python-dotenv is an eval-harness dep; harness still runs if the key
+    # is exported in the shell environment instead.
+    pass
+
 # --- mcp client ---------------------------------------------------------
 # The `mcp` package is already a runtime dep of the server (via FastMCP).
 # We use the stock stdio client to spawn `gsc_server.py` as a subprocess
@@ -104,15 +116,17 @@ async def _list_and_run(
     max_turns: int,
     max_tokens: int,
     output_path: Path,
+    server_path: Optional[Path] = None,
 ) -> None:
     """Connect to the MCP server, list tools, then loop over prompts.
 
     Writes one JSONL record per prompt to `output_path` as we go so a
     crash mid-run still leaves partial results on disk.
     """
+    resolved_server = server_path or (ROOT / "gsc_server.py")
     server_params = StdioServerParameters(
         command=sys.executable,
-        args=[str(ROOT / "gsc_server.py")],
+        args=[str(resolved_server)],
         env={**os.environ},
     )
 
@@ -383,6 +397,12 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--max-turns", type=int, default=DEFAULT_MAX_TURNS)
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    parser.add_argument(
+        "--server",
+        type=Path,
+        help="Path to the gsc_server.py to spawn (default: project root). "
+             "Pointing this at a historical checkout enables baseline-vs-post comparisons.",
+    )
     args = parser.parse_args()
 
     prompts = load_prompts()
@@ -422,6 +442,7 @@ def main() -> int:
         max_turns=args.max_turns,
         max_tokens=args.max_tokens,
         output_path=output_path,
+        server_path=args.server,
     ))
     sys.stderr.write(f"[eval] wrote {output_path}\n")
     return 0

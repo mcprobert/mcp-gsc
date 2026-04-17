@@ -20,9 +20,11 @@ audit/eval/
 
 ## Prerequisites
 
-- `ANTHROPIC_API_KEY` env var (for the `anthropic.Anthropic` client).
+- `ANTHROPIC_API_KEY` — either exported in the shell OR written to a
+  gitignored `gsc-mcp/.env` file as `ANTHROPIC_API_KEY=sk-ant-…`. The
+  runner auto-loads `gsc-mcp/.env` via `python-dotenv` if present.
 - GSC OAuth already configured in `accounts/` (same as the main server).
-- Python deps: `pip install -r audit/eval/requirements.txt`.
+- Python deps: `uv pip install -r audit/eval/requirements.txt`.
 
 ## Quick start
 

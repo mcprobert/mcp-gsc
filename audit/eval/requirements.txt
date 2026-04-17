@@ -4,3 +4,4 @@
 # Kept separate from the server's runtime deps so the MCP server
 # doesn't drag the Anthropic SDK into every install.
 anthropic>=0.40,<1.0
+python-dotenv>=1.0,<2.0
