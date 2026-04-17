@@ -1252,46 +1252,36 @@ async def get_site_details(site_url: str) -> str:
         return f"Error retrieving site details: {str(e)}"
 
 @mcp.tool()
-async def get_sitemaps(site_url: str) -> str:
-    """
-    List all sitemaps for a specific Search Console property.
-    
+async def get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
+    """List submitted sitemaps for a GSC property. Compact output with
+    Valid/Has-errors status. Use `list_sitemaps_enhanced` for the richer
+    table (includes submission + download timestamps + warnings).
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
+        site_url: GSC site URL (exact match).
+        response_format: `markdown` (default) | `csv` | `json`.
     """
     try:
         service = get_gsc_service()
-        
-        # Get sitemaps list
+
         sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
-        
-        if not sitemaps.get("sitemap"):
+
+        raw = sitemaps.get("sitemap") or []
+        if not raw:
             return f"No sitemaps found for {site_url}."
-        
-        # Format the results
-        result_lines = [f"Sitemaps for {site_url}:"]
-        result_lines.append("-" * 80)
-        
-        # Header
-        result_lines.append("Path | Last Downloaded | Status | Indexed URLs | Errors")
-        result_lines.append("-" * 80)
-        
-        # Add each sitemap
-        for sitemap in sitemaps.get("sitemap", []):
+
+        rows: List[Dict[str, Any]] = []
+        for sitemap in raw:
             path = sitemap.get("path", "Unknown")
             last_downloaded = sitemap.get("lastDownloaded", "Never")
-            
-            # Format last downloaded date if it exists
             if last_downloaded != "Never":
                 try:
-                    # Convert to more readable format
                     dt = datetime.fromisoformat(last_downloaded.replace('Z', '+00:00'))
                     last_downloaded = dt.strftime("%Y-%m-%d %H:%M")
-                except:
+                except Exception:
                     pass
-            
-            # GSC Sitemaps API returns errors/warnings as strings
-            # (e.g. "0", "7"), so coerce before any numeric compare.
+
+            # GSC returns errors/warnings as strings — coerce defensively.
             try:
                 errors = int(sitemap.get("errors", 0) or 0)
             except (TypeError, ValueError):
@@ -1301,21 +1291,51 @@ async def get_sitemaps(site_url: str) -> str:
             except (TypeError, ValueError):
                 warnings = 0
 
-            status = "Has errors" if errors > 0 else "Valid"
-            
-            # Get contents if available
-            indexed_urls = "N/A"
+            indexed_urls: Any = "N/A"
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
                         indexed_urls = content.get("submitted", "0")
                         break
-            
-            result_lines.append(f"{path} | {last_downloaded} | {status} | {indexed_urls} | {errors}")
-        
-        return "\n".join(result_lines)
+
+            rows.append({
+                "path": path,
+                "last_downloaded": last_downloaded,
+                "status": "Has errors" if errors > 0 else "Valid",
+                "indexed_urls": indexed_urls,
+                "errors": errors,
+                "warnings": warnings,
+            })
+
+        columns = [
+            {"key": "path", "display": "Path", "type": "str"},
+            {"key": "last_downloaded", "display": "Last Downloaded", "type": "str"},
+            {"key": "status", "display": "Status", "type": "str"},
+            {"key": "indexed_urls", "display": "Indexed URLs", "type": "str"},
+            {"key": "errors", "display": "Errors", "type": "int"},
+        ]
+
+        return _format_table(
+            rows,
+            columns,
+            response_format=response_format,
+            header_lines=[f"Sitemaps for {site_url}"],
+            meta={"site_url": site_url, "count": len(rows)},
+        )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="get_sitemaps", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error retrieving sitemaps: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="get_sitemaps",
+            ),
+            response_format=response_format,
+        )
 
 @mcp.tool()
 async def inspect_url_enhanced(site_url: str, page_url: str) -> str:
@@ -2722,82 +2742,132 @@ async def gsc_compare_periods_landing_pages(
 
 
 @mcp.tool()
-async def list_sitemaps_enhanced(site_url: str, sitemap_index: str = None) -> str:
-    """
-    List all sitemaps for a specific Search Console property with detailed information.
-    
+async def list_sitemaps_enhanced(
+    site_url: str,
+    sitemap_index: str = None,
+    response_format: str = "markdown",
+) -> Any:
+    """List submitted sitemaps for a GSC property with submission +
+    download timestamps, type, URL counts, and error/warning totals.
+    Pick me for the detailed table; use `get_sitemaps` for a compact
+    Valid/Has-errors summary.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        sitemap_index: Optional sitemap index URL to list child sitemaps
+        site_url: GSC site URL (exact match).
+        sitemap_index: Optional sitemap-index URL to list its children.
+        response_format: `markdown` (default) | `csv` | `json`.
     """
     try:
         service = get_gsc_service()
-        
-        # Get sitemaps list
+
         if sitemap_index:
-            sitemaps = service.sitemaps().list(siteUrl=site_url, sitemapIndex=sitemap_index).execute()
+            sitemaps = service.sitemaps().list(
+                siteUrl=site_url, sitemapIndex=sitemap_index
+            ).execute()
             source = f"child sitemaps from index: {sitemap_index}"
         else:
             sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
             source = "all submitted sitemaps"
-        
-        if not sitemaps.get("sitemap"):
-            return f"No sitemaps found for {site_url}" + (f" in index {sitemap_index}" if sitemap_index else ".")
-        
-        # Format the results
-        result_lines = [f"Sitemaps for {site_url} ({source}):"]
-        result_lines.append("-" * 100)
-        
-        # Header
-        result_lines.append("Path | Last Submitted | Last Downloaded | Type | URLs | Errors | Warnings")
-        result_lines.append("-" * 100)
-        
-        # Add each sitemap
-        for sitemap in sitemaps.get("sitemap", []):
+
+        raw = sitemaps.get("sitemap") or []
+        if not raw:
+            suffix = f" in index {sitemap_index}" if sitemap_index else "."
+            return f"No sitemaps found for {site_url}{suffix}"
+
+        rows: List[Dict[str, Any]] = []
+        for sitemap in raw:
             path = sitemap.get("path", "Unknown")
-            
-            # Format dates
-            last_submitted = sitemap.get("lastSubmitted", "Never")
-            if last_submitted != "Never":
+
+            def _fmt_date(raw_date: str) -> str:
+                if raw_date == "Never":
+                    return raw_date
                 try:
-                    dt = datetime.fromisoformat(last_submitted.replace('Z', '+00:00'))
-                    last_submitted = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            
-            last_downloaded = sitemap.get("lastDownloaded", "Never")
-            if last_downloaded != "Never":
-                try:
-                    dt = datetime.fromisoformat(last_downloaded.replace('Z', '+00:00'))
-                    last_downloaded = dt.strftime("%Y-%m-%d %H:%M")
-                except:
-                    pass
-            
-            # Determine type
+                    dt = datetime.fromisoformat(raw_date.replace('Z', '+00:00'))
+                    return dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    return raw_date
+
+            last_submitted = _fmt_date(sitemap.get("lastSubmitted", "Never"))
+            last_downloaded = _fmt_date(sitemap.get("lastDownloaded", "Never"))
             sitemap_type = "Index" if sitemap.get("isSitemapsIndex", False) else "Sitemap"
-            
-            # Get counts
-            errors = sitemap.get("errors", 0)
-            warnings = sitemap.get("warnings", 0)
-            
-            # Get URL counts
-            url_count = "N/A"
+
+            # GSC returns errors/warnings as strings — coerce for sort /
+            # meta consistency, let int column type re-stringify.
+            try:
+                errors = int(sitemap.get("errors", 0) or 0)
+            except (TypeError, ValueError):
+                errors = 0
+            try:
+                warnings = int(sitemap.get("warnings", 0) or 0)
+            except (TypeError, ValueError):
+                warnings = 0
+
+            url_count: Any = "N/A"
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
                         url_count = content.get("submitted", "0")
                         break
-            
-            result_lines.append(f"{path} | {last_submitted} | {last_downloaded} | {sitemap_type} | {url_count} | {errors} | {warnings}")
-        
-        # Add processing status if available
-        pending_count = sum(1 for sitemap in sitemaps.get("sitemap", []) if sitemap.get("isPending", False))
-        if pending_count > 0:
-            result_lines.append(f"\nNote: {pending_count} sitemaps are still pending processing by Google.")
-        
-        return "\n".join(result_lines)
+
+            rows.append({
+                "path": path,
+                "last_submitted": last_submitted,
+                "last_downloaded": last_downloaded,
+                "type": sitemap_type,
+                "urls": url_count,
+                "errors": errors,
+                "warnings": warnings,
+            })
+
+        columns = [
+            {"key": "path", "display": "Path", "type": "str"},
+            {"key": "last_submitted", "display": "Last Submitted", "type": "str"},
+            {"key": "last_downloaded", "display": "Last Downloaded", "type": "str"},
+            {"key": "type", "display": "Type", "type": "str"},
+            {"key": "urls", "display": "URLs", "type": "str"},
+            {"key": "errors", "display": "Errors", "type": "int"},
+            {"key": "warnings", "display": "Warnings", "type": "int"},
+        ]
+
+        pending_count = sum(1 for s in raw if s.get("isPending", False))
+        header_lines = [f"Sitemaps for {site_url} ({source})"]
+
+        meta = {
+            "site_url": site_url,
+            "sitemap_index": sitemap_index,
+            "count": len(rows),
+            "pending_count": pending_count,
+        }
+
+        rendered = _format_table(
+            rows,
+            columns,
+            response_format=response_format,
+            header_lines=header_lines,
+            meta=meta,
+        )
+
+        # Pending-processing footnote is agent-useful and was part of
+        # the legacy markdown — append to str modes, expose via meta in
+        # json mode (already in meta above).
+        if pending_count > 0 and isinstance(rendered, str):
+            note = f"\nNote: {pending_count} sitemaps are still pending processing by Google."
+            return rendered + note
+        return rendered
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="list_sitemaps_enhanced", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error retrieving sitemaps: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="list_sitemaps_enhanced",
+            ),
+            response_format=response_format,
+        )
 
 @mcp.tool()
 async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
@@ -2864,8 +2934,16 @@ async def get_sitemap_details(site_url: str, sitemap_url: str) -> str:
             result_lines.append(f"list_sitemaps_enhanced with sitemap_index={sitemap_url}")
         
         return "\n".join(result_lines)
+    except HttpError as e:
+        env = _http_error_envelope(e, tool="get_sitemap_details", site_url=site_url)
+        return _format_error(env, response_format="markdown")
     except Exception as e:
-        return f"Error retrieving sitemap details: {str(e)}"
+        env = _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+            tool="get_sitemap_details",
+        )
+        return _format_error(env, response_format="markdown")
 
 @mcp.tool()
 async def submit_sitemap(site_url: str, sitemap_url: str) -> str:
