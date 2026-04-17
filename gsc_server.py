@@ -3122,7 +3122,14 @@ async def list_accounts() -> str:
         lines.append(f"\nTotal: {len(accounts)} account(s)")
         return "\n".join(lines)
     except Exception as e:
-        return f"Error listing accounts: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Check that the accounts manifest exists and is readable.",
+                tool="list_accounts",
+            ),
+            response_format="markdown",
+        )
 
 
 @mcp.tool()
@@ -3196,12 +3203,22 @@ async def add_account(alias: str) -> str:
             flow = InstalledAppFlow.from_client_secrets_file(OAUTH_CLIENT_SECRETS_FILE, OAUTH_SCOPES)
             creds = _start_oauth_flow(flow, context=f"add_account('{alias}')")
         except HeadlessOAuthError as e:
+            # HeadlessOAuthError carries its own remediation message —
+            # surface it verbatim rather than wrapping in an envelope.
             shutil.rmtree(acct_dir, ignore_errors=True)
             return str(e)
         except Exception as e:
             # Clean up partial directory on OAuth failure
             shutil.rmtree(acct_dir, ignore_errors=True)
-            return f"OAuth flow failed: {str(e)}"
+            return _format_error(
+                _make_error_envelope(
+                    error=f"OAuth flow failed: {type(e).__name__}: {e}",
+                    hint="Check that client_secrets.json is current and that the "
+                         "browser was able to reach the local callback port.",
+                    tool="add_account",
+                ),
+                response_format="markdown",
+            )
 
         # Save token
         with open(token_path, "w") as f:
@@ -3227,7 +3244,15 @@ async def add_account(alias: str) -> str:
         email_str = email or "unknown"
         return f"Account '{alias}' added and set as active. Email: {email_str}"
     except Exception as e:
-        return f"Error adding account: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint=f"The `{alias}` account directory may be in a partial state; "
+                     "try `remove_account` to clean up, then retry.",
+                tool="add_account",
+            ),
+            response_format="markdown",
+        )
 
 
 @mcp.tool()
@@ -3259,7 +3284,14 @@ async def switch_account(alias: str) -> str:
         email = manifest["accounts"][alias].get("email") or "unknown"
         return f"Switched to account '{alias}' ({email}). All GSC operations now use this account."
     except Exception as e:
-        return f"Error switching account: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Run `list_accounts` to see available aliases.",
+                tool="switch_account",
+            ),
+            response_format="markdown",
+        )
 
 
 @mcp.tool()
@@ -3306,7 +3338,15 @@ async def remove_account(alias: str) -> str:
         else:
             return f"Account '{alias}' removed. No accounts remaining — GSC will fall back to legacy token.json if present."
     except Exception as e:
-        return f"Error removing account: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="The account directory or manifest may be locked; check file "
+                     "permissions on accounts/ and retry.",
+                tool="remove_account",
+            ),
+            response_format="markdown",
+        )
 
 
 # --- Health check (Add 4) ---
