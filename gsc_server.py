@@ -97,6 +97,131 @@ ACCOUNTS_DIR = os.path.join(SCRIPT_DIR, "accounts")
 ACCOUNTS_MANIFEST = os.path.join(ACCOUNTS_DIR, "accounts.json")
 _active_account: Optional[str] = None
 
+_RESPONSE_FORMATS = ("markdown", "csv", "json")
+
+
+def _format_table(
+    rows: List[Dict[str, Any]],
+    columns: List[Dict[str, str]],
+    *,
+    response_format: str = "markdown",
+    header_lines: Optional[List[str]] = None,
+    truncated: bool = False,
+    truncation_hint: str = "",
+    meta: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """Render a tabular result as markdown, csv, or a json dict.
+
+    This is the shared output-shaping primitive that Tranche B leans on
+    — individual tools will migrate their per-tool string-building to
+    call this so every tool gets csv + json for free and so the
+    truncation-nudge phrasing stays identical.
+
+    Args:
+        rows: list of dicts. Every dict should carry the keys named in
+            ``columns[*]["key"]``; missing keys render as empty.
+        columns: column specs, in display order. Each is
+            ``{"key": str, "display": str, "type": str}`` where type is
+            one of ``int``, ``float``, ``pct`` (formatted with 2-decimal
+            percent sign), or ``str`` (default).
+        response_format: ``markdown`` | ``csv`` | ``json``.
+        header_lines: plain-text lines prepended above the table
+            (markdown / csv only; ignored for json).
+        truncated: True when the caller knows ``len(rows)`` hit a cap
+            and more rows exist.
+        truncation_hint: agent-facing sentence explaining how to get
+            more rows. Rendered prominently when ``truncated=True``.
+        meta: extra key/value pairs to surface only in the json shape
+            (e.g. totals, thresholds).
+
+    Returns:
+        str for markdown and csv, dict for json. On unknown
+        ``response_format`` returns a plain error string — tools should
+        treat this as a validation failure and surface to the caller.
+    """
+    fmt = str(response_format or "").strip().lower()
+    if fmt not in _RESPONSE_FORMATS:
+        return (
+            f"Error: response_format must be one of {_RESPONSE_FORMATS}; "
+            f"got {response_format!r}."
+        )
+
+    if fmt == "json":
+        return {
+            "ok": True,
+            "columns": [c["key"] for c in columns],
+            "rows": [{c["key"]: row.get(c["key"]) for c in columns} for row in rows],
+            "row_count": len(rows),
+            "truncated": bool(truncated),
+            "truncation_hint": truncation_hint if truncated else "",
+            "meta": meta or {},
+        }
+
+    # For markdown + csv we need string renderings of each cell.
+    def _render_cell(value: Any, col_type: str) -> str:
+        if value is None:
+            return ""
+        if col_type == "int":
+            try:
+                return str(int(value))
+            except (TypeError, ValueError):
+                return str(value)
+        if col_type == "float":
+            try:
+                return f"{float(value):.1f}"
+            except (TypeError, ValueError):
+                return str(value)
+        if col_type == "pct":
+            # Caller may pass either a 0-1 ratio or an already-percent
+            # number; heuristic: anything <= 1 is treated as a ratio.
+            try:
+                f = float(value)
+            except (TypeError, ValueError):
+                return str(value)
+            if abs(f) <= 1.0:
+                f *= 100.0
+            return f"{f:.2f}%"
+        return str(value)
+
+    headers = [c.get("display", c["key"]) for c in columns]
+    data_rows = [
+        [_render_cell(row.get(c["key"]), c.get("type", "str")) for c in columns]
+        for row in rows
+    ]
+
+    if fmt == "markdown":
+        lines: List[str] = []
+        if header_lines:
+            lines.extend(header_lines)
+            lines.append("")
+        if truncated and truncation_hint:
+            lines.append(f"⚠ TRUNCATED: {truncation_hint}")
+            lines.append("")
+        lines.append(" | ".join(headers))
+        lines.append(" | ".join("---" for _ in headers))
+        for row in data_rows:
+            lines.append(" | ".join(row))
+        return "\n".join(lines)
+
+    # csv — RFC-4180-ish: comma separator, CRLF newlines, quote cells
+    # that contain comma / quote / newline.
+    def _csv_quote(cell: str) -> str:
+        if any(ch in cell for ch in (",", '"', "\n", "\r")):
+            return '"' + cell.replace('"', '""') + '"'
+        return cell
+
+    lines = []
+    if header_lines:
+        # csv comment prefix so downstream parsers can skip easily.
+        lines.extend(f"# {line}" for line in header_lines)
+    if truncated and truncation_hint:
+        lines.append(f"# TRUNCATED: {truncation_hint}")
+    lines.append(",".join(_csv_quote(h) for h in headers))
+    for row in data_rows:
+        lines.append(",".join(_csv_quote(c) for c in row))
+    return "\r\n".join(lines)
+
+
 # --- Screaming Frog CSV bridge (Add 1) ---
 # Sessions hold file paths and metadata only. Rows stream from disk at query time
 # to avoid OOM on large exports (internal_all.csv can be 60MB+ and 1100+ columns).
