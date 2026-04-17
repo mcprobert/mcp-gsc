@@ -2531,22 +2531,16 @@ async def gsc_get_landing_page_summary(
             "filters": {"country": country, "device": device},
         }
     except HttpError as e:
-        try:
-            error_content = json.loads(e.content.decode("utf-8"))
-            message = error_content.get("error", {}).get("message", str(e))
-        except Exception:
-            message = str(e)
-        return {
-            "ok": False,
-            "error": f"HTTP {e.resp.status}: {message}",
-            "tool": "gsc_get_landing_page_summary",
-        }
+        return _http_error_envelope(
+            e, tool="gsc_get_landing_page_summary", site_url=site_url
+        )
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "tool": "gsc_get_landing_page_summary",
-        }
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Check the date range and filter args; "
+                 "set GSC_MCP_TELEMETRY=1 for structured logs.",
+            tool="gsc_get_landing_page_summary",
+        )
 
 
 @mcp.tool()
@@ -2732,22 +2726,16 @@ async def gsc_compare_periods_landing_pages(
             "truncated": len(diffs) > limit,
         }
     except HttpError as e:
-        try:
-            error_content = json.loads(e.content.decode("utf-8"))
-            message = error_content.get("error", {}).get("message", str(e))
-        except Exception:
-            message = str(e)
-        return {
-            "ok": False,
-            "error": f"HTTP {e.resp.status}: {message}",
-            "tool": "gsc_compare_periods_landing_pages",
-        }
+        return _http_error_envelope(
+            e, tool="gsc_compare_periods_landing_pages", site_url=site_url
+        )
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "tool": "gsc_compare_periods_landing_pages",
-        }
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Check date args and sort_by / sort_direction values; "
+                 "set GSC_MCP_TELEMETRY=1 for structured logs.",
+            tool="gsc_compare_periods_landing_pages",
+        )
 
 
 @mcp.tool()
@@ -3436,12 +3424,17 @@ async def gsc_health_check(site_url: str) -> Dict[str, Any]:
 
     try:
         service = get_gsc_service()
+    except HttpError as e:
+        return _http_error_envelope(
+            e, tool="gsc_health_check", site_url=site_url
+        )
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"auth failed: {type(e).__name__}: {e}",
-            "tool": "gsc_health_check",
-        }
+        return _make_error_envelope(
+            error=f"auth failed: {type(e).__name__}: {e}",
+            hint="Check that `client_secrets.json` is present and that the "
+                 "active account has a valid token (see `get_active_account`).",
+            tool="gsc_health_check",
+        )
 
     # Track whether any probe actually produced useful data. If all three
     # fail, the health check learned nothing and must return ok=False.
@@ -3644,11 +3637,13 @@ async def gsc_load_from_sf_export(
             "warnings": warnings,
         }
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "tool": "gsc_load_from_sf_export",
-        }
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Verify the SF export directory exists and contains at least "
+                 "one `search_console_*.csv`; permissions + encoding must be "
+                 "readable by this process.",
+            tool="gsc_load_from_sf_export",
+        )
 
 
 @mcp.tool()
@@ -3857,11 +3852,12 @@ async def gsc_query_sf_export(
             "rows": sliced,
         }
     except Exception as e:
-        return {
-            "ok": False,
-            "error": f"{type(e).__name__}: {e}",
-            "tool": "gsc_query_sf_export",
-        }
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Inspect the session with `gsc_load_from_sf_export` output for "
+                 "dataset and column names; streaming may fail on corrupt CSVs.",
+            tool="gsc_query_sf_export",
+        )
 
 
 @mcp.tool()
