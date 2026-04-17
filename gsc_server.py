@@ -16,6 +16,14 @@ from uuid import uuid4
 
 URL_INSPECTION_PACING_SEC = 0.1
 
+# B.5 (gsc_get_search_by_page_query): when `row_limit` is at or below
+# this threshold, the JSON `summary` block is suppressed by default
+# because its impression-weighted aggregates are misleading when the
+# returned rows have been capped (the top-ranked queries dominate).
+# Callers can force the summary on or off via the `include_summary`
+# argument regardless of row_limit.
+_PAGE_QUERY_SUMMARY_MIN_ROWS = 50
+
 # B.6 — opt-in structured telemetry. Off by default; enable with
 # ``GSC_MCP_TELEMETRY=1`` in the server's environment. When enabled, each
 # instrumented tool emits one ``tool_enter`` JSON line on start and one
@@ -156,7 +164,14 @@ OAUTH_SCOPES = SCOPES + [
     "https://www.googleapis.com/auth/userinfo.email",
 ]
 
-# Multi-account support
+# Multi-account support. All module globals below (`_active_account`,
+# `_sf_sessions`, `_migration_checked`) are touched without locks. This
+# is safe under FastMCP's stdio transport — it dispatches one request
+# at a time through the asyncio loop and none of the read-modify-write
+# sequences contain an `await` that would yield between read and
+# write. If this server is ever re-platformed to SSE or HTTP
+# multi-tenant, these three variables become racy and need an asyncio
+# Lock (or a move to per-session state).
 ACCOUNTS_DIR = os.path.join(SCRIPT_DIR, "accounts")
 ACCOUNTS_MANIFEST = os.path.join(ACCOUNTS_DIR, "accounts.json")
 _active_account: Optional[str] = None
@@ -987,6 +1002,8 @@ async def gsc_list_properties(
 
             return "\n".join(lines)
     except FileNotFoundError as e:
+        # Credentials-setup guidance stays as a plain string — it's an
+        # environment-setup concern, not a B.4-style tool failure.
         return (
             "Error: Service account credentials file not found.\n\n"
             "To access Google Search Console, please:\n"
@@ -995,8 +1012,21 @@ async def gsc_list_properties(
             "3. Save it as 'service_account_credentials.json' in the same directory as this script\n"
             "4. Share your GSC properties with the service account email"
         )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="gsc_list_properties"),
+            response_format="markdown",
+        )
     except Exception as e:
-        return f"Error retrieving properties: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Check that the active account has at least one verified "
+                     "GSC property; use `gsc_get_active_account` to confirm.",
+                tool="gsc_list_properties",
+            ),
+            response_format="markdown",
+        )
 
 @mcp.tool()
 async def gsc_add_site(site_url: str) -> str:
@@ -1547,8 +1577,20 @@ async def gsc_batch_url_inspection(
         # --- Phase 2: authenticate and inspect ---
         service = get_gsc_service()
 
-        # Process each URL
-        results = []
+        # Telemetry: emit tool_enter/tool_exit around the batch as a
+        # whole, not per URL (per-URL would drown the batch-latency
+        # signal). Manual _log calls rather than async with so we
+        # don't have to re-indent the existing per-URL loop body.
+        _batch_start = time.perf_counter()
+        _log(
+            "tool_enter",
+            tool="gsc_batch_url_inspection",
+            site_url=site_url,
+            url_count=len(url_list),
+            from_session=from_session,
+        )
+
+        results: List[str] = []
 
         for i, page_url in enumerate(url_list):
             if i > 0 and URL_INSPECTION_PACING_SEC > 0:
@@ -1597,14 +1639,35 @@ async def gsc_batch_url_inspection(
 
         # Combine results
         header = clamp_note + f"Batch URL Inspection Results for {site_url}:\n\n"
+        _log(
+            "tool_exit",
+            tool="gsc_batch_url_inspection",
+            dur_ms=int((time.perf_counter() - _batch_start) * 1000),
+            ok=True,
+            urls_inspected=len(results),
+        )
         return header + "\n".join(results) + next_offset_note
 
     except HttpError as e:
+        _log(
+            "tool_error",
+            tool="gsc_batch_url_inspection",
+            ok=False,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
         return _format_error(
             _http_error_envelope(e, tool="gsc_batch_url_inspection", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
+        _log(
+            "tool_error",
+            tool="gsc_batch_url_inspection",
+            ok=False,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
         return _format_error(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
@@ -1629,16 +1692,26 @@ async def gsc_check_indexing_issues(site_url: str, urls: str) -> str:
     """
     try:
         service = get_gsc_service()
-        
+
         # Parse URLs
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
-        
+
         if not url_list:
             return "No URLs provided for inspection."
-        
+
         if len(url_list) > 10:
             return f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
-        
+
+        # Telemetry: one tool_enter/exit pair for the whole batch (same
+        # pattern as gsc_batch_url_inspection).
+        _batch_start = time.perf_counter()
+        _log(
+            "tool_enter",
+            tool="gsc_check_indexing_issues",
+            site_url=site_url,
+            url_count=len(url_list),
+        )
+
         # Track issues by category
         issues_summary = {
             "not_indexed": [],
@@ -1647,7 +1720,7 @@ async def gsc_check_indexing_issues(site_url: str, urls: str) -> str:
             "fetch_issues": [],
             "indexed": []
         }
-        
+
         # Process each URL
         for i, page_url in enumerate(url_list):
             if i > 0 and URL_INSPECTION_PACING_SEC > 0:
@@ -1733,14 +1806,35 @@ async def gsc_check_indexing_issues(site_url: str, urls: str) -> str:
             for issue in issues_summary["fetch_issues"]:
                 result_lines.append(f"- {issue}")
         
+        _log(
+            "tool_exit",
+            tool="gsc_check_indexing_issues",
+            dur_ms=int((time.perf_counter() - _batch_start) * 1000),
+            ok=True,
+            urls_inspected=len(url_list),
+        )
         return "\n".join(result_lines)
 
     except HttpError as e:
+        _log(
+            "tool_error",
+            tool="gsc_check_indexing_issues",
+            ok=False,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
         return _format_error(
             _http_error_envelope(e, tool="gsc_check_indexing_issues", site_url=site_url),
             response_format="markdown",
         )
     except Exception as e:
+        _log(
+            "tool_error",
+            tool="gsc_check_indexing_issues",
+            ok=False,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
         return _format_error(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
@@ -1751,27 +1845,40 @@ async def gsc_check_indexing_issues(site_url: str, urls: str) -> str:
         )
 
 @mcp.tool()
-async def gsc_get_performance_overview(site_url: str, days: int = 28) -> str:
-    """
-    Get a performance overview for a specific property.
-    
+async def gsc_get_performance_overview(
+    site_url: str,
+    days: int = 28,
+    response_format: str = "markdown",
+) -> Any:
+    """Totals-plus-daily-trend snapshot for a GSC property. Pick me for a
+    quick "how is my site doing?" read; use `gsc_get_search_analytics`
+    or `gsc_get_advanced_search_analytics` to slice by dimension.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
-        days: Number of days to look back (default: 28)
+        site_url: GSC site URL (exact match).
+        days: Look-back window (default 28, clamped to min 1).
+        response_format: `markdown` (default) | `csv` | `json`.
     """
     try:
+        days = max(int(days), 1)
+
         service = get_gsc_service()
-        
-        # Calculate date range
+
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
-        
-        # Get total metrics
+
         total_request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": [],  # No dimensions for totals
-            "rowLimit": 1
+            "dimensions": [],
+            "rowLimit": 1,
+        }
+
+        date_request = {
+            "startDate": start_date.strftime("%Y-%m-%d"),
+            "endDate": end_date.strftime("%Y-%m-%d"),
+            "dimensions": ["date"],
+            "rowLimit": days,
         }
 
         async with _instrument(
@@ -1779,61 +1886,87 @@ async def gsc_get_performance_overview(site_url: str, days: int = 28) -> str:
             site_url=site_url,
             days=days,
         ):
-            total_response = service.searchanalytics().query(siteUrl=site_url, body=total_request).execute()
+            total_response = service.searchanalytics().query(
+                siteUrl=site_url, body=total_request
+            ).execute()
+            date_response = service.searchanalytics().query(
+                siteUrl=site_url, body=date_request
+            ).execute()
 
-            # Get by date for trend
-            date_request = {
-                "startDate": start_date.strftime("%Y-%m-%d"),
-                "endDate": end_date.strftime("%Y-%m-%d"),
-                "dimensions": ["date"],
-                "rowLimit": days
-            }
+        totals_rows = total_response.get("rows") or []
+        if not totals_rows:
+            return f"No performance data found for {site_url} in the last {days} days."
 
-            date_response = service.searchanalytics().query(siteUrl=site_url, body=date_request).execute()
-        
-        # Format results
-        result_lines = [f"Performance Overview for {site_url} (last {days} days):"]
-        result_lines.append("-" * 80)
-        
-        # Add total metrics
-        if total_response.get("rows"):
-            row = total_response["rows"][0]
-            result_lines.append(f"Total Clicks: {row.get('clicks', 0):,}")
-            result_lines.append(f"Total Impressions: {row.get('impressions', 0):,}")
-            result_lines.append(f"Average CTR: {row.get('ctr', 0) * 100:.2f}%")
-            result_lines.append(f"Average Position: {row.get('position', 0):.1f}")
-        else:
-            result_lines.append("No data available for the selected period.")
-            return "\n".join(result_lines)
-        
-        # Add trend data
-        if date_response.get("rows"):
-            result_lines.append("\nDaily Trend:")
-            result_lines.append("Date | Clicks | Impressions | CTR | Position")
-            result_lines.append("-" * 80)
-            
-            # Sort by date
-            sorted_rows = sorted(date_response["rows"], key=lambda x: x["keys"][0])
-            
-            for row in sorted_rows:
-                date_str = row["keys"][0]
-                # Format date from YYYY-MM-DD to MM/DD
-                try:
-                    date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                    date_formatted = date_obj.strftime("%m/%d")
-                except:
-                    date_formatted = date_str
-                
-                clicks = row.get("clicks", 0)
-                impressions = row.get("impressions", 0)
-                ctr = row.get("ctr", 0) * 100
-                position = row.get("position", 0)
-                
-                result_lines.append(f"{date_formatted} | {clicks:.0f} | {impressions:.0f} | {ctr:.2f}% | {position:.1f}")
-        
-        return "\n".join(result_lines)
+        t = totals_rows[0]
+        totals = {
+            "clicks": t.get("clicks", 0),
+            "impressions": t.get("impressions", 0),
+            "ctr": t.get("ctr", 0),
+            "position": t.get("position", 0),
+        }
+
+        # Daily trend rows, sorted by date ascending.
+        trend_raw = date_response.get("rows") or []
+        trend_rows: List[Dict[str, Any]] = []
+        for row in sorted(trend_raw, key=lambda x: (x.get("keys") or [""])[0]):
+            date_str = (row.get("keys") or [""])[0]
+            try:
+                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
+                date_formatted = date_obj.strftime("%m/%d")
+            except ValueError:
+                date_formatted = date_str
+            trend_rows.append({
+                "date": date_formatted,
+                "clicks": row.get("clicks", 0),
+                "impressions": row.get("impressions", 0),
+                "ctr": row.get("ctr", 0),
+                "position": row.get("position", 0),
+            })
+
+        columns = [
+            {"key": "date", "display": "Date", "type": "str"},
+            {"key": "clicks", "display": "Clicks", "type": "int"},
+            {"key": "impressions", "display": "Impressions", "type": "int"},
+            {"key": "ctr", "display": "CTR", "type": "pct"},
+            {"key": "position", "display": "Position", "type": "float"},
+        ]
+
+        header_lines = [
+            f"Performance Overview for {site_url} (last {days} days)",
+            f"Total Clicks: {totals['clicks']:,}",
+            f"Total Impressions: {totals['impressions']:,}",
+            f"Average CTR: {totals['ctr'] * 100:.2f}%",
+            f"Average Position: {totals['position']:.1f}",
+            "",
+            "Daily Trend:",
+        ]
+
+        return _format_table(
+            trend_rows,
+            columns,
+            response_format=response_format,
+            header_lines=header_lines,
+            meta={
+                "site_url": site_url,
+                "days": days,
+                "totals": totals,
+                "daily_count": len(trend_rows),
+            },
+        )
+    except HttpError as e:
+        return _format_error(
+            _http_error_envelope(e, tool="gsc_get_performance_overview", site_url=site_url),
+            response_format=response_format,
+        )
     except Exception as e:
-        return f"Error retrieving performance overview: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
+                tool="gsc_get_performance_overview",
+            ),
+            response_format=response_format,
+        )
 
 @mcp.tool()
 async def gsc_get_advanced_search_analytics(
@@ -2184,9 +2317,6 @@ async def gsc_compare_search_periods(
             ),
             response_format=response_format,
         )
-
-_PAGE_QUERY_SUMMARY_MIN_ROWS = 50
-
 
 @mcp.tool()
 async def gsc_get_search_by_page_query(
@@ -3239,7 +3369,15 @@ async def gsc_get_active_account() -> str:
             email = acct.get("email") or "unknown"
             return f"Active account: **{_active_account}** ({email})"
     except Exception as e:
-        return f"Error getting active account: {str(e)}"
+        return _format_error(
+            _make_error_envelope(
+                error=f"{type(e).__name__}: {e}",
+                hint="If the accounts manifest is corrupted, run "
+                     "`gsc_list_accounts` to inspect available aliases.",
+                tool="gsc_get_active_account",
+            ),
+            response_format="markdown",
+        )
 
 
 @mcp.tool()
@@ -3306,8 +3444,10 @@ async def gsc_add_account(alias: str) -> str:
         with open(token_path, "w") as f:
             f.write(creds.to_json())
 
-        # Detect email
-        email = _detect_email(creds)
+        # Detect email. _detect_email does a sync urllib GET against
+        # tokeninfo (10s timeout); offload to a thread so we don't
+        # block the asyncio loop in the middle of gsc_add_account.
+        email = await asyncio.to_thread(_detect_email, creds)
 
         # Update manifest
         manifest.setdefault("accounts", {})[alias] = {

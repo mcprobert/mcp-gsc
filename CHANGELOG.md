@@ -5,6 +5,53 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.0.1] — 2026-04-17 — v1.0.0 post-release review cleanup
+
+Addresses the `should-fix` items from the full codebase review after
+v1.0.0 tagged. No behaviour changes agents can rely on — only
+consistency polish.
+
+- **b.1** Three outlier tools that still used the legacy
+  `f"Error ...: {str(e)}"` error path now use the full B.4 envelope
+  helpers: `gsc_list_properties`, `gsc_get_active_account`,
+  `gsc_get_performance_overview`. `gsc_list_properties` also gained
+  a dedicated `HttpError` branch. The pre-existing
+  `FileNotFoundError` branch for missing service-account credentials
+  is preserved as a plain string (environment-setup concern, not a
+  tool failure).
+
+- **b.2** Hoisted `_PAGE_QUERY_SUMMARY_MIN_ROWS` from mid-file
+  (~line 2240) to the top-of-file tuning-constants block next to
+  `URL_INSPECTION_PACING_SEC`. All module-scope tunables now live
+  together and a single scroll covers them.
+
+- **b.3** Harmonised URL-inspection telemetry. `gsc_batch_url_inspection`
+  and `gsc_check_indexing_issues` now emit `tool_enter` / `tool_exit` /
+  `tool_error` events as a single batch-level span (not per URL). The
+  per-URL inner loop stays string-based — per-URL telemetry would
+  drown out the batch-latency signal.
+
+- **b.4** Migrated `gsc_get_performance_overview` to `_format_table`
+  and added a `response_format` enum. Markdown output still shows
+  totals + daily trend; csv and json now available. Meta includes
+  totals for downstream code. B.4 envelopes apply on the error path.
+
+- **b.5** `_detect_email`'s sync `urllib` GET (10s timeout) is now
+  offloaded via `asyncio.to_thread` so it doesn't block the asyncio
+  loop during `gsc_add_account`.
+
+- **(c)** Added a load-bearing comment on the module-global cluster
+  (`_active_account`, `_sf_sessions`, `_migration_checked`) noting
+  that lock-free access is safe under FastMCP's stdio transport but
+  would become racy under SSE/HTTP multi-tenant. Added a telemetry
+  PII + stderr-channel section to `CLAUDE.md` explaining that
+  `page_url` and `site_url` flow into `_instrument` on purpose and
+  warning against passing credentials as initial fields.
+
+Tests unchanged at 308 (no behaviour diff, only polish).
+
+---
+
 ## [1.0.0] — 2026-04-17 — Namespace rename (A.4) + Tranche B complete
 
 ### Breaking — tool namespace rename

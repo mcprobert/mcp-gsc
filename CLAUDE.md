@@ -60,3 +60,20 @@ Both need `GSC_OAUTH_CLIENT_SECRETS_FILE` updated with the real path to credenti
 ## Dependencies
 
 Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth-oauthlib`, `oauth2client`.
+
+## Telemetry + stderr channel
+
+Stdio transport reserves **stdout** for JSON-RPC. All telemetry
+(`_log`, `_instrument`) writes JSONL to **stderr**. When you launch
+`gsc_server.py` as a subprocess, capture stderr separately if you
+want the telemetry stream; mixing stderr into stdout will corrupt
+the MCP protocol.
+
+Telemetry is opt-in via `GSC_MCP_TELEMETRY=1`. When enabled, the
+`tool_enter` events include initial fields like `site_url` and
+`page_url` so operators can correlate performance with the GSC
+property being queried. These URLs are already in the API requests
+being observed — treat them as business-sensitive but not secret.
+**Never** pass OAuth tokens, client secrets, or API keys as
+`initial_fields` to `_instrument` (they would be `repr()`-ed via
+`default=str` in `json.dumps` and land in log aggregators).
