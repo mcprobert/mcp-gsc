@@ -10,6 +10,36 @@ references are to `gsc_server.py`.
 
 ---
 
+## Tranche A delivery status (2026-04-17)
+
+Shipped as **v0.6.0** (commit `352219c`). 8 of 9 items landed; A.4
+deferred to v1.0.0 per the original scope.
+
+| Item | Status | Notes |
+|---|---|---|
+| A.1 — `get_advanced_search_analytics` default 1000 → 100 | ✅ shipped | Loud `⚠ TRUNCATED` first-line warning + tail pagination nudge |
+| A.2 — parameterise `get_search_analytics` `row_limit` | ✅ shipped | Default 100, clamped [1, 25000] |
+| A.3 — fix `get_sitemaps` str/int bug | ✅ shipped | 6 regression tests |
+| A.4 — namespace rename to `gsc_*` | ⏳ deferred | Scheduled for v1.0.0 |
+| A.5 — tighten top-5 docstrings + disambiguation | ✅ shipped | Schema tax −1,464 tokens verified via eval harness |
+| A.6 — `list_properties` default `limit=50` + nudge | ✅ shipped | Clamp [1, 1000] |
+| A.7 — asyncio request pacing on URL-inspection loops | ✅ shipped | `URL_INSPECTION_PACING_SEC=0.1` via `await asyncio.sleep` |
+| A.8 — `compare_search_periods` `upstream_row_limit` | ✅ shipped | Default 500, keyword-only |
+| A.9 — headless-OAuth guard | ✅ shipped | `GSC_MCP_HEADLESS=1` raises `HeadlessOAuthError`; re-raised past the broad except in `get_gsc_service` so the primary entry point surfaces it |
+
+**Measured impact (6 shared eval prompts, see
+`audit/eval/runs/v050-v060-6prompt-delta.md`):**
+
+- `grand_total_tokens` −12,426 (−7%)
+- `tool_definitions_tokens` −1,464 (−4%)
+- `error_count` 0 in both
+- Tests: 132 → 144 (12 new: 6 sitemap + 6 OAuth guard including 2
+  integration tests for the broad-except re-raise)
+
+Tranche B (below) is the next planned work.
+
+---
+
 ## Tranche A — Quick wins (target 1–2 days)
 
 Scope: **metadata + parameter tweaks only. No return-type changes.**

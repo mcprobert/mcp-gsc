@@ -7,6 +7,35 @@ Score 1 = absent, 5 = exemplary. Evidence cites source lines in
 
 ---
 
+## Post-Tranche-A validation (2026-04-17)
+
+Tranche A (8 of 9 items) shipped as **v0.6.0** (commit `352219c`). A.4
+namespace rename stays deferred to v1.0.0. Measured delta from the
+eval harness against `sc-domain:chaserhq.com` (6 shared prompts,
+`claude-sonnet-4-6`, temperature=0, caching disabled):
+
+| Metric | Baseline (a808da4) | v0.6.0 | Δ |
+|---|---:|---:|---:|
+| `tool_definitions_tokens` | 41,736 | 40,272 | **−1,464 (−4%)** |
+| `prompt_tokens` | 134,071 | 119,476 | −14,595 (−11%) |
+| `grand_total_tokens` | 178,522 | 166,096 | **−12,426 (−7%)** |
+| `total_tool_calls` | 9 | 7 | −2 (−22%) |
+| `error_count` | 0 | 0 | — |
+
+Full delta in `audit/eval/runs/v050-v060-6prompt-delta.md`. Biggest
+single-prompt win: P7 analytics (−14,436 tokens). Schema-tax drop
+(−1,464 across 6 prompts; live FastMCP schema size moved from 6,956
+→ 6,712 tokens per call, verified via `run.py --probe-mcp`)
+confirms A.5 description tightening measurably improves real calls,
+not just `cl100k_base` proxy counts.
+
+The pre-implementation projection "~2,500–26,000 tokens per session,
+dominated by A.1" still stands; the eval subset didn't include
+enough calls that actually hit the old 1,000-row default to realize
+the top end.
+
+---
+
 ## Scores
 
 | Layer | Criterion | Score | Evidence | Token impact (tokens per typical session) |
