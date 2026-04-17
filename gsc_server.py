@@ -8,11 +8,75 @@ import csv
 import heapq
 import math
 import sys
+import time
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 URL_INSPECTION_PACING_SEC = 0.1
+
+# B.6 — opt-in structured telemetry. Off by default; enable with
+# ``GSC_MCP_TELEMETRY=1`` in the server's environment. When enabled, each
+# instrumented tool emits one ``tool_enter`` JSON line on start and one
+# ``tool_exit`` (or ``tool_error``) line on completion, to stderr. stdout
+# is reserved for MCP JSON-RPC frames so telemetry MUST stay on stderr.
+TELEMETRY_ENABLED = os.environ.get("GSC_MCP_TELEMETRY", "").strip().lower() in ("1", "true", "yes")
+
+
+def _log(event: str, **fields: Any) -> None:
+    """Emit one JSON line to stderr when telemetry is enabled.
+
+    ``default=str`` makes the helper robust to non-JSON-native values
+    (datetimes, Path, exception instances) sneaking in via ``fields``.
+    No-op when telemetry is disabled so the overhead is zero on the
+    hot path.
+    """
+    if not TELEMETRY_ENABLED:
+        return
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "event": event,
+        **fields,
+    }
+    print(json.dumps(record, default=str), file=sys.stderr, flush=True)
+
+
+@asynccontextmanager
+async def _instrument(tool: str, **initial_fields: Any):
+    """Wrap a tool body with tool_enter / tool_exit / tool_error logging.
+
+    Usage::
+
+        async def my_tool(...):
+            async with _instrument("my_tool", site_url=site_url):
+                ...
+
+    On normal exit emits ``tool_exit`` with ``dur_ms`` and ``ok=True``.
+    On exception emits ``tool_error`` with ``ok=False``,
+    ``error_type``, and a truncated ``error`` message, then re-raises.
+    """
+    start = time.perf_counter()
+    _log("tool_enter", tool=tool, **initial_fields)
+    try:
+        yield
+    except Exception as e:
+        _log(
+            "tool_error",
+            tool=tool,
+            dur_ms=int((time.perf_counter() - start) * 1000),
+            ok=False,
+            error_type=type(e).__name__,
+            error=str(e)[:200],
+        )
+        raise
+    else:
+        _log(
+            "tool_exit",
+            tool=tool,
+            dur_ms=int((time.perf_counter() - start) * 1000),
+            ok=True,
+        )
 
 
 class HeadlessOAuthError(RuntimeError):
@@ -2713,25 +2777,26 @@ async def get_active_account() -> str:
     Shows the currently active Google account alias and email.
     All GSC operations use the active account's credentials.
     """
-    try:
-        global _active_account
-        # Lazy init
-        if _active_account is None:
+    async with _instrument("get_active_account"):
+        try:
+            global _active_account
+            # Lazy init
+            if _active_account is None:
+                manifest = _load_manifest()
+                _active_account = manifest.get("active_account")
+
+            if _active_account is None:
+                return "No active account. Use `add_account` to add one, or existing token.json will be used as fallback."
+
             manifest = _load_manifest()
-            _active_account = manifest.get("active_account")
+            acct = manifest.get("accounts", {}).get(_active_account)
+            if not acct:
+                return f"Active account '{_active_account}' not found in manifest. Use `list_accounts` to see available accounts."
 
-        if _active_account is None:
-            return "No active account. Use `add_account` to add one, or existing token.json will be used as fallback."
-
-        manifest = _load_manifest()
-        acct = manifest.get("accounts", {}).get(_active_account)
-        if not acct:
-            return f"Active account '{_active_account}' not found in manifest. Use `list_accounts` to see available accounts."
-
-        email = acct.get("email") or "unknown"
-        return f"Active account: **{_active_account}** ({email})"
-    except Exception as e:
-        return f"Error getting active account: {str(e)}"
+            email = acct.get("email") or "unknown"
+            return f"Active account: **{_active_account}** ({email})"
+        except Exception as e:
+            return f"Error getting active account: {str(e)}"
 
 
 @mcp.tool()
