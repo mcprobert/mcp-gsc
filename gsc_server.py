@@ -230,9 +230,19 @@ def _format_table(
                 return str(int(value))
             except (TypeError, ValueError):
                 return str(value)
+        if col_type == "signed_int":
+            try:
+                return f"{int(value):+d}"
+            except (TypeError, ValueError):
+                return str(value)
         if col_type == "float":
             try:
                 return f"{float(value):.1f}"
+            except (TypeError, ValueError):
+                return str(value)
+        if col_type == "signed_float":
+            try:
+                return f"{float(value):+.1f}"
             except (TypeError, ValueError):
                 return str(value)
         if col_type == "pct":
@@ -933,7 +943,8 @@ async def get_search_analytics(
     days: int = 28,
     dimensions: str = "query",
     row_limit: int = 100,
-) -> str:
+    response_format: str = "markdown",
+) -> Any:
     """Overview of a GSC property's top rows. Pick me for a single-dimension
     summary; use `get_advanced_search_analytics` for sorting/filtering, or
     `get_search_by_page_query` to break queries down for one page.
@@ -943,22 +954,20 @@ async def get_search_analytics(
         days: Look-back window (default 28, clamped to min 1).
         dimensions: Comma-separated GSC dimensions (default `query`; options: query, page, device, country, date).
         row_limit: Max rows returned (default 100; clamped to [1, 25000]).
+        response_format: `markdown` (default, table) | `csv` (compact
+            for downstream parsing) | `json` (dict with typed rows).
     """
     try:
-        # Clamp inputs so the API request is always well-formed.
         days = max(int(days), 1)
         row_limit = max(1, min(int(row_limit), 25000))
 
         service = get_gsc_service()
 
-        # Calculate date range
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
 
-        # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
 
-        # Build request
         request = {
             "startDate": start_date.strftime("%Y-%m-%d"),
             "endDate": end_date.strftime("%Y-%m-%d"),
@@ -966,41 +975,57 @@ async def get_search_analytics(
             "rowLimit": row_limit,
         }
 
-        # Execute request
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
 
-        rows = response.get("rows") or []
-        if not rows:
+        raw_rows = response.get("rows") or []
+        if not raw_rows:
             return f"No search analytics data found for {site_url} in the last {days} days."
 
-        # Format results
-        result_lines = [f"Search analytics for {site_url} (last {days} days):"]
-        result_lines.append("\n" + "-" * 80 + "\n")
+        # Shape rows into dicts keyed by column name for the shared helper.
+        rows = []
+        for r in raw_rows:
+            row_dict: Dict[str, Any] = {}
+            for i, dim in enumerate(dimension_list):
+                keys = r.get("keys", [])
+                row_dict[dim] = keys[i][:100] if i < len(keys) else ""
+            row_dict["clicks"] = r.get("clicks", 0)
+            row_dict["impressions"] = r.get("impressions", 0)
+            row_dict["ctr"] = r.get("ctr", 0)
+            row_dict["position"] = r.get("position", 0)
+            rows.append(row_dict)
 
-        # Create header based on dimensions
-        header = [dim.capitalize() for dim in dimension_list]
-        header.extend(["Clicks", "Impressions", "CTR", "Position"])
-        result_lines.append(" | ".join(header))
-        result_lines.append("-" * 80)
+        columns = [
+            {"key": dim, "display": dim.capitalize(), "type": "str"}
+            for dim in dimension_list
+        ]
+        columns.extend([
+            {"key": "clicks", "display": "Clicks", "type": "int"},
+            {"key": "impressions", "display": "Impressions", "type": "int"},
+            {"key": "ctr", "display": "CTR", "type": "pct"},
+            {"key": "position", "display": "Position", "type": "float"},
+        ])
 
-        # Add data rows
-        for row in rows:
-            data = [dim_value[:100] for dim_value in row.get("keys", [])]
-            data.append(str(row.get("clicks", 0)))
-            data.append(str(row.get("impressions", 0)))
-            data.append(f"{row.get('ctr', 0) * 100:.2f}%")
-            data.append(f"{row.get('position', 0):.1f}")
-            result_lines.append(" | ".join(data))
+        truncated = len(rows) >= row_limit
+        truncation_hint = (
+            f"Showing {row_limit} rows of possibly-more. Pass a larger "
+            f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
+            f"with `start_row` to paginate."
+        )
 
-        if len(rows) >= row_limit:
-            result_lines.append("-" * 80)
-            result_lines.append(
-                f"⚠ Showing {row_limit} of possibly-more rows. Pass a larger "
-                f"`row_limit` (max 25000) or use `get_advanced_search_analytics` "
-                f"with `start_row` to paginate."
-            )
-
-        return "\n".join(result_lines)
+        return _format_table(
+            rows,
+            columns,
+            response_format=response_format,
+            header_lines=[f"Search analytics for {site_url} (last {days} days)"],
+            truncated=truncated,
+            truncation_hint=truncation_hint,
+            meta={
+                "site_url": site_url,
+                "days": days,
+                "dimensions": dimension_list,
+                "row_limit": row_limit,
+            },
+        )
     except Exception as e:
         return f"Error retrieving search analytics: {str(e)}"
 
@@ -1607,7 +1632,8 @@ async def get_advanced_search_analytics(
     filter_dimension: str = None,
     filter_operator: str = "contains",
     filter_expression: str = None,
-) -> str:
+    response_format: str = "markdown",
+) -> Any:
     """GSC search analytics with sorting, filtering, and pagination. Pick me
     when you need more than a plain top-N summary; use `get_search_analytics`
     for a quick overview or `get_search_by_page_query` to break one page
@@ -1628,22 +1654,20 @@ async def get_advanced_search_analytics(
         filter_dimension: query | page | country | device.
         filter_operator: contains | equals | notContains | notEquals.
         filter_expression: value to filter on.
+        response_format: `markdown` (default) | `csv` | `json`.
     """
     try:
         row_limit = max(1, min(int(row_limit), 25000))
 
         service = get_gsc_service()
 
-        # Calculate date range if not provided
         if not end_date:
             end_date = datetime.now().date().strftime("%Y-%m-%d")
         if not start_date:
             start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
 
-        # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
 
-        # Build request
         request = {
             "startDate": start_date,
             "endDate": end_date,
@@ -1652,97 +1676,113 @@ async def get_advanced_search_analytics(
             "startRow": start_row,
             "searchType": search_type.upper(),
         }
-        
-        # Add sorting
+
         if sort_by:
             metric_map = {
                 "clicks": "CLICK_COUNT",
                 "impressions": "IMPRESSION_COUNT",
                 "ctr": "CTR",
-                "position": "POSITION"
+                "position": "POSITION",
             }
-            
             if sort_by in metric_map:
                 request["orderBy"] = [{
                     "metric": metric_map[sort_by],
-                    "direction": sort_direction.lower()
+                    "direction": sort_direction.lower(),
                 }]
-        
-        # Add filtering if provided
+
         if filter_dimension and filter_expression:
             filter_group = {
                 "filters": [{
                     "dimension": filter_dimension,
                     "operator": filter_operator,
-                    "expression": filter_expression
+                    "expression": filter_expression,
                 }]
             }
             request["dimensionFilterGroups"] = [filter_group]
-        
-        # Execute request
+
         response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        
-        if not response.get("rows"):
-            return (f"No search analytics data found for {site_url} with the specified parameters.\n\n"
-                   f"Parameters used:\n"
-                   f"- Date range: {start_date} to {end_date}\n"
-                   f"- Dimensions: {dimensions}\n"
-                   f"- Search type: {search_type}\n"
-                   f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'" if filter_dimension else "- No filter applied")
-        
-        # Loud truncation warning goes at the TOP so agents can't skim past
-        # it. A tail nudge is also emitted further below (belt and braces)
-        # since agents vary in whether they read from the top or bottom.
-        rows_returned = len(response.get("rows", []))
+        raw_rows = response.get("rows") or []
+
+        if not raw_rows:
+            filter_note = (
+                f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'"
+                if filter_dimension else "- No filter applied"
+            )
+            return (
+                f"No search analytics data found for {site_url} with the specified parameters.\n\n"
+                f"Parameters used:\n"
+                f"- Date range: {start_date} to {end_date}\n"
+                f"- Dimensions: {dimensions}\n"
+                f"- Search type: {search_type}\n"
+                f"{filter_note}"
+            )
+
+        rows_returned = len(raw_rows)
         truncated = rows_returned >= row_limit
 
-        result_lines: List[str] = []
-        if truncated:
-            result_lines.append(
-                f"⚠ TRUNCATED: returned {rows_returned} rows and hit "
-                f"`row_limit={row_limit}`. There may be more data. Pass a "
-                f"larger `row_limit` (max 25000) or paginate via "
-                f"`start_row={start_row + row_limit}`."
-            )
-            result_lines.append("")
+        rows = []
+        for r in raw_rows:
+            row_dict: Dict[str, Any] = {}
+            keys = r.get("keys", [])
+            for i, dim in enumerate(dimension_list):
+                row_dict[dim] = keys[i][:100] if i < len(keys) else ""
+            row_dict["clicks"] = r.get("clicks", 0)
+            row_dict["impressions"] = r.get("impressions", 0)
+            row_dict["ctr"] = r.get("ctr", 0)
+            row_dict["position"] = r.get("position", 0)
+            rows.append(row_dict)
 
-        result_lines.append(f"Search analytics for {site_url}:")
-        result_lines.append(f"Date range: {start_date} to {end_date}")
-        result_lines.append(f"Search type: {search_type}")
+        columns = [
+            {"key": dim, "display": dim.capitalize(), "type": "str"}
+            for dim in dimension_list
+        ]
+        columns.extend([
+            {"key": "clicks", "display": "Clicks", "type": "int"},
+            {"key": "impressions", "display": "Impressions", "type": "int"},
+            {"key": "ctr", "display": "CTR", "type": "pct"},
+            {"key": "position", "display": "Position", "type": "float"},
+        ])
+
+        header_lines = [
+            f"Search analytics for {site_url}",
+            f"Date range: {start_date} to {end_date}",
+            f"Search type: {search_type}",
+        ]
         if filter_dimension:
-            result_lines.append(f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'")
-        result_lines.append(f"Showing rows {start_row+1} to {start_row+rows_returned} (sorted by {sort_by} {sort_direction})")
-        result_lines.append("\n" + "-" * 80 + "\n")
-        
-        # Create header based on dimensions
-        header = []
-        for dim in dimension_list:
-            header.append(dim.capitalize())
-        header.extend(["Clicks", "Impressions", "CTR", "Position"])
-        result_lines.append(" | ".join(header))
-        result_lines.append("-" * 80)
-        
-        # Add data rows
-        for row in response.get("rows", []):
-            data = []
-            # Add dimension values
-            for dim_value in row.get("keys", []):
-                data.append(dim_value[:100])  # Increased truncation limit to 100 characters
-            
-            # Add metrics
-            data.append(str(row.get("clicks", 0)))
-            data.append(str(row.get("impressions", 0)))
-            data.append(f"{row.get('ctr', 0) * 100:.2f}%")
-            data.append(f"{row.get('position', 0):.1f}")
-            
-            result_lines.append(" | ".join(data))
-        
-        if truncated:
-            next_start = start_row + row_limit
-            result_lines.append("\nThere may be more results available. To see the next page, use:")
-            result_lines.append(f"start_row: {next_start}, row_limit: {row_limit}")
+            header_lines.append(
+                f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'"
+            )
+        header_lines.append(
+            f"Showing rows {start_row + 1} to {start_row + rows_returned} "
+            f"(sorted by {sort_by} {sort_direction})"
+        )
 
-        return "\n".join(result_lines)
+        truncation_hint = (
+            f"returned {rows_returned} rows and hit `row_limit={row_limit}`. "
+            f"There may be more data. Pass a larger `row_limit` (max 25000) "
+            f"or paginate via `start_row={start_row + row_limit}`."
+        )
+
+        return _format_table(
+            rows,
+            columns,
+            response_format=response_format,
+            header_lines=header_lines,
+            truncated=truncated,
+            truncation_hint=truncation_hint,
+            meta={
+                "site_url": site_url,
+                "start_date": start_date,
+                "end_date": end_date,
+                "dimensions": dimension_list,
+                "search_type": search_type,
+                "row_limit": row_limit,
+                "start_row": start_row,
+                "sort_by": sort_by,
+                "sort_direction": sort_direction,
+                "next_start_row": start_row + row_limit if truncated else None,
+            },
+        )
     except Exception as e:
         return f"Error retrieving advanced search analytics: {str(e)}"
 
@@ -1757,7 +1797,8 @@ async def compare_search_periods(
     limit: int = 10,
     *,
     upstream_row_limit: int = 500,
-) -> str:
+    response_format: str = "markdown",
+) -> Any:
     """Compare GSC analytics between two time periods.
 
     Args:
@@ -1771,115 +1812,114 @@ async def compare_search_periods(
         upstream_row_limit: Per-period rows pulled from GSC before the
             join (default 500; clamped to [1, 25000]). Raise this if
             long-tail queries aren't matching between periods.
+        response_format: `markdown` (default) | `csv` | `json`.
     """
     try:
         upstream_row_limit = max(1, min(int(upstream_row_limit), 25000))
 
         service = get_gsc_service()
 
-        # Parse dimensions
         dimension_list = [d.strip() for d in dimensions.split(",")]
 
-        # Build requests for both periods
         period1_request = {
             "startDate": period1_start,
             "endDate": period1_end,
             "dimensions": dimension_list,
             "rowLimit": upstream_row_limit,
         }
-
         period2_request = {
             "startDate": period2_start,
             "endDate": period2_end,
             "dimensions": dimension_list,
             "rowLimit": upstream_row_limit,
         }
-        
-        # Execute requests
+
         period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
         period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
-        
-        period1_rows = period1_response.get("rows", [])
-        period2_rows = period2_response.get("rows", [])
-        
+
+        period1_rows = period1_response.get("rows", []) or []
+        period2_rows = period2_response.get("rows", []) or []
+
         if not period1_rows and not period2_rows:
             return f"No data found for either period for {site_url}."
-        
-        # Create dictionaries for easy lookup
+
         period1_data = {tuple(row.get("keys", [])): row for row in period1_rows}
         period2_data = {tuple(row.get("keys", [])): row for row in period2_rows}
-        
-        # Find common keys and calculate differences
+
         all_keys = set(period1_data.keys()) | set(period2_data.keys())
-        comparison_data = []
-        
+        comparison_data: List[Dict[str, Any]] = []
+
+        empty = {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0}
         for key in all_keys:
-            p1_row = period1_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            p2_row = period2_data.get(key, {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0})
-            
-            # Calculate differences
-            click_diff = p2_row.get("clicks", 0) - p1_row.get("clicks", 0)
-            click_pct = (click_diff / p1_row.get("clicks", 1)) * 100 if p1_row.get("clicks", 0) > 0 else float('inf')
-            
-            imp_diff = p2_row.get("impressions", 0) - p1_row.get("impressions", 0)
-            imp_pct = (imp_diff / p1_row.get("impressions", 1)) * 100 if p1_row.get("impressions", 0) > 0 else float('inf')
-            
-            ctr_diff = p2_row.get("ctr", 0) - p1_row.get("ctr", 0)
-            pos_diff = p1_row.get("position", 0) - p2_row.get("position", 0)  # Note: lower position is better
-            
-            comparison_data.append({
-                "key": key,
-                "p1_clicks": p1_row.get("clicks", 0),
-                "p2_clicks": p2_row.get("clicks", 0),
+            p1 = period1_data.get(key, empty)
+            p2 = period2_data.get(key, empty)
+
+            click_diff = p2.get("clicks", 0) - p1.get("clicks", 0)
+            p1_clicks = p1.get("clicks", 0)
+            click_pct = (click_diff / p1_clicks) * 100 if p1_clicks > 0 else None
+
+            pos_diff = p1.get("position", 0) - p2.get("position", 0)
+
+            row: Dict[str, Any] = {}
+            for i, dim in enumerate(dimension_list):
+                row[dim] = str(key[i])[:100] if i < len(key) else ""
+            row.update({
+                "p1_clicks": p1_clicks,
+                "p2_clicks": p2.get("clicks", 0),
                 "click_diff": click_diff,
-                "click_pct": click_pct,
-                "p1_impressions": p1_row.get("impressions", 0),
-                "p2_impressions": p2_row.get("impressions", 0),
-                "imp_diff": imp_diff,
-                "imp_pct": imp_pct,
-                "p1_ctr": p1_row.get("ctr", 0),
-                "p2_ctr": p2_row.get("ctr", 0),
-                "ctr_diff": ctr_diff,
-                "p1_position": p1_row.get("position", 0),
-                "p2_position": p2_row.get("position", 0),
-                "pos_diff": pos_diff
+                # Pre-format click_pct as a string so the "N/A" fallback
+                # renders consistently across markdown/csv/json. JSON
+                # readers that want the numeric value can still compute it
+                # from p1_clicks + click_diff.
+                "click_pct": f"{click_pct:.1f}%" if click_pct is not None else "N/A",
+                "p1_position": p1.get("position", 0),
+                "p2_position": p2.get("position", 0),
+                "pos_diff": pos_diff,
             })
-        
-        # Sort by absolute click difference (can change to other metrics)
-        comparison_data.sort(key=lambda x: abs(x["click_diff"]), reverse=True)
-        
-        # Format results
-        result_lines = [f"Search analytics comparison for {site_url}:"]
-        result_lines.append(f"Period 1: {period1_start} to {period1_end}")
-        result_lines.append(f"Period 2: {period2_start} to {period2_end}")
-        result_lines.append(f"Dimension(s): {dimensions}")
-        result_lines.append(f"Top {min(limit, len(comparison_data))} results by change in clicks:")
-        result_lines.append("\n" + "-" * 100 + "\n")
-        
-        # Create header
-        dim_header = " | ".join([d.capitalize() for d in dimension_list])
-        result_lines.append(f"{dim_header} | P1 Clicks | P2 Clicks | Change | % | P1 Pos | P2 Pos | Pos Δ")
-        result_lines.append("-" * 100)
-        
-        # Add data rows (limited to requested number)
-        for item in comparison_data[:limit]:
-            key_str = " | ".join([str(k)[:100] for k in item["key"]])
-            
-            # Format the click change with color indicators
-            click_change = item["click_diff"]
-            click_pct = item["click_pct"] if item["click_pct"] != float('inf') else "N/A"
-            click_pct_str = f"{click_pct:.1f}%" if click_pct != "N/A" else "N/A"
-            
-            # Format position change (positive is good - moving up in rankings)
-            pos_change = item["pos_diff"]
-            
-            result_lines.append(
-                f"{key_str} | {item['p1_clicks']} | {item['p2_clicks']} | "
-                f"{click_change:+d} | {click_pct_str} | "
-                f"{item['p1_position']:.1f} | {item['p2_position']:.1f} | {pos_change:+.1f}"
-            )
-        
-        return "\n".join(result_lines)
+            comparison_data.append(row)
+
+        # Sort by absolute click difference descending.
+        comparison_data.sort(key=lambda r: abs(r["click_diff"]), reverse=True)
+        rows = comparison_data[:limit]
+
+        columns: List[Dict[str, str]] = [
+            {"key": dim, "display": dim.capitalize(), "type": "str"}
+            for dim in dimension_list
+        ]
+        columns.extend([
+            {"key": "p1_clicks", "display": "P1 Clicks", "type": "int"},
+            {"key": "p2_clicks", "display": "P2 Clicks", "type": "int"},
+            {"key": "click_diff", "display": "Change", "type": "signed_int"},
+            {"key": "click_pct", "display": "%", "type": "str"},
+            {"key": "p1_position", "display": "P1 Pos", "type": "float"},
+            {"key": "p2_position", "display": "P2 Pos", "type": "float"},
+            {"key": "pos_diff", "display": "Pos Δ", "type": "signed_float"},
+        ])
+
+        header_lines = [
+            f"Search analytics comparison for {site_url}",
+            f"Period 1: {period1_start} to {period1_end}",
+            f"Period 2: {period2_start} to {period2_end}",
+            f"Dimension(s): {dimensions}",
+            f"Top {min(limit, len(comparison_data))} results by change in clicks",
+        ]
+
+        return _format_table(
+            rows,
+            columns,
+            response_format=response_format,
+            header_lines=header_lines,
+            truncated=False,
+            meta={
+                "site_url": site_url,
+                "period1": {"start": period1_start, "end": period1_end},
+                "period2": {"start": period2_start, "end": period2_end},
+                "dimensions": dimension_list,
+                "limit": limit,
+                "upstream_row_limit": upstream_row_limit,
+                "total_matched": len(comparison_data),
+            },
+        )
     except Exception as e:
         return f"Error comparing search periods: {str(e)}"
 

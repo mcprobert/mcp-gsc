@@ -170,6 +170,21 @@ class TestCellRendering:
         # Falls back to str representation rather than crashing.
         assert "n/a" in out
 
+    def test_signed_int_shows_plus_on_positive(self):
+        rows = [{"d": 5}, {"d": -3}, {"d": 0}]
+        cols = [{"key": "d", "display": "D", "type": "signed_int"}]
+        out = _format_table(rows, cols, response_format="markdown")
+        assert "+5" in out
+        assert "-3" in out
+        assert "+0" in out
+
+    def test_signed_float_shows_plus_on_positive(self):
+        rows = [{"d": 2.5}, {"d": -1.2}]
+        cols = [{"key": "d", "display": "D", "type": "signed_float"}]
+        out = _format_table(rows, cols, response_format="markdown")
+        assert "+2.5" in out
+        assert "-1.2" in out
+
 
 class TestValidation:
     def test_unknown_format_returns_error_string(self):
