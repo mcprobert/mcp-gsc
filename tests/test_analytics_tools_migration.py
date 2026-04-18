@@ -321,6 +321,52 @@ class TestCompareSearchPeriodsMigration:
         assert out["meta"]["total_matched"] == 25
         assert out["meta"]["limit"] == 10
 
+    async def test_clicks_pct_is_float_ratio(self, monkeypatch):
+        """F3 regression guard: `clicks_pct` (renamed from `click_pct`)
+        is a raw float ratio (-0.5 = -50%), not a pre-formatted string.
+        Consumers format for display; the "pct" column type handles
+        markdown/CSV rendering."""
+        # 100 → 50 clicks = -0.5 ratio (-50%)
+        period1 = [
+            {"keys": ["kw"], "clicks": 100, "impressions": 1000, "ctr": 0.1, "position": 3.0},
+        ]
+        period2 = [
+            {"keys": ["kw"], "clicks": 50, "impressions": 1000, "ctr": 0.05, "position": 3.0},
+        ]
+        _patch(monkeypatch, _mock_two_period_service(period1, period2))
+        out = await gsc_compare_search_periods(
+            site_url="sc-domain:example.com",
+            period1_start="2026-01-01",
+            period1_end="2026-01-31",
+            period2_start="2026-02-01",
+            period2_end="2026-02-28",
+            response_format="json",
+        )
+        row = out["rows"][0]
+        assert "click_pct" not in row  # legacy field removed
+        assert row["clicks_pct"] == pytest.approx(-0.5)
+        assert isinstance(row["clicks_pct"], float)
+
+    async def test_clicks_pct_null_when_p1_is_zero(self, monkeypatch):
+        """F3 companion: clicks_pct is None (not 'N/A' string) when
+        the denominator (p1 clicks) is zero."""
+        period1 = [
+            {"keys": ["emerging"], "clicks": 0, "impressions": 50, "ctr": 0.0, "position": 8.0},
+        ]
+        period2 = [
+            {"keys": ["emerging"], "clicks": 5, "impressions": 60, "ctr": 0.083, "position": 7.0},
+        ]
+        _patch(monkeypatch, _mock_two_period_service(period1, period2))
+        out = await gsc_compare_search_periods(
+            site_url="sc-domain:example.com",
+            period1_start="2026-01-01",
+            period1_end="2026-01-31",
+            period2_start="2026-02-01",
+            period2_end="2026-02-28",
+            response_format="json",
+        )
+        assert out["rows"][0]["clicks_pct"] is None
+
     async def test_absent_side_positions_are_null(self, monkeypatch):
         """F4 regression guard: position 0 is not a valid GSC rank.
         When a query exists in one period but not the other, the

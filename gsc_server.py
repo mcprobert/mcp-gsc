@@ -2231,7 +2231,9 @@ async def gsc_compare_search_periods(
             p1_clicks = p1.get("clicks", 0) if p1 is not None else 0
             p2_clicks = p2.get("clicks", 0) if p2 is not None else 0
             click_diff = p2_clicks - p1_clicks
-            click_pct = (click_diff / p1_clicks) * 100 if p1_clicks > 0 else None
+            # Ratio (e.g. -0.5353 = -53.53%). `_format_table`'s "pct"
+            # column type handles the display formatting for markdown/CSV.
+            clicks_pct = (click_diff / p1_clicks) if p1_clicks > 0 else None
 
             # Position is 1-indexed in GSC — 0 is not a valid rank. When a
             # side is absent we emit null rather than a misleading sentinel.
@@ -2250,11 +2252,7 @@ async def gsc_compare_search_periods(
                 "p1_clicks": p1_clicks,
                 "p2_clicks": p2_clicks,
                 "click_diff": click_diff,
-                # Pre-format click_pct as a string so the "N/A" fallback
-                # renders consistently across markdown/csv/json. JSON
-                # readers that want the numeric value can still compute it
-                # from p1_clicks + click_diff.
-                "click_pct": f"{click_pct:.1f}%" if click_pct is not None else "N/A",
+                "clicks_pct": clicks_pct,
                 "p1_position": p1_position,
                 "p2_position": p2_position,
                 "pos_diff": pos_diff,
@@ -2280,7 +2278,7 @@ async def gsc_compare_search_periods(
             {"key": "p1_clicks", "display": "P1 Clicks", "type": "int"},
             {"key": "p2_clicks", "display": "P2 Clicks", "type": "int"},
             {"key": "click_diff", "display": "Change", "type": "signed_int"},
-            {"key": "click_pct", "display": "%", "type": "str"},
+            {"key": "clicks_pct", "display": "%", "type": "pct"},
             {"key": "p1_position", "display": "P1 Pos", "type": "float"},
             {"key": "p2_position", "display": "P2 Pos", "type": "float"},
             {"key": "pos_diff", "display": "Pos Δ", "type": "signed_float"},
