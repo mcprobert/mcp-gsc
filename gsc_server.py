@@ -1200,51 +1200,80 @@ async def gsc_get_search_analytics(
         )
 
 @mcp.tool()
-async def gsc_get_site_details(site_url: str) -> str:
-    """
-    Get detailed information about a specific Search Console property.
-    
+async def gsc_get_site_details(
+    site_url: str, response_format: str = "markdown"
+) -> Any:
+    """Show permission level and, when available, verification and
+    ownership metadata for a GSC property. Returns only fields the
+    Search Console API populates — for most domain properties (sc-domain:…)
+    the response is just `permission_level`.
+
     Args:
-        site_url: The URL of the site in Search Console (must be exact match)
+        site_url: GSC site URL (exact match).
+        response_format: "markdown" (default) or "json".
     """
+    fmt = str(response_format or "").strip().lower()
+    if fmt not in ("markdown", "json"):
+        return (
+            "Error retrieving site details: "
+            f"response_format must be 'markdown' or 'json', got {response_format!r}"
+        )
+
     try:
         service = get_gsc_service()
-        
-        # Get site details
         site_info = service.sites().get(siteUrl=site_url).execute()
-        
-        # Format the results
+
+        permission_level = site_info.get("permissionLevel", "Unknown")
+
+        verification: Optional[Dict[str, Any]] = None
+        if "siteVerificationInfo" in site_info:
+            v = site_info["siteVerificationInfo"]
+            verification = {
+                "state": v.get("verificationState"),
+                "verified_user": v.get("verifiedUser"),
+                "method": v.get("verificationMethod"),
+            }
+
+        ownership: Optional[Dict[str, Any]] = None
+        if "ownershipInfo" in site_info:
+            o = site_info["ownershipInfo"]
+            ownership = {
+                "owner": o.get("owner"),
+                "method": o.get("verificationMethod"),
+            }
+
+        if fmt == "json":
+            return {
+                "ok": True,
+                "tool": "gsc_get_site_details",
+                "site_url": site_url,
+                "permission_level": permission_level,
+                "verification": verification,
+                "ownership": ownership,
+                "meta": {"site_url": site_url},
+            }
+
         result_lines = [f"Site details for {site_url}:"]
         result_lines.append("-" * 50)
-        
-        # Add basic info
-        result_lines.append(f"Permission level: {site_info.get('permissionLevel', 'Unknown')}")
-        
-        # Add verification info if available
-        if "siteVerificationInfo" in site_info:
-            verify_info = site_info["siteVerificationInfo"]
-            result_lines.append(f"Verification state: {verify_info.get('verificationState', 'Unknown')}")
-            
-            if "verifiedUser" in verify_info:
-                result_lines.append(f"Verified by: {verify_info['verifiedUser']}")
-                
-            if "verificationMethod" in verify_info:
-                result_lines.append(f"Verification method: {verify_info['verificationMethod']}")
-        
-        # Add ownership info if available
-        if "ownershipInfo" in site_info:
-            owner_info = site_info["ownershipInfo"]
+        result_lines.append(f"Permission level: {permission_level}")
+        if verification is not None:
+            result_lines.append(
+                f"Verification state: {verification['state'] or 'Unknown'}"
+            )
+            if verification["verified_user"]:
+                result_lines.append(f"Verified by: {verification['verified_user']}")
+            if verification["method"]:
+                result_lines.append(f"Verification method: {verification['method']}")
+        if ownership is not None:
             result_lines.append("\nOwnership Information:")
-            result_lines.append(f"Owner: {owner_info.get('owner', 'Unknown')}")
-            
-            if "verificationMethod" in owner_info:
-                result_lines.append(f"Ownership verification: {owner_info['verificationMethod']}")
-        
+            result_lines.append(f"Owner: {ownership['owner'] or 'Unknown'}")
+            if ownership["method"]:
+                result_lines.append(f"Ownership verification: {ownership['method']}")
         return "\n".join(result_lines)
     except HttpError as e:
         return _format_error(
             _http_error_envelope(e, tool="gsc_get_site_details", site_url=site_url),
-            response_format="markdown",
+            response_format=fmt,
         )
     except Exception as e:
         return _format_error(
@@ -1253,7 +1282,7 @@ async def gsc_get_site_details(site_url: str) -> str:
                 hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
                 tool="gsc_get_site_details",
             ),
-            response_format="markdown",
+            response_format=fmt,
         )
 
 @mcp.tool()

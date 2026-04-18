@@ -129,3 +129,57 @@ class TestGetSiteDetails:
         out = await gsc_get_site_details("sc-domain:example.com")
         assert "HTTP 404" in out
         assert "sc-domain:" in out  # hint names the property
+
+    async def test_json_mode_with_full_metadata(self, monkeypatch):
+        """F5: JSON mode emits a structured envelope with nullable
+        verification / ownership sub-objects."""
+        service = MagicMock()
+        service.sites.return_value.get.return_value.execute.return_value = {
+            "permissionLevel": "siteOwner",
+            "siteVerificationInfo": {
+                "verificationState": "VERIFIED",
+                "verifiedUser": "user@example.com",
+                "verificationMethod": "DNS",
+            },
+            "ownershipInfo": {
+                "owner": "user@example.com",
+                "verificationMethod": "DNS",
+            },
+        }
+        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
+        out = await gsc_get_site_details(
+            "sc-domain:example.com", response_format="json"
+        )
+        assert out["ok"] is True
+        assert out["tool"] == "gsc_get_site_details"
+        assert out["site_url"] == "sc-domain:example.com"
+        assert out["permission_level"] == "siteOwner"
+        assert out["verification"] == {
+            "state": "VERIFIED",
+            "verified_user": "user@example.com",
+            "method": "DNS",
+        }
+        assert out["ownership"] == {"owner": "user@example.com", "method": "DNS"}
+
+    async def test_json_mode_minimal_property(self, monkeypatch):
+        """F5: many domain properties only carry permissionLevel. The
+        verification / ownership blocks must be null (not absent)
+        so consumers can branch on presence without KeyError."""
+        service = MagicMock()
+        service.sites.return_value.get.return_value.execute.return_value = {
+            "permissionLevel": "siteFullUser",
+        }
+        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
+        out = await gsc_get_site_details(
+            "sc-domain:example.com", response_format="json"
+        )
+        assert out["permission_level"] == "siteFullUser"
+        assert out["verification"] is None
+        assert out["ownership"] is None
+
+    async def test_invalid_response_format_returns_error_string(self, monkeypatch):
+        out = await gsc_get_site_details(
+            "sc-domain:example.com", response_format="xml"
+        )
+        assert isinstance(out, str)
+        assert "response_format" in out
