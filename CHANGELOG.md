@@ -5,6 +5,99 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.1.0] — 2026-04-18 — post-refactor review remediation (F1–F7)
+
+Resolves the seven findings from the 2026-04-18 analyst review of the
+post-v1.0 token-reduction refactor. No functional regressions were
+found in the refactor itself; all seven items were cosmetic or
+shape-level drift in the older tools that the refactor hadn't touched.
+Three of them are breaking field-type changes in niche fields of three
+tools — the minor bump reflects that, with migration notes below.
+
+### Breaking (opt-in: only affects `response_format="json"` consumers)
+
+- **F3 — `gsc_compare_search_periods.rows[].click_pct` → `clicks_pct`**.
+  Field renamed and type changed: was a pre-formatted string
+  `"-58.3%"` (or `"N/A"`); is now a float ratio (e.g. `-0.583` =
+  −58.3%) or `null` when p1 clicks is zero. Display formatting is
+  handled by `_format_table`'s `"pct"` column type — markdown/CSV
+  callers see the same shape. Brings this tool into alignment with
+  `gsc_compare_periods_landing_pages.rows[].clicks_pct`, which was
+  already a float ratio.
+
+  *Migration:* if you were reading `click_pct`, rename to `clicks_pct`
+  and multiply by 100 for display. `None` replaces the `"N/A"` string.
+
+- **F4 — `gsc_compare_search_periods.rows[].{p1,p2}_position` nullable**.
+  When a query is present in one period but absent from the other,
+  the missing side's position is now `null` instead of the sentinel
+  `0`. GSC positions are 1-indexed — `0` was a lie that naive consumers
+  read as "ranked first". `pos_diff` is also `null` when either side
+  is null. Clicks and impressions for absent sides remain `0` (zero
+  events is truthful; position is not).
+
+  *Migration:* guard position reads with `is not None` before numeric
+  comparison or arithmetic.
+
+- **F7 — sitemap URL counts are int, not string**. Both
+  `gsc_get_sitemaps.rows[].indexed_urls` and
+  `gsc_list_sitemaps_enhanced.rows[].urls` now coerce the GSC API's
+  string `submitted` value to an int (or `null` on parse failure /
+  missing `web` contents entry), replacing the legacy `"N/A"` sentinel.
+  The `errors` and `warnings` columns were already int-coerced;
+  this drops the drift.
+
+  *Migration:* numeric comparisons / sorts on these fields now work as
+  expected; string comparisons (`x == "673"`) must be updated.
+
+### Added
+
+- **F2 — `response_format="json"` on the URL-inspection family**.
+  `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, and
+  `gsc_check_indexing_issues` now accept `response_format="markdown"`
+  (default, byte-equivalent to pre-F2) or `response_format="json"` with
+  structured envelopes: nested single-URL payload for `inspect`,
+  tabular `rows`+`row_count`+`next_offset` for `batch`, and
+  `summary`+`buckets` (where canonical_conflict/fetch_failure carry
+  structured entries) for `check`. Programmatic consumers no longer
+  need to regex-parse markdown.
+
+- **F5 — `response_format` on `gsc_get_site_details`**. JSON mode
+  emits `{ok, tool, site_url, permission_level, verification|null,
+  ownership|null, meta}`. The docstring was also trimmed to reflect
+  what the Google `sites.get` API actually returns (most
+  `sc-domain:` properties carry only `permissionLevel`).
+
+- **F6 — `truncation_hint` on `gsc_get_search_by_page_query`**. An
+  actionable one-sentence hint is now emitted when `possibly_truncated`
+  is `true`, pointing at the `row_limit` lever (up to 25000). Matches
+  the convention on the sibling analytics tools.
+
+### Docs
+
+- **F1 — response envelope convention documented** in `CLAUDE.md`.
+  Flat top-level spine `{ok, tool, ...payload, meta}` with error
+  envelopes via `_make_error_envelope`; analytics tools use the
+  `columns+rows+truncation_hint` skeleton via `_format_table`;
+  domain-shaped tools use flat dicts with the same spine. Percentages
+  are raw float ratios, positions are 1-indexed with null for absent
+  data, counts are int.
+
+- Added `tool` field + minimal `meta` block to the four domain tools
+  that were returning flat dicts without them: `gsc_get_landing_page_summary`,
+  `gsc_compare_periods_landing_pages`, `gsc_load_from_sf_export`,
+  `gsc_query_sf_export`. Additive; no behaviour change for consumers
+  that weren't branching on these keys.
+
+### Reviewer note
+
+The analyst's "wrapped in `result:`" framing from the review turned out
+not to reflect the code — there was no `result:` wrapper anywhere. The
+real drift was `str`-vs-`dict` returns on the URL-inspection family
+(addressed by F2) and missing spine fields on a handful of domain
+tools (addressed by this release). F1 is therefore documentation +
+light spine additions rather than a structural rewrite.
+
 ## [1.0.1] — 2026-04-17 — v1.0.0 post-release review cleanup
 
 Addresses the `should-fix` items from the full codebase review after
