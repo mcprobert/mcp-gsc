@@ -81,6 +81,65 @@ class TestGetSitemapsStringTypedCounts:
         # returns "None" or blank is caught.
         assert "| 0" in out
 
+    async def test_indexed_urls_returned_as_int_in_json(self, monkeypatch):
+        """F7 regression guard: the GSC API returns `submitted` as a
+        string ("672"). Downstream consumers want a number so sort /
+        threshold / maths work without surprise coercion."""
+        payload = {
+            "sitemap": [
+                {
+                    "path": "https://example.com/sitemap.xml",
+                    "lastDownloaded": "2026-04-15T23:52:00Z",
+                    "errors": "0",
+                    "warnings": "0",
+                    "contents": [{"type": "web", "submitted": "673"}],
+                }
+            ]
+        }
+        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
+        out = await gsc_get_sitemaps("sc-domain:example.com", response_format="json")
+        assert out["rows"][0]["indexed_urls"] == 673
+        assert isinstance(out["rows"][0]["indexed_urls"], int)
+
+    async def test_indexed_urls_is_null_when_no_web_contents(self, monkeypatch):
+        """F7 companion: if the sitemap has no `web` content entry, the
+        count is null (not the old "N/A" sentinel)."""
+        payload = {
+            "sitemap": [
+                {
+                    "path": "https://example.com/sitemap.xml",
+                    "lastDownloaded": "2026-04-15T23:52:00Z",
+                    "errors": "0",
+                    "warnings": "0",
+                }
+            ]
+        }
+        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
+        out = await gsc_get_sitemaps("sc-domain:example.com", response_format="json")
+        assert out["rows"][0]["indexed_urls"] is None
+
+    async def test_list_sitemaps_enhanced_urls_returned_as_int(self, monkeypatch):
+        """F7: same int coercion on the enhanced variant — the field is
+        called `urls` there, same semantics."""
+        payload = {
+            "sitemap": [
+                {
+                    "path": "https://example.com/sitemap.xml",
+                    "lastSubmitted": "2026-04-15T23:52:00Z",
+                    "lastDownloaded": "2026-04-15T23:52:00Z",
+                    "errors": "0",
+                    "warnings": "0",
+                    "contents": [{"type": "web", "submitted": "1234"}],
+                }
+            ]
+        }
+        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: _mock_service(payload))
+        out = await gsc_list_sitemaps_enhanced(
+            "sc-domain:example.com", response_format="json"
+        )
+        assert out["rows"][0]["urls"] == 1234
+        assert isinstance(out["rows"][0]["urls"], int)
+
     async def test_errors_non_numeric_string_falls_back_to_zero(self, monkeypatch):
         # If the API ever returns "n/a" or similar, we log Valid rather than crash.
         payload = {

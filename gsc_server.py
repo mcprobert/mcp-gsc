@@ -1296,11 +1296,14 @@ async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> 
             except (TypeError, ValueError):
                 warnings = 0
 
-            indexed_urls: Any = "N/A"
+            indexed_urls: Optional[int] = None
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
-                        indexed_urls = content.get("submitted", "0")
+                        try:
+                            indexed_urls = int(content.get("submitted", 0) or 0)
+                        except (TypeError, ValueError):
+                            indexed_urls = None
                         break
 
             rows.append({
@@ -1316,7 +1319,7 @@ async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> 
             {"key": "path", "display": "Path", "type": "str"},
             {"key": "last_downloaded", "display": "Last Downloaded", "type": "str"},
             {"key": "status", "display": "Status", "type": "str"},
-            {"key": "indexed_urls", "display": "Indexed URLs", "type": "str"},
+            {"key": "indexed_urls", "display": "Indexed URLs", "type": "int"},
             {"key": "errors", "display": "Errors", "type": "int"},
         ]
 
@@ -2978,11 +2981,14 @@ async def gsc_list_sitemaps_enhanced(
             except (TypeError, ValueError):
                 warnings = 0
 
-            url_count: Any = "N/A"
+            url_count: Optional[int] = None
             if "contents" in sitemap:
                 for content in sitemap["contents"]:
                     if content.get("type") == "web":
-                        url_count = content.get("submitted", "0")
+                        try:
+                            url_count = int(content.get("submitted", 0) or 0)
+                        except (TypeError, ValueError):
+                            url_count = None
                         break
 
             rows.append({
@@ -3000,7 +3006,7 @@ async def gsc_list_sitemaps_enhanced(
             {"key": "last_submitted", "display": "Last Submitted", "type": "str"},
             {"key": "last_downloaded", "display": "Last Downloaded", "type": "str"},
             {"key": "type", "display": "Type", "type": "str"},
-            {"key": "urls", "display": "URLs", "type": "str"},
+            {"key": "urls", "display": "URLs", "type": "int"},
             {"key": "errors", "display": "Errors", "type": "int"},
             {"key": "warnings", "display": "Warnings", "type": "int"},
         ]
