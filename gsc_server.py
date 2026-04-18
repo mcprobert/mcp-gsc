@@ -2863,6 +2863,7 @@ async def gsc_get_landing_page_summary(
 
         return {
             "ok": True,
+            "tool": "gsc_get_landing_page_summary",
             "site_url": site_url,
             "start_date": resolved_start,
             "end_date": resolved_end,
@@ -2875,6 +2876,7 @@ async def gsc_get_landing_page_summary(
                 "site_avg_ctr": site_avg_ctr,
             },
             "filters": {"country": country, "device": device},
+            "meta": {"site_url": site_url},
         }
     except HttpError as e:
         return _http_error_envelope(
@@ -3065,6 +3067,7 @@ async def gsc_compare_periods_landing_pages(
 
         return {
             "ok": True,
+            "tool": "gsc_compare_periods_landing_pages",
             "site_url": site_url,
             "period_a": {"start": a_start, "end": a_end, "totals": _period_totals(a_rows)},
             "period_b": {"start": b_start, "end": b_end, "totals": _period_totals(b_rows)},
@@ -3076,6 +3079,7 @@ async def gsc_compare_periods_landing_pages(
             "sort": {"by": sort_by, "direction": direction_normalized},
             "total_matched": len(diffs),
             "truncated": len(diffs) > limit,
+            "meta": {"site_url": site_url},
         }
     except HttpError as e:
         return _http_error_envelope(
@@ -3996,12 +4000,14 @@ async def gsc_load_from_sf_export(
 
         return {
             "ok": True,
+            "tool": "gsc_load_from_sf_export",
             "session_id": session_id,
             "site_url": site_url,
             "snapshot_date": _sf_sessions[session_id]["snapshot_date"],
             "sf_export_path": str(path),
             "loaded": loaded_summary,
             "warnings": warnings,
+            "meta": {"site_url": site_url, "session_id": session_id},
         }
     except Exception as e:
         return _make_error_envelope(
@@ -4209,6 +4215,7 @@ async def gsc_query_sf_export(
 
         return {
             "ok": True,
+            "tool": "gsc_query_sf_export",
             "session_id": session_id,
             "dataset": dataset,
             "total_matched": total_matched,
@@ -4217,6 +4224,7 @@ async def gsc_query_sf_export(
             "truncated": total_matched > offset + len(sliced),
             "columns": returned_columns,
             "rows": sliced,
+            "meta": {"session_id": session_id, "dataset": dataset},
         }
     except Exception as e:
         return _make_error_envelope(

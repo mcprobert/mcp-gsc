@@ -61,6 +61,41 @@ Both need `GSC_OAUTH_CLIENT_SECRETS_FILE` updated with the real path to credenti
 
 Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth-oauthlib`, `oauth2client`.
 
+## Response envelope convention
+
+Every tool's JSON output follows a flat top-level envelope — no `result:`
+wrapper. These invariants hold across the server:
+
+1. **Success spine:** `{ok: true, tool: str, ..., meta: {...}}`.
+2. **Error spine:** `{ok: false, error: str, hint: str, retry_after?: int, tool: str}`.
+   Built via `_make_error_envelope` / `_http_error_envelope`.
+3. **Tabular tools** (analytics family, `gsc_get_sitemaps`,
+   `gsc_list_sitemaps_enhanced`, `gsc_compare_search_periods`,
+   `gsc_batch_url_inspection`) use the
+   `columns + rows + row_count + truncated + truncation_hint + meta`
+   skeleton, emitted by `_format_table`.
+4. **Domain-shaped tools** (landing pages, SF bridge, single-URL
+   inspection, site details) return `{ok, tool, ...domain_fields, meta}`
+   directly — the payload is tree-shaped, not a table.
+5. **`response_format`** is `markdown` (default) | `json` on most tools,
+   plus `csv` where tabular. Markdown / CSV return a `str`; JSON
+   returns a `dict`.
+
+House conventions for numeric fields:
+
+- **Percentages** are raw float ratios (`-0.5353` = −53.53%). Callers
+  format for display. `_format_table`'s `"pct"` column type handles
+  markdown/CSV rendering (line 412 in `gsc_server.py`).
+- **Positions** are 1-indexed floats. Absent data is `null`, never `0`
+  — `0` would falsely imply "ranked first" (see compare_search_periods F4).
+- **Counts** are ints. String coercion from the Google API is handled
+  defensively at the tool boundary (see sitemap `indexed_urls` F7).
+
+When you add a new tool, route JSON through `_format_table` when
+tabular; otherwise emit a flat dict that satisfies the success spine
+above. Always include `tool` and `meta` so downstream code can identify
+the payload without inspecting keys.
+
 ## Telemetry + stderr channel
 
 Stdio transport reserves **stdout** for JSON-RPC. All telemetry
