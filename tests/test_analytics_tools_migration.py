@@ -321,6 +321,40 @@ class TestCompareSearchPeriodsMigration:
         assert out["meta"]["total_matched"] == 25
         assert out["meta"]["limit"] == 10
 
+    async def test_absent_side_positions_are_null(self, monkeypatch):
+        """F4 regression guard: position 0 is not a valid GSC rank.
+        When a query exists in one period but not the other, the
+        missing side must report null, not a sentinel 0 that naive
+        consumers will read as "rank 1"."""
+        period1 = [
+            {"keys": ["only-in-p1"], "clicks": 5, "impressions": 100, "ctr": 0.05, "position": 4.2},
+        ]
+        period2 = [
+            {"keys": ["only-in-p2"], "clicks": 3, "impressions": 80, "ctr": 0.0375, "position": 7.1},
+        ]
+        _patch(monkeypatch, _mock_two_period_service(period1, period2))
+        out = await gsc_compare_search_periods(
+            site_url="sc-domain:example.com",
+            period1_start="2026-01-01",
+            period1_end="2026-01-31",
+            period2_start="2026-02-01",
+            period2_end="2026-02-28",
+            response_format="json",
+        )
+        rows_by_query = {r["query"]: r for r in out["rows"]}
+
+        p1_only = rows_by_query["only-in-p1"]
+        assert p1_only["p1_position"] == 4.2
+        assert p1_only["p2_position"] is None
+        assert p1_only["pos_diff"] is None
+        assert p1_only["p2_clicks"] == 0
+
+        p2_only = rows_by_query["only-in-p2"]
+        assert p2_only["p1_position"] is None
+        assert p2_only["p2_position"] == 7.1
+        assert p2_only["pos_diff"] is None
+        assert p2_only["p1_clicks"] == 0
+
     async def test_upstream_row_limit_flows_through(self, monkeypatch):
         """A.8 invariant — upstream_row_limit reaches the API request."""
         captured_bodies: list = []

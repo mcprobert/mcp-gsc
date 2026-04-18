@@ -2224,31 +2224,39 @@ async def gsc_compare_search_periods(
         all_keys = set(period1_data.keys()) | set(period2_data.keys())
         comparison_data: List[Dict[str, Any]] = []
 
-        empty = {"clicks": 0, "impressions": 0, "ctr": 0, "position": 0}
         for key in all_keys:
-            p1 = period1_data.get(key, empty)
-            p2 = period2_data.get(key, empty)
+            p1 = period1_data.get(key)
+            p2 = period2_data.get(key)
 
-            click_diff = p2.get("clicks", 0) - p1.get("clicks", 0)
-            p1_clicks = p1.get("clicks", 0)
+            p1_clicks = p1.get("clicks", 0) if p1 is not None else 0
+            p2_clicks = p2.get("clicks", 0) if p2 is not None else 0
+            click_diff = p2_clicks - p1_clicks
             click_pct = (click_diff / p1_clicks) * 100 if p1_clicks > 0 else None
 
-            pos_diff = p1.get("position", 0) - p2.get("position", 0)
+            # Position is 1-indexed in GSC — 0 is not a valid rank. When a
+            # side is absent we emit null rather than a misleading sentinel.
+            p1_position = p1.get("position") if p1 is not None else None
+            p2_position = p2.get("position") if p2 is not None else None
+            pos_diff = (
+                p1_position - p2_position
+                if p1_position is not None and p2_position is not None
+                else None
+            )
 
             row: Dict[str, Any] = {}
             for i, dim in enumerate(dimension_list):
                 row[dim] = str(key[i])[:100] if i < len(key) else ""
             row.update({
                 "p1_clicks": p1_clicks,
-                "p2_clicks": p2.get("clicks", 0),
+                "p2_clicks": p2_clicks,
                 "click_diff": click_diff,
                 # Pre-format click_pct as a string so the "N/A" fallback
                 # renders consistently across markdown/csv/json. JSON
                 # readers that want the numeric value can still compute it
                 # from p1_clicks + click_diff.
                 "click_pct": f"{click_pct:.1f}%" if click_pct is not None else "N/A",
-                "p1_position": p1.get("position", 0),
-                "p2_position": p2.get("position", 0),
+                "p1_position": p1_position,
+                "p2_position": p2_position,
                 "pos_diff": pos_diff,
             })
             comparison_data.append(row)
