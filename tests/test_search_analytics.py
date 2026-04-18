@@ -421,6 +421,10 @@ class TestJsonPossiblyTruncated:
         assert result["total_rows_returned"] == 20
         assert result["row_limit"] == 20
         assert result["possibly_truncated"] is True
+        # F6 regression guard: actionable hint must be present when
+        # truncated (siblings like gsc_get_search_analytics ship one).
+        assert result["truncation_hint"]
+        assert "row_limit" in result["truncation_hint"]
 
     async def test_possibly_truncated_false_when_rows_below_limit(self, monkeypatch):
         rows = [
@@ -436,6 +440,8 @@ class TestJsonPossiblyTruncated:
         )
 
         assert result["possibly_truncated"] is False
+        # F6: empty hint when not truncated (don't noise up the payload).
+        assert result["truncation_hint"] == ""
 
 
 # =============================================================================

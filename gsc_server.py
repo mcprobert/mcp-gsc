@@ -2502,6 +2502,7 @@ async def gsc_get_search_by_page_query(
                 "position": float(row.get("position", 0.0)),
             })
 
+        possibly_truncated = len(queries) >= effective_row_limit
         result: Dict[str, Any] = {
             "ok": True,
             "site_url": site_url,
@@ -2509,7 +2510,12 @@ async def gsc_get_search_by_page_query(
             "days": effective_days,
             "row_limit": effective_row_limit,
             "total_rows_returned": len(queries),
-            "possibly_truncated": len(queries) >= effective_row_limit,
+            "possibly_truncated": possibly_truncated,
+            "truncation_hint": (
+                f"Returned {len(queries)} rows at row_limit={effective_row_limit}. "
+                f"Raise row_limit (up to 25000) to surface long-tail queries "
+                f"for this page."
+            ) if possibly_truncated else "",
             "queries": queries,
         }
 
