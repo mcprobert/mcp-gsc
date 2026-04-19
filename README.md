@@ -31,11 +31,19 @@ A tool that connects [Google Search Console](https://search.google.com/search-co
    - Check for errors or warnings in your sitemaps
    - Monitor sitemap processing status
 
-5. **Multi-Account Management**
+5. **Multi-Account Management (v1.2.0 — agent-first routing)**
    - Manage multiple Google accounts for agency workflows
-   - Switch between client accounts without re-authenticating
-   - Add new accounts via browser OAuth
-   - Per-account token storage for security
+   - Add new accounts via browser OAuth; per-account token storage
+   - **Per-call routing.** Every site_url-taking tool auto-resolves
+     which account serves the request from the property itself. No
+     stateful "active account" to get out of sync between concurrent
+     calls or across MCP restarts.
+   - **Optional override** — pass `account_alias=...` on any tool call
+     when multiple accounts share access (`AMBIGUOUS_ACCOUNT` error).
+   - **`gsc_whoami(site_url=...)`** pre-flights the routing decision
+     without a real GSC call.
+   - `gsc_list_accounts(include_properties=True)` shows coverage per
+     account for audit and orchestration.
 
 ---
 
@@ -62,9 +70,11 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
 | `gsc_load_from_sf_export`       | Ingests a Screaming Frog export folder for offline querying | Path to the SF export folder and the site URL                   |
 | `gsc_query_sf_export`           | Query a loaded SF export with filter/sort/pagination        | Session id and dataset name                                     |
-| `gsc_list_accounts`                 | Shows all configured Google accounts (now with OAuth scopes)| Nothing - just ask!                                             |
-| `gsc_add_account`                   | Adds a new Google account via browser OAuth                 | An alias (e.g., 'client-a')                                     |
-| `gsc_switch_account`                | Switches the active Google account                          | The alias of the account to switch to                           |
+| `gsc_list_accounts`                 | Lists configured Google accounts; pass `include_properties=True` for per-account coverage | Nothing — optional flag |
+| `gsc_add_account`                   | Adds a new Google account via browser OAuth (alias `default` is reserved) | An alias (e.g., 'client-a')                                     |
+| `gsc_whoami`                        | Shows which configured account auto-resolves for a given `site_url` | Your website URL |
+| `gsc_switch_account`                | **DEPRECATED in v1.2.0.** Returns `ok:false, error_code:DEPRECATED_TOOL`; pass `account_alias` on each call instead. | — |
+| `gsc_get_active_account`            | **DEPRECATED in v1.2.0.** No more "active account" — use `gsc_whoami(site_url=...)`. | — |
 | `gsc_remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*

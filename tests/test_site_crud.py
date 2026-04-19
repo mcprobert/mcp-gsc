@@ -6,6 +6,8 @@ HttpError codes and generic exceptions.
 """
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,13 +26,30 @@ def _mock_http_error(status: int, message: str = "msg", reason: str = "") -> Htt
     return HttpError(resp=resp, content=body)
 
 
+def _configure_one_account(monkeypatch, service=None):
+    """Write a single-account manifest + patch the non-interactive auth
+    helper to return ``service`` so ``gsc_add_site`` can route."""
+    accounts_dir = Path(gsc_server.ACCOUNTS_DIR)
+    accounts_dir.mkdir(parents=True, exist_ok=True)
+    (accounts_dir / "accounts.json").write_text(json.dumps({
+        "accounts": {"only": {"alias": "only", "token_file": "t"}},
+    }))
+    if service is None:
+        service = MagicMock()
+    monkeypatch.setattr(
+        gsc_server, "_build_service_noninteractive",
+        lambda alias: (service, None),
+    )
+    return service
+
+
 class TestAddSite:
     async def test_happy_path(self, monkeypatch):
         service = MagicMock()
         service.sites.return_value.add.return_value.execute.return_value = {
             "permissionLevel": "siteOwner"
         }
-        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
+        _configure_one_account(monkeypatch, service)
         out = await gsc_add_site("sc-domain:example.com")
         assert "has been added" in out
         assert "Permission level: siteOwner" in out
@@ -40,7 +59,7 @@ class TestAddSite:
         idempotent success, NOT a bare error envelope."""
         service = MagicMock()
         service.sites.return_value.add.return_value.execute.side_effect = _mock_http_error(409)
-        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
+        _configure_one_account(monkeypatch, service)
         out = await gsc_add_site("sc-domain:example.com")
         assert "already added" in out
         assert "Error:" not in out  # Must not render as a B.4 error envelope
@@ -50,16 +69,16 @@ class TestAddSite:
         service.sites.return_value.add.return_value.execute.side_effect = _mock_http_error(
             403, message="no access"
         )
-        monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
+        _configure_one_account(monkeypatch, service)
         out = await gsc_add_site("sc-domain:example.com")
         assert out.startswith("Error: HTTP 403")
         assert "Hint:" in out
         assert "sc-domain:example.com" in out
 
     async def test_generic_exception_renders_envelope(self, monkeypatch):
-        def _explode():
-            raise RuntimeError("boom")
-        monkeypatch.setattr(gsc_server, "get_gsc_service", _explode)
+        service = MagicMock()
+        service.sites.return_value.add.side_effect = RuntimeError("boom")
+        _configure_one_account(monkeypatch, service)
         out = await gsc_add_site("sc-domain:example.com")
         assert "RuntimeError" in out
         assert "Hint:" in out
@@ -91,7 +110,9 @@ class TestDeleteSite:
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
         out = await gsc_delete_site("sc-domain:example.com")
         assert out.startswith("Error: HTTP 403")
-        assert "gsc_get_active_account" in out  # B.4's 403 hint
+        # v1.2.0: 403 hint points to gsc_whoami / gsc_list_accounts
+        # (replacements for the deprecated gsc_get_active_account surface).
+        assert "gsc_whoami" in out or "gsc_list_accounts" in out
 
     async def test_429_envelope_surfaces_retry_after(self, monkeypatch):
         resp = MagicMock()

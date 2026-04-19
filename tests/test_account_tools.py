@@ -23,15 +23,13 @@ from gsc_server import (
 
 @pytest.fixture
 def fake_accounts_home(tmp_path, monkeypatch):
-    """Isolate manifest + accounts dir per test."""
-    accounts_dir = tmp_path / "accounts"
-    accounts_dir.mkdir()
-    manifest = tmp_path / "accounts" / "accounts.json"
-    monkeypatch.setattr(gsc_server, "ACCOUNTS_DIR", str(accounts_dir))
-    monkeypatch.setattr(gsc_server, "ACCOUNTS_MANIFEST", str(manifest))
-    # Reset active-account module state between tests.
-    monkeypatch.setattr(gsc_server, "_active_account", None)
-    return tmp_path
+    """Isolate manifest + accounts dir per test.
+
+    The autouse conftest shim already isolates SCRIPT_DIR/ACCOUNTS_DIR
+    to a tmp_path + creates ``accounts/``. This fixture just hands
+    back the effective tmp root so tests can write manifests into it.
+    """
+    return Path(gsc_server.ACCOUNTS_DIR).parent
 
 
 class TestListAccounts:
@@ -40,19 +38,20 @@ class TestListAccounts:
         assert "No accounts configured" in out
         assert "gsc_add_account" in out
 
-    async def test_populated_manifest_renders_active_marker(self, fake_accounts_home):
+    async def test_populated_manifest_renders_both_accounts(self, fake_accounts_home):
+        """v1.2.0: no more active-account marker. List renders all
+        accounts alphabetically with email + scopes."""
         Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
-            "active_account": "client-a",
             "accounts": {
                 "client-a": {"alias": "client-a", "email": "a@example.com", "added_at": "2026-04-17"},
                 "client-b": {"alias": "client-b", "email": "b@example.com", "added_at": "2026-04-16"},
             },
         }))
         out = await gsc_list_accounts()
-        assert "**client-a**" in out and "**(active)**" in out
+        assert "**client-a**" in out
         assert "**client-b**" in out
-        # Active marker only fires on the active account.
-        assert out.count("**(active)**") == 1
+        # Active-account concept is gone; no marker should appear.
+        assert "(active)" not in out
 
     async def test_exception_renders_envelope(self, monkeypatch):
         def _explode():
@@ -136,38 +135,45 @@ class TestAddAccount:
         assert not (fake_accounts_home / "accounts" / "new").exists()
 
 
-class TestSwitchAccount:
-    async def test_invalid_alias(self, fake_accounts_home):
-        # Underscore violates the regex; case alone is lowercased first.
+class TestSwitchAccountDeprecated:
+    """v1.2.0: gsc_switch_account is a behavioural no-op that returns
+    ``ok:false`` with ``error_code: DEPRECATED_TOOL`` so old callers
+    can't silently believe state was changed."""
+
+    async def test_invalid_alias_still_validated(self, fake_accounts_home):
+        # Underscore violates the regex. Even for a deprecated tool we
+        # surface the validation failure distinctly, so a typo doesn't
+        # get masked by the generic deprecation message.
         out = await gsc_switch_account("has_underscore")
-        assert "Invalid alias" in out
+        assert out["ok"] is False
+        assert out["error_code"] == "DEPRECATED_TOOL"
+        assert "invalid" in out["error"].lower()
 
-    async def test_unknown_alias_lists_available(self, fake_accounts_home):
+    async def test_known_alias_returns_deprecation_envelope(self, fake_accounts_home):
         Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
-            "active_account": "a",
-            "accounts": {"a": {"alias": "a"}, "b": {"alias": "b"}},
-        }))
-        out = await gsc_switch_account("nonexistent")
-        assert "not found" in out
-        assert "a, b" in out or "b, a" in out
-
-    async def test_happy_path(self, fake_accounts_home):
-        Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
-            "active_account": "a",
             "accounts": {"a": {"alias": "a"}, "b": {"alias": "b", "email": "b@example.com"}},
         }))
         out = await gsc_switch_account("b")
-        assert "Switched to account 'b'" in out
-        assert "b@example.com" in out
+        assert out["ok"] is False
+        assert out["error_code"] == "DEPRECATED_TOOL"
+        assert out["retryable"] is False
+        assert "account_alias" in out["hint"]
+        # replacement info surfaces so agents can migrate their calls.
+        # F15: nested key is ``suggested_tool`` (not ``tool``) to avoid
+        # collision with the envelope-level ``tool`` field.
+        assert "replacement" in out
+        assert "suggested_tool" in out["replacement"]
+        assert "tool" not in out["replacement"]  # old name must be gone
 
-    async def test_exception_renders_envelope(self, fake_accounts_home, monkeypatch):
-        def _explode():
-            raise OSError("manifest unreadable")
-        monkeypatch.setattr(gsc_server, "_load_manifest", _explode)
-        out = await gsc_switch_account("a")
-        assert "OSError" in out
-        assert "manifest unreadable" in out
-        assert "gsc_list_accounts" in out  # The hint names the next tool.
+    async def test_unknown_alias_includes_alternatives(self, fake_accounts_home):
+        Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
+            "accounts": {"a": {"alias": "a"}, "b": {"alias": "b"}},
+        }))
+        out = await gsc_switch_account("nonexistent")
+        assert out["ok"] is False
+        assert out["error_code"] == "DEPRECATED_TOOL"
+        # Known aliases listed for discovery.
+        assert set(out["alternatives"]) == {"a", "b"}
 
 
 class TestRemoveAccount:

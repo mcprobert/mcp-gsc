@@ -183,7 +183,9 @@ class TestHotPathToolsEmitTelemetry:
         assert enter["row_limit"] == 50
 
     @pytest.mark.asyncio
-    async def test_tool_error_fires_before_envelope_conversion(self, monkeypatch, capsys):
+    async def test_tool_error_fires_before_envelope_conversion(
+        self, monkeypatch, capsys, tmp_path,
+    ):
         """When an instrumented body raises, _instrument must log
         tool_error before the outer except converts the exception into
         a user-facing envelope string. Otherwise telemetry thinks every
@@ -191,9 +193,29 @@ class TestHotPathToolsEmitTelemetry:
         mod = _reload_with_env(monkeypatch, "1")
         from unittest.mock import MagicMock
 
+        # v1.2.0: gsc_list_properties uses _build_service_noninteractive
+        # per-alias, not the legacy get_gsc_service(). The body's first
+        # raise-ing statement is now the sites().list().execute() call
+        # against the returned service. Isolate accounts to tmp_path so
+        # the reloaded module doesn't see the dev-machine manifest.
+        accounts_dir = tmp_path / "accounts"
+        accounts_dir.mkdir(exist_ok=True)
+        (accounts_dir / "accounts.json").write_text(
+            '{"accounts": {"only": {"alias": "only", "token_file": "t"}}}'
+        )
+        monkeypatch.setattr(mod, "SCRIPT_DIR", str(tmp_path))
+        monkeypatch.setattr(mod, "ACCOUNTS_DIR", str(accounts_dir))
+        monkeypatch.setattr(mod, "ACCOUNTS_MANIFEST", str(accounts_dir / "accounts.json"))
+        monkeypatch.setattr(mod, "_migration_checked", True)
+        mod._account_property_state.clear()
+        mod._account_properties.clear()
+
         service = MagicMock()
         service.sites.return_value.list.return_value.execute.side_effect = RuntimeError("boom")
-        mod.get_gsc_service = lambda: service  # type: ignore[assignment]
+        monkeypatch.setattr(
+            mod, "_build_service_noninteractive",
+            lambda alias: (service, None),
+        )
 
         out = await mod.gsc_list_properties()
         # User saw the envelope-converted string...

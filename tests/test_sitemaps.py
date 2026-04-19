@@ -222,7 +222,8 @@ class TestGetSitemapsResponseFormat:
         assert isinstance(out, dict)
         assert out["ok"] is False
         assert "HTTP 403" in out["error"]
-        assert "gsc_get_active_account" in out["hint"]
+        # v1.2.0: 403 hint points to the new routing diagnostics.
+        assert "gsc_whoami" in out["hint"] or "gsc_list_accounts" in out["hint"]
 
 
 class TestListSitemapsEnhancedResponseFormat:

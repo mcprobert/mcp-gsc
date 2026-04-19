@@ -25,7 +25,7 @@ Single-file FastMCP server (`gsc_server.py`) with 24 tools covering:
 
 Uses OAuth 2.0 (Desktop app flow). Set `GSC_OAUTH_CLIENT_SECRETS_FILE` env var to point at your `client_secrets.json`. On first run, opens browser for Google login; caches token in `token.json`.
 
-### Multi-Account Support
+### Multi-Account Support (v1.2.0 — agent-first)
 
 Multiple Google accounts are supported for agency workflows. Tokens are stored per-account under `accounts/`:
 
@@ -36,14 +36,68 @@ accounts/
   client-b/token.json
 ```
 
-**Account tools:**
-- `gsc_list_accounts` — show all configured accounts
-- `gsc_get_active_account` — show which account is currently active
-- `gsc_add_account(alias)` — authenticate a new Google account via browser OAuth
-- `gsc_switch_account(alias)` — switch active account (all GSC tools use this)
-- `gsc_remove_account(alias)` — delete an account and its stored token
+**Routing is per-call, not stateful.** Every tool that takes `site_url`
+auto-resolves which configured account serves that property. The
+"active account" concept has been removed — it was the source of two
+production incidents (silent reset on MCP restart; race between
+concurrent agents). The server caches each alias's property set
+in-memory (tri-state: `never | ok | error`), lazy-loaded with a
+per-alias `asyncio.Lock` to avoid redundant discovery calls.
 
-**Migration:** On first start after upgrade, existing `token.json` is automatically copied to `accounts/default/token.json`. The original file is preserved for safe rollback. If no accounts are configured, the legacy `token.json` is used as fallback.
+Resolution rules (see `_resolve_account` in `gsc_server.py`):
+
+- **Explicit `account_alias`:** use it directly; raises
+  `ACCOUNT_SITE_MISMATCH` if the alias lacks access to `site_url`.
+- **No alias + 1 candidate:** use it (only when every other alias is
+  `state=="ok"` and known-negative — a transient discovery failure
+  surfaces `ACCOUNT_RESOLUTION_INCOMPLETE`, not a false unique match).
+- **No alias + >1 candidates:** `AMBIGUOUS_ACCOUNT` + `alternatives`.
+- **No alias + 0 candidates + no errors:** one force-refresh retry,
+  then `NO_ACCOUNT_FOR_PROPERTY`.
+- **Empty manifest:** `NO_ACCOUNTS_CONFIGURED`.
+
+`gsc_add_site` uses a different code path (cannot verify a property
+that isn't yet in GSC): explicit alias is used as-is; no alias + one
+account auto-picks; no alias + multiple accounts returns
+`AMBIGUOUS_ACCOUNT`.
+
+**Stale-positive 403 recovery** (auto-resolved path only): if a tool
+gets a 403 back from Google, the resolver invalidates that alias's
+cache and re-resolves once — catching the case where a user revoked a
+property's access after the cache was warmed. Explicit-alias callers
+do NOT retry (caller chose that credential).
+
+**Account tools:**
+- `gsc_list_accounts(include_properties=False)` — show configured
+  accounts. `include_properties=True` also returns each account's
+  `properties[]` list; default False for privacy + speed.
+- `gsc_whoami(site_url)` — diagnostic: show which account auto-
+  resolves for a property without making a real GSC call.
+- `gsc_add_account(alias)` — authenticate a new Google account via
+  browser OAuth. Alias `default` is reserved and will be rejected.
+- `gsc_remove_account(alias)` — delete an account and its stored token.
+- `gsc_switch_account(alias)` — **DEPRECATED (v1.2.0)**: returns
+  `ok:false, error_code:DEPRECATED_TOOL`. Removed in v1.3.0.
+- `gsc_get_active_account()` — **DEPRECATED (v1.2.0)**: use
+  `gsc_whoami(site_url=...)` instead.
+
+**Auth safety.** The resolver and every routed tool use
+`_build_service_noninteractive`, which:
+
+- NEVER launches browser OAuth (would wedge the stdio subprocess).
+- NEVER deletes a token file on refresh failure.
+- NEVER falls back to service-account credentials for an alias-routed
+  call (would be a confused-deputy bug).
+
+Interactive OAuth is only triggered by `gsc_add_account`.
+
+**Migration (v1.1.x → v1.2.0):** On first start, if the manifest
+contains alias `default`, it is renamed in-place to `legacy`
+(`legacy_<timestamp>` on collision). The underlying token file path
+stays put — only the user-visible alias changes. Legacy bare
+`token.json` next to the script is copied to
+`accounts/legacy/token.json` with alias `legacy`. The `active_account`
+field is dropped on first save.
 
 ## Git Remotes
 
@@ -67,8 +121,18 @@ Every tool's JSON output follows a flat top-level envelope — no `result:`
 wrapper. These invariants hold across the server:
 
 1. **Success spine:** `{ok: true, tool: str, ..., meta: {...}}`.
-2. **Error spine:** `{ok: false, error: str, hint: str, retry_after?: int, tool: str}`.
+2. **Error spine (v1.2.0):** `{ok: false, error: str, error_code: str,
+   hint: str, retryable: bool, retry_after?: int, tool: str}`.
    Built via `_make_error_envelope` / `_http_error_envelope`.
+   - `error_code`: stable enum from the `ErrorCode` class in
+     `gsc_server.py`. Agents branch on this, not the `error` string.
+   - `retryable`: "is retrying the identical request likely to
+     succeed?" Derived from `_RETRYABLE_CODES` when omitted. Agents
+     that auto-retry should key off this field.
+   - Per-code extras may be present: `alternatives: [alias,...]` for
+     `AMBIGUOUS_ACCOUNT` / `ACCOUNT_SITE_MISMATCH`, `site_url: str`
+     for routing failures, `replacement: {tool, example}` for
+     `DEPRECATED_TOOL`.
 3. **Tabular tools** (analytics family, `gsc_get_sitemaps`,
    `gsc_list_sitemaps_enhanced`, `gsc_compare_search_periods`,
    `gsc_batch_url_inspection`) use the

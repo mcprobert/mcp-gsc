@@ -154,7 +154,7 @@ class TestManageSitemaps:
         # confirm it runs.
         called = {"n": 0}
 
-        async def _fake_list(site_url, sitemap_index=None, response_format="markdown"):
+        async def _fake_list(site_url, sitemap_index=None, response_format="markdown", *, account_alias=None):
             called["n"] += 1
             return "delegated-list-ok"
 
@@ -171,7 +171,7 @@ class TestManageSitemaps:
         not swallow routine HttpErrors — those are handled inside the
         delegated tools."""
 
-        async def _fake_list_bad_signature(site_url, sitemap_index=None, response_format="markdown"):
+        async def _fake_list_bad_signature(site_url, sitemap_index=None, response_format="markdown", *, account_alias=None):
             raise TypeError("unexpected argument xyz")
 
         monkeypatch.setattr(gsc_server, "gsc_list_sitemaps_enhanced", _fake_list_bad_signature)

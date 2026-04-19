@@ -179,31 +179,139 @@ _active_account: Optional[str] = None
 _RESPONSE_FORMATS = ("markdown", "csv", "json")
 
 
+class ErrorCode:
+    """Stable string enum for error envelopes (v1.2.0+).
+
+    Agents branch on these; they MUST remain stable across versions.
+    When adding a new code, update ``_RETRYABLE_CODES`` if retries are
+    safe, and document it in CLAUDE.md's response-envelope section.
+    """
+
+    # Account resolution (new in v1.2.0)
+    ACCOUNT_SITE_MISMATCH = "ACCOUNT_SITE_MISMATCH"
+    AMBIGUOUS_ACCOUNT = "AMBIGUOUS_ACCOUNT"
+    NO_ACCOUNT_FOR_PROPERTY = "NO_ACCOUNT_FOR_PROPERTY"
+    NO_ACCOUNTS_CONFIGURED = "NO_ACCOUNTS_CONFIGURED"
+    ACCOUNT_RESOLUTION_INCOMPLETE = "ACCOUNT_RESOLUTION_INCOMPLETE"
+
+    # Input validation
+    INVALID_PROPERTY_FORMAT = "INVALID_PROPERTY_FORMAT"
+    BAD_REQUEST = "BAD_REQUEST"
+
+    # Auth
+    AUTH_EXPIRED = "AUTH_EXPIRED"
+    PERMISSION_DENIED = "PERMISSION_DENIED"
+
+    # HTTP-mapped
+    NOT_FOUND = "NOT_FOUND"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    INTERNAL_ERROR = "INTERNAL_ERROR"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+
+    # Lifecycle
+    DEPRECATED_TOOL = "DEPRECATED_TOOL"
+
+
+# Codes where retrying the identical request is likely to succeed
+# (transient server-side conditions). Agents that do automated retries
+# should key off ``retryable`` rather than regex-matching the error
+# message.
+#
+# Why AUTH_EXPIRED is NOT in this set: four of its five emission sites
+# (missing token file, corrupt token, missing refresh token, expired
+# creds with no refresh token) are strictly non-retryable — the user
+# must re-run ``gsc_add_account``. The fifth site (``creds.refresh()``
+# raising) is ambiguous: a network blip is transient but a revoked
+# token is not, and an agent loop on revoked is worse than one extra
+# manual re-auth on a blip. The one genuinely transient case — the
+# post-resolve race in ``get_gsc_service_for_site`` where a token
+# expires between discovery and use — opts in by passing
+# ``retryable=True`` explicitly at that call site.
+_RETRYABLE_CODES: frozenset = frozenset({
+    ErrorCode.ACCOUNT_RESOLUTION_INCOMPLETE,
+    ErrorCode.QUOTA_EXCEEDED,
+    ErrorCode.INTERNAL_ERROR,
+    ErrorCode.SERVICE_UNAVAILABLE,
+})
+
+
+# HTTP status → ErrorCode. Any status not in this map falls back to
+# INTERNAL_ERROR on the principle that an unknown status from Google is
+# more likely a transient hiccup than a deterministic caller bug.
+_HTTP_STATUS_TO_CODE: Dict[int, str] = {
+    400: ErrorCode.BAD_REQUEST,
+    401: ErrorCode.AUTH_EXPIRED,
+    403: ErrorCode.PERMISSION_DENIED,
+    404: ErrorCode.NOT_FOUND,
+    429: ErrorCode.QUOTA_EXCEEDED,
+    500: ErrorCode.INTERNAL_ERROR,
+    503: ErrorCode.SERVICE_UNAVAILABLE,
+}
+
+
+# Fields that are part of the envelope spine and must not be set via
+# ``_make_error_envelope(..., **extras)``. Guards against a future
+# caller bug that accidentally flips ``ok`` to True on an error
+# envelope via a misnamed extras kwarg.
+_ENVELOPE_RESERVED_FIELDS: frozenset = frozenset({
+    "ok", "error", "error_code", "hint", "retryable", "retry_after", "tool",
+})
+
+
 def _make_error_envelope(
     *,
     error: str,
     hint: str = "",
+    error_code: str = ErrorCode.INTERNAL_ERROR,
+    retryable: Optional[bool] = None,
     retry_after: Optional[float] = None,
     tool: Optional[str] = None,
+    **extras: Any,
 ) -> Dict[str, Any]:
-    """Structured error envelope used by tools that opted into B.4.
+    """Structured error envelope (extended in v1.2.0).
 
     Fields:
         ok: always False (this is the error branch).
         error: short message, human-readable, suitable for agent
-            reasoning. Does not include remediation — that's `hint`.
+            reasoning. Does not include remediation — that's ``hint``.
+        error_code: stable string enum from :class:`ErrorCode`. Agents
+            branch on this; it is the canonical decision pivot.
         hint: one-sentence remediation suggestion. May be empty.
+        retryable: "Is retrying the identical request likely to
+            succeed?" When ``None`` (default), derived from
+            ``error_code`` via :data:`_RETRYABLE_CODES`. Pass explicit
+            True/False only when the code's default would be wrong
+            for this specific call site.
         retry_after: seconds to wait before retrying, when the
             error is transient. None for non-transient errors.
         tool: name of the tool that produced the envelope.
+        **extras: additional keyed fields — e.g. ``alternatives=[...]``
+            for ``AMBIGUOUS_ACCOUNT``, ``site_url=...`` for routing
+            errors. Merged into the returned envelope.
     """
-    return {
+    if retryable is None:
+        retryable = error_code in _RETRYABLE_CODES
+    envelope: Dict[str, Any] = {
         "ok": False,
         "error": error,
+        "error_code": error_code,
         "hint": hint,
+        "retryable": retryable,
         "retry_after": retry_after,
         "tool": tool,
     }
+    if extras:
+        # Guard spine fields. A caller that accidentally passed e.g.
+        # ``ok=True`` as an extras kwarg would otherwise flip the
+        # envelope's error flag silently.
+        overlap = _ENVELOPE_RESERVED_FIELDS & extras.keys()
+        if overlap:
+            raise TypeError(
+                f"_make_error_envelope extras may not override core "
+                f"envelope fields: {sorted(overlap)}"
+            )
+        envelope.update(extras)
+    return envelope
 
 
 def _http_error_envelope(
@@ -231,16 +339,18 @@ def _http_error_envelope(
     hint = ""
     retry_after: Optional[float] = None
 
-    if status == 401:
+    if status == 400:
+        hint = "Request rejected by GSC. Check the arguments you passed."
+    elif status == 401:
         hint = (
-            "Unauthorised. Re-authenticate with `gsc_add_account` / "
-            "`gsc_switch_account`, or set GSC_OAUTH_CLIENT_SECRETS_FILE."
+            "Unauthorised. Re-authenticate with `gsc_add_account`, "
+            "or set GSC_OAUTH_CLIENT_SECRETS_FILE."
         )
     elif status == 403:
-        site_part = f" Verify `{site_url!r}` is shared with the active account." if site_url else ""
+        site_part = f" Verify `{site_url!r}` is shared with this account." if site_url else ""
         hint = (
-            f"Permission denied. Check `gsc_get_active_account` and "
-            f"`gsc_list_properties` first.{site_part}"
+            f"Permission denied. Use `gsc_whoami` / `gsc_list_accounts` "
+            f"to confirm routing.{site_part}"
         )
     elif status == 404:
         if site_url:
@@ -258,9 +368,12 @@ def _http_error_envelope(
         retry_after = 30.0
 
     status_text = f"HTTP {status}" if status else "HTTP (unknown status)"
+    # Unknown / missing status → INTERNAL_ERROR (transient assumption).
+    error_code = _HTTP_STATUS_TO_CODE.get(status, ErrorCode.INTERNAL_ERROR) if status else ErrorCode.INTERNAL_ERROR
     return _make_error_envelope(
         error=f"{status_text}: {message}",
         hint=hint,
+        error_code=error_code,
         retry_after=retry_after,
         tool=tool,
     )
@@ -567,40 +680,96 @@ def _detect_email(creds) -> Optional[str]:
 
 _migration_checked = False
 
-def _maybe_migrate_legacy_token() -> None:
-    """One-time migration of existing token.json into accounts/default/token.json.
-    Deferred to first use — no network I/O, no blocking at import time."""
+
+def _migrate_legacy_state() -> None:
+    """One-time startup migration, covering both upgrade paths:
+
+    1. **Fresh install with a legacy ``token.json``.** Copy it to
+       ``accounts/legacy/token.json`` and register alias ``legacy`` in
+       the manifest. (Pre-v1.2.0 used alias ``default`` for this; we
+       now use ``legacy`` so the user-facing alias is meaningful.)
+
+    2. **Upgrade from v1.1.x with a ``default`` alias in the manifest.**
+       Rename the alias to ``legacy`` in-place. The underlying token
+       file stays where it is — ``accounts/default/token.json`` is
+       just an internal filesystem path at this point; only the alias
+       is user-visible. If ``legacy`` is already taken, suffix with a
+       timestamp.
+
+    Both migrations are idempotent and persist ``active_account: None``
+    (the field is preserved for manifest back-compat reads but is no
+    longer consulted by the resolver).
+
+    Deferred to first use: no network I/O, no blocking at import time.
+    """
     global _migration_checked, _active_account
     if _migration_checked:
         return
     _migration_checked = True
 
     manifest = _load_manifest()
-    # Skip if accounts already exist
-    if manifest.get("accounts"):
-        return
-    # Check for legacy token
-    if not os.path.exists(TOKEN_FILE):
-        return
-    # Copy token (original left in place for safe rollback)
-    default_dir = os.path.join(ACCOUNTS_DIR, "default")
-    os.makedirs(default_dir, exist_ok=True)
-    dest = os.path.join(default_dir, "token.json")
-    shutil.copy2(TOKEN_FILE, dest)
+    mutated = False
 
-    manifest = {
-        "active_account": "default",
-        "accounts": {
-            "default": {
-                "alias": "default",
+    # Path 2: rename "default" → "legacy" in existing manifest.
+    accounts = manifest.get("accounts") or {}
+    if "default" in accounts:
+        target = "legacy"
+        if target in accounts:
+            # Collision: try legacy_<ts>, then legacy_<ts>_1, _2, ...
+            # until unique. The counter loop closes the sub-second
+            # race window a bare timestamp would leave open.
+            base = f"legacy_{int(datetime.now(timezone.utc).timestamp())}"
+            target = base
+            counter = 0
+            while target in accounts:
+                counter += 1
+                target = f"{base}_{counter}"
+        accounts[target] = dict(accounts["default"])
+        accounts[target]["alias"] = target
+        del accounts["default"]
+        manifest["accounts"] = accounts
+        # Drop the active_account field (v1.2.0 no longer uses it).
+        manifest.pop("active_account", None)
+        mutated = True
+        print(
+            f"[gsc-mcp] Migrated account alias 'default' → {target!r}. "
+            f"The v1.2.0 resolver routes by site_url; 'default' is reserved.",
+            file=sys.stderr, flush=True,
+        )
+
+    # Path 1: legacy token.json + no configured accounts → fresh install.
+    if not accounts and os.path.exists(TOKEN_FILE):
+        legacy_dir = os.path.join(ACCOUNTS_DIR, "legacy")
+        os.makedirs(legacy_dir, exist_ok=True)
+        dest = os.path.join(legacy_dir, "token.json")
+        if not os.path.exists(dest):
+            shutil.copy2(TOKEN_FILE, dest)
+        manifest["accounts"] = {
+            "legacy": {
+                "alias": "legacy",
                 "email": None,
-                "token_file": "accounts/default/token.json",
+                "token_file": "accounts/legacy/token.json",
                 "added_at": datetime.now(timezone.utc).isoformat(),
             }
-        },
-    }
-    _save_manifest(manifest)
-    _active_account = "default"
+        }
+        manifest.pop("active_account", None)
+        mutated = True
+        print(
+            "[gsc-mcp] Migrated legacy token.json → accounts/legacy/token.json. "
+            "Alias 'legacy' is available. Original token.json preserved.",
+            file=sys.stderr, flush=True,
+        )
+
+    if mutated:
+        _save_manifest(manifest)
+    # _active_account stays None; the resolver is per-call in v1.2.0.
+    _active_account = None
+
+
+# Back-compat shim: old callers (including our own get_gsc_service_oauth)
+# use the pre-v1.2.0 name. Forward to the new migration path.
+def _maybe_migrate_legacy_token() -> None:
+    _migrate_legacy_state()
 
 
 # --- Shared date helper (used by landing-page tools) ---
@@ -950,47 +1119,647 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
     # Build and return the service
     return build("searchconsole", "v1", credentials=creds)
 
+
+class AccountResolverError(Exception):
+    """Raised by :func:`_resolve_account` when no single account can be
+    chosen for a site_url (or when an explicit alias can't serve one).
+
+    Carries the envelope-shaping fields so every routed tool can emit a
+    standard error envelope with a single ``e.to_envelope(tool=...)``
+    call instead of duplicating the mapping 20 times.
+    """
+
+    def __init__(
+        self,
+        *,
+        code: str,
+        error: str,
+        hint: str = "",
+        retryable: Optional[bool] = None,
+        alternatives: Optional[List[str]] = None,
+        site_url: Optional[str] = None,
+    ) -> None:
+        super().__init__(error)
+        self.code = code
+        self.error = error
+        self.hint = hint
+        self.retryable = retryable
+        self.alternatives = alternatives
+        self.site_url = site_url
+
+    def to_envelope(self, *, tool: str) -> Dict[str, Any]:
+        extras: Dict[str, Any] = {}
+        if self.alternatives is not None:
+            extras["alternatives"] = self.alternatives
+        if self.site_url is not None:
+            extras["site_url"] = self.site_url
+        return _make_error_envelope(
+            error=self.error,
+            hint=self.hint,
+            error_code=self.code,
+            retryable=self.retryable,
+            tool=tool,
+            **extras,
+        )
+
+
+# Tri-state property cache. Keys are account aliases; states:
+#   "never"  — never loaded (or invalidated). Must refresh before trusting.
+#   "ok"     — last refresh succeeded; ``_account_properties[alias]`` is
+#              the authoritative set of site URLs for that account.
+#   "error"  — last refresh failed. Alias is NEITHER a candidate NOR a
+#              known-negative — resolver returns ACCOUNT_RESOLUTION_INCOMPLETE
+#              rather than silently excluding it.
+#
+# Conflating "error" with empty-set would convert transient 500s during
+# discovery into false NO_ACCOUNT_FOR_PROPERTY / ACCOUNT_SITE_MISMATCH
+# verdicts — exactly the confused-deputy class of failure this refactor
+# is meant to close off.
+_account_property_state: Dict[str, str] = {}          # alias -> "never"|"ok"|"error"
+_account_properties: Dict[str, set] = {}              # alias -> {site_url,...}, valid iff state=="ok"
+_account_property_error: Dict[str, Optional[str]] = {}  # alias -> last error_code, valid iff state=="error"
+_account_property_refreshed_at: Dict[str, float] = {}  # alias -> unix ts of last refresh
+_alias_locks: Dict[str, asyncio.Lock] = {}            # per-alias refresh serialisation
+_alias_locks_mutex = asyncio.Lock()                   # protects lock-dict mutation
+
+
+async def _get_alias_lock(alias: str) -> asyncio.Lock:
+    """Get-or-create the per-alias refresh lock. Avoids a single global
+    lock that would serialise unrelated accounts' refreshes."""
+    async with _alias_locks_mutex:
+        lock = _alias_locks.get(alias)
+        if lock is None:
+            lock = asyncio.Lock()
+            _alias_locks[alias] = lock
+        return lock
+
+
+def _invalidate_property_cache(alias: str) -> None:
+    """Drop the alias's cached property snapshot so the next resolver
+    lookup will rediscover from the Google API.
+
+    Called from two sites where the cache is known-stale:
+    ``gsc_add_site`` (we just added a new property that the cache can't
+    possibly know about) and ``_call_with_stale_retry`` (403 on an
+    auto-resolved call means the cached "can reach" judgment is wrong).
+
+    Safe to call without holding the per-alias lock: dict writes are
+    atomic under the stdio single-threaded asyncio loop, and the worst
+    concurrent case is one wasted refresh.
+    """
+    _account_property_state[alias] = "never"
+    _account_properties.pop(alias, None)
+    _account_property_error.pop(alias, None)
+
+
+async def _ensure_property_cache(
+    alias: str,
+    *,
+    force_refresh: bool = False,
+) -> None:
+    """Ensure ``alias`` has a known-good or known-error property snapshot.
+
+    - ``force_refresh=False`` (default): no-op if state is already ``ok``
+      or ``error`` from a previous refresh attempt.
+    - ``force_refresh=True``: always re-runs discovery.
+
+    Uses a per-alias lock so concurrent callers see at most one
+    discovery call per alias. Double-checks state after acquiring the
+    lock to avoid redundant refresh when another task just finished.
+
+    Never raises — failures land in ``state == "error"`` + error_code.
+    Resolver inspects state/error_code to produce the right envelope.
+    """
+    lock = await _get_alias_lock(alias)
+    async with lock:
+        current = _account_property_state.get(alias, "never")
+        if not force_refresh and current in ("ok", "error"):
+            return
+
+        service, err = await asyncio.to_thread(_build_service_noninteractive, alias)
+        if service is None:
+            _account_property_state[alias] = "error"
+            _account_property_error[alias] = err or ErrorCode.INTERNAL_ERROR
+            _account_properties.pop(alias, None)
+            _account_property_refreshed_at[alias] = time.time()
+            return
+
+        try:
+            site_list = await asyncio.to_thread(
+                lambda: service.sites().list().execute()
+            )
+        except Exception:
+            # Discovery failed (403, 500, network). Mark state="error"
+            # so the resolver treats this alias as "unknown" — neither
+            # a candidate nor a known-negative. ``_account_properties``
+            # is left in place for inspection but the resolver's
+            # ``_classify`` only counts aliases with state=="ok"; that
+            # data is effectively dead while state is "error".
+            #
+            # We deliberately do NOT fall back to any stale snapshot:
+            # doing so would reintroduce the confused-deputy risk that
+            # drove this refactor. If access was revoked in GSC after
+            # the cache warmed, routing to the "last-known-good" alias
+            # would silently hit the wrong account.
+            _account_property_state[alias] = "error"
+            _account_property_error[alias] = ErrorCode.SERVICE_UNAVAILABLE
+            _account_property_refreshed_at[alias] = time.time()
+            return
+
+        sites = site_list.get("siteEntry", []) or []
+        props: set = set()
+        for entry in sites:
+            url = entry.get("siteUrl")
+            if url:
+                props.add(url)
+        _account_properties[alias] = props
+        _account_property_state[alias] = "ok"
+        _account_property_error.pop(alias, None)
+        _account_property_refreshed_at[alias] = time.time()
+
+
+def _list_configured_aliases() -> List[str]:
+    """Sorted alias list for the resolver and discovery tools.
+
+    Runs the legacy-state migration first: without this, a pre-v1.2.0
+    manifest still containing ``default`` would leak that reserved
+    alias into routing decisions before the migration had a chance to
+    rename it. Deferring migration to here (instead of server start)
+    keeps import-time fast and lets tests that manipulate the manifest
+    directly control when migration runs.
+    """
+    _maybe_migrate_legacy_token()
+    manifest = _load_manifest()
+    return sorted((manifest.get("accounts") or {}).keys())
+
+
+async def _resolve_account(
+    site_url: str,
+    account_alias: Optional[str],
+) -> str:
+    """Return the alias that should serve ``site_url``.
+
+    Explicit-alias path: verify the alias exists and has access; raise
+    ``ACCOUNT_SITE_MISMATCH`` if not. Auth/discovery failure for the
+    explicit alias surfaces as ``AUTH_EXPIRED`` / ``SERVICE_UNAVAILABLE``
+    rather than pretending mismatch — otherwise a transient network blip
+    would look like a credential mix-up.
+
+    Auto-resolve path: refresh all ``never`` aliases, then classify:
+
+    - >1 candidates → ``AMBIGUOUS_ACCOUNT`` with ``alternatives``.
+    - 1 candidate + zero ``error`` aliases → use it.
+    - 1 candidate + some ``error`` aliases → ``ACCOUNT_RESOLUTION_INCOMPLETE``
+      (can't claim uniqueness; another error-state alias might also match).
+    - 0 candidates + zero errors → force-refresh once (newly-added site
+      case), re-check; still zero → ``NO_ACCOUNT_FOR_PROPERTY``.
+    - 0 candidates + some errors → ``ACCOUNT_RESOLUTION_INCOMPLETE``.
+
+    Never raises anything except :class:`AccountResolverError`.
+    """
+    aliases = _list_configured_aliases()
+    if not aliases:
+        raise AccountResolverError(
+            code=ErrorCode.NO_ACCOUNTS_CONFIGURED,
+            error="No GSC accounts configured.",
+            hint="Run `gsc_add_account` with an alias to authorise an account.",
+            site_url=site_url,
+        )
+
+    if account_alias is not None:
+        try:
+            alias = _validate_alias(account_alias)
+        except ValueError as e:
+            raise AccountResolverError(
+                code=ErrorCode.BAD_REQUEST,
+                error=f"Invalid account_alias: {e}",
+                hint="Aliases are 1-30 chars, lowercase alphanumerics and hyphens.",
+                site_url=site_url,
+            )
+        if alias not in aliases:
+            raise AccountResolverError(
+                code=ErrorCode.ACCOUNT_SITE_MISMATCH,
+                error=f"Account alias {alias!r} is not configured.",
+                hint=f"Configured aliases: {aliases}. Use gsc_list_accounts to verify.",
+                alternatives=aliases,
+                site_url=site_url,
+            )
+        await _ensure_property_cache(alias)
+        state = _account_property_state.get(alias, "never")
+        if state == "error":
+            err_code = _account_property_error.get(alias) or ErrorCode.INTERNAL_ERROR
+            # Hint bifurcates on code so agents don't loop-retry on
+            # AUTH_EXPIRED (which usually needs human re-auth) but DO
+            # retry on SERVICE_UNAVAILABLE (transient backend blip).
+            # retryable derives from the code via _RETRYABLE_CODES.
+            if err_code == ErrorCode.AUTH_EXPIRED:
+                hint = (
+                    f"Account {alias!r}'s token is no longer valid. "
+                    f"Re-auth via `gsc_add_account {alias}`."
+                )
+            else:
+                hint = (
+                    f"Discovery for {alias!r} failed transiently. "
+                    f"Retry after a short backoff."
+                )
+            raise AccountResolverError(
+                code=err_code,
+                error=f"Cannot verify account {alias!r} access right now.",
+                hint=hint,
+                site_url=site_url,
+            )
+        if site_url in _account_properties.get(alias, set()):
+            return alias
+        raise AccountResolverError(
+            code=ErrorCode.ACCOUNT_SITE_MISMATCH,
+            error=f"Account {alias!r} does not have access to {site_url!r}.",
+            hint=(
+                f"Use gsc_whoami(site_url={site_url!r}) to see which accounts can; "
+                f"or gsc_list_properties(account_alias={alias!r}) to see what it can."
+            ),
+            site_url=site_url,
+        )
+
+    # Auto-resolve: refresh any never-loaded aliases.
+    await asyncio.gather(
+        *(_ensure_property_cache(a) for a in aliases),
+        return_exceptions=False,
+    )
+
+    def _classify() -> Tuple[List[str], List[str]]:
+        cands = [
+            a for a in aliases
+            if _account_property_state.get(a) == "ok"
+            and site_url in _account_properties.get(a, set())
+        ]
+        errs = [a for a in aliases if _account_property_state.get(a) == "error"]
+        return cands, errs
+
+    candidates, errors = _classify()
+
+    if len(candidates) > 1:
+        raise AccountResolverError(
+            code=ErrorCode.AMBIGUOUS_ACCOUNT,
+            error=f"Multiple accounts have access to {site_url!r}.",
+            hint=(
+                f"Pass account_alias explicitly to disambiguate. "
+                f"Candidates: {sorted(candidates)}."
+            ),
+            alternatives=sorted(candidates),
+            site_url=site_url,
+        )
+
+    if len(candidates) == 1 and not errors:
+        return candidates[0]
+
+    if len(candidates) == 1 and errors:
+        raise AccountResolverError(
+            code=ErrorCode.ACCOUNT_RESOLUTION_INCOMPLETE,
+            error=(
+                f"Account resolution incomplete for {site_url!r}: "
+                f"cannot confirm uniqueness while {errors} are unreachable."
+            ),
+            hint=(
+                f"Retry after a backoff, or pass account_alias explicitly "
+                f"(e.g. {candidates[0]!r}) to bypass discovery."
+            ),
+            alternatives=errors,
+            site_url=site_url,
+        )
+
+    # Zero candidates case — two sub-paths.
+    if not errors:
+        # Force refresh once in case the property was added after first
+        # discovery populated the cache.
+        await asyncio.gather(
+            *(_ensure_property_cache(a, force_refresh=True) for a in aliases),
+            return_exceptions=False,
+        )
+        candidates, errors = _classify()
+        if len(candidates) == 1 and not errors:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise AccountResolverError(
+                code=ErrorCode.AMBIGUOUS_ACCOUNT,
+                error=f"Multiple accounts have access to {site_url!r}.",
+                hint=(
+                    f"Pass account_alias explicitly to disambiguate. "
+                    f"Candidates: {sorted(candidates)}."
+                ),
+                alternatives=sorted(candidates),
+                site_url=site_url,
+            )
+        if errors:
+            raise AccountResolverError(
+                code=ErrorCode.ACCOUNT_RESOLUTION_INCOMPLETE,
+                error=(
+                    f"Account resolution incomplete for {site_url!r}: "
+                    f"{errors} unreachable on force-refresh."
+                ),
+                hint="Retry after a backoff, or pass account_alias explicitly.",
+                alternatives=errors,
+                site_url=site_url,
+            )
+        # Still zero candidates after force-refresh — genuinely no access.
+        raise AccountResolverError(
+            code=ErrorCode.NO_ACCOUNT_FOR_PROPERTY,
+            error=f"No configured account has access to {site_url!r}.",
+            hint=(
+                f"Use gsc_list_accounts(include_properties=True) to audit coverage, "
+                f"or gsc_add_account to authorise an account with access."
+            ),
+            site_url=site_url,
+        )
+
+    # candidates == 0 AND errors != []
+    raise AccountResolverError(
+        code=ErrorCode.ACCOUNT_RESOLUTION_INCOMPLETE,
+        error=(
+            f"Account resolution incomplete for {site_url!r}: "
+            f"{errors} unreachable during discovery."
+        ),
+        hint="Retry after a backoff, or pass account_alias explicitly to bypass discovery.",
+        alternatives=errors,
+        site_url=site_url,
+    )
+
+
+async def get_gsc_service_for_site(
+    site_url: str,
+    account_alias: Optional[str],
+) -> Tuple[str, Any]:
+    """Resolve the account for ``site_url`` and return an authenticated
+    Google Search Console service for it.
+
+    Returns ``(resolved_alias, service)``. Raises
+    :class:`AccountResolverError` on resolution failure. Raises a wrapped
+    :class:`AccountResolverError` with ``AUTH_EXPIRED`` /
+    ``SERVICE_UNAVAILABLE`` on auth failure for the resolved alias —
+    callers convert via ``err.to_envelope(tool=...)``.
+
+    Safety: uses only :func:`_build_service_noninteractive`. Never
+    launches browser OAuth. Never falls back to service-account creds.
+    """
+    resolved_alias = await _resolve_account(site_url, account_alias)
+    service, err_code = await asyncio.to_thread(
+        _build_service_noninteractive, resolved_alias
+    )
+    if service is None:
+        # Resolver just verified this alias had state=="ok" — if auth
+        # fails here it's a brief race (token expired between discovery
+        # and use) or a token revoked in the narrow window. The race
+        # case IS genuinely transient, so explicitly mark the error as
+        # retryable even though AUTH_EXPIRED is non-retryable by
+        # default (see _RETRYABLE_CODES). Worst case the agent retries
+        # once and the second attempt surfaces the non-retryable
+        # AUTH_EXPIRED from the resolver path.
+        raise AccountResolverError(
+            code=err_code or ErrorCode.INTERNAL_ERROR,
+            error=f"Could not authenticate account {resolved_alias!r}.",
+            hint=(
+                "Token may have expired between discovery and use; retry once. "
+                "If the retry also fails, re-auth via gsc_add_account."
+            ),
+            retryable=True,
+            site_url=site_url,
+        )
+    return resolved_alias, service
+
+
+async def _call_with_stale_retry(
+    *,
+    site_url: str,
+    account_alias: Optional[str],
+    api_call,
+) -> Tuple[str, Any, Any]:
+    """Resolve → build service → invoke ``api_call(service)``.
+
+    On HTTP 403 from ``api_call`` AND ``account_alias is None`` (auto-
+    resolved path), invalidate the resolved alias's property cache,
+    re-resolve once, and retry if resolution picks a different alias.
+    Explicit-alias callers do not retry — they chose that credential
+    and 403 should surface as PERMISSION_DENIED straight away.
+
+    Returns ``(resolved_alias, service, result)``. The returned service
+    is the one used by the retry if a retry occurred, so downstream
+    calls in the tool body target the right account.
+
+    Raises :class:`AccountResolverError` or :class:`HttpError` — the
+    caller's existing error-envelope handlers deal with both.
+    """
+    resolved_alias, service = await get_gsc_service_for_site(site_url, account_alias)
+    try:
+        result = await asyncio.to_thread(api_call, service)
+        return resolved_alias, service, result
+    except HttpError as e:
+        if account_alias is not None:
+            raise
+        if getattr(e.resp, "status", None) != 403:
+            raise
+        _invalidate_property_cache(resolved_alias)
+        try:
+            new_alias, new_service = await get_gsc_service_for_site(site_url, None)
+        except AccountResolverError:
+            # Re-resolve itself failed — surface the original 403 so
+            # the caller sees the actual Google API response, not a
+            # resolver error that masks it.
+            raise e
+        if new_alias == resolved_alias:
+            # Resolution picked the same alias — no recovery possible.
+            raise e
+        result = await asyncio.to_thread(api_call, new_service)
+        return new_alias, new_service, result
+
+
+def _build_service_noninteractive(alias: str) -> Tuple[Optional[Any], Optional[str]]:
+    """Build a GSC service for ``alias`` without any interactive fallback.
+
+    Used by the account resolver (discovery) and by routed tool calls in
+    v1.2.0+. Safety contract:
+
+    * NEVER launches ``InstalledAppFlow.run_local_server`` (no browser).
+    * NEVER deletes the token file on refresh failure — a transient
+      refresh error should not force a full re-auth on the next call.
+      Users recover via ``gsc_add_account``, which owns the interactive
+      path.
+    * NEVER falls back to service-account credentials — that path exists
+      only for ``get_gsc_service`` and would silently satisfy an
+      alias-routed request with the wrong identity.
+    * Persists the refreshed token ONLY after a successful refresh.
+
+    Returns ``(service, None)`` on success or ``(None, error_code)`` on
+    failure, where ``error_code`` is one of :class:`ErrorCode` values
+    ``AUTH_EXPIRED``, ``SERVICE_UNAVAILABLE``, or ``INTERNAL_ERROR``.
+    Callers decide how to surface the failure (envelope, re-raise, etc).
+    """
+    # Ensure the default→(per-account) migration has run so the manifest
+    # is internally consistent. Cheap after first call.
+    _maybe_migrate_legacy_token()
+    manifest = _load_manifest()
+    acct = manifest.get("accounts", {}).get(alias)
+    if acct is None:
+        # Resolver should have caught this upstream; treat as internal
+        # (not AUTH_EXPIRED, which would mislead a retrying caller).
+        return None, ErrorCode.INTERNAL_ERROR
+
+    token_path = acct.get("token_file")
+    if not token_path:
+        return None, ErrorCode.AUTH_EXPIRED
+    if not os.path.isabs(token_path):
+        token_path = os.path.join(SCRIPT_DIR, token_path)
+    if not os.path.exists(token_path):
+        return None, ErrorCode.AUTH_EXPIRED
+
+    try:
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+    except Exception:
+        # Corrupted token file. Do NOT delete — user can fix via
+        # gsc_add_account re-auth, which writes a fresh token.
+        return None, ErrorCode.AUTH_EXPIRED
+
+    if not creds.valid:
+        if creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except Exception:
+                # Refresh failed (network, revoked token, server error).
+                # Leave token file intact; next call will re-try. If the
+                # token is genuinely revoked the user re-runs
+                # gsc_add_account.
+                return None, ErrorCode.AUTH_EXPIRED
+            # Persist refreshed token on success only. Best-effort write:
+            # a disk error here is not fatal because creds are valid
+            # in-memory for this call.
+            try:
+                with open(token_path, "w") as f:
+                    f.write(creds.to_json())
+            except OSError:
+                pass
+        else:
+            # No refresh token, or invalid in a non-expired way. Can't
+            # recover without interactive auth.
+            return None, ErrorCode.AUTH_EXPIRED
+
+    try:
+        return build("searchconsole", "v1", credentials=creds), None
+    except Exception:
+        # discovery/build failure — treat as transient upstream.
+        return None, ErrorCode.SERVICE_UNAVAILABLE
+
+
 @mcp.tool()
 async def gsc_list_properties(
     name_contains: Optional[str] = None,
     limit: int = 50,
+    *,
+    account_alias: Optional[str] = None,
 ) -> str:
-    """List the GSC properties the active account can see.
+    """List GSC properties visible to one or all configured accounts.
+
+    v1.2.0: when ``account_alias`` is omitted this lists properties
+    across every configured account, tagging each row with its source
+    account so agents can see the full coverage in one call.
 
     Args:
         name_contains: Optional case-insensitive substring filter on the
             site URL (e.g. `name_contains='whitehat'`). Use this first on
             agency accounts with many properties.
         limit: Max properties to return (default 50; clamped to [1, 1000]).
+        account_alias: Restrict to a single account. Omit for cross-
+            account listing.
     """
     try:
-        async with _instrument("gsc_list_properties", name_contains=name_contains, limit=limit):
+        async with _instrument(
+            "gsc_list_properties",
+            name_contains=name_contains,
+            limit=limit,
+            account_alias=account_alias,
+        ):
             limit = max(1, min(int(limit), 1000))
 
-            service = get_gsc_service()
-            site_list = service.sites().list().execute()
+            aliases = _list_configured_aliases()
+            if not aliases:
+                return (
+                    "No accounts configured.\n\n"
+                    "Use `gsc_add_account` to authorise a Google account."
+                )
 
-            sites = site_list.get("siteEntry", [])
+            if account_alias is not None:
+                try:
+                    chosen = _validate_alias(account_alias)
+                except ValueError as e:
+                    return _format_error(
+                        _make_error_envelope(
+                            error=f"Invalid account_alias: {e}",
+                            error_code=ErrorCode.BAD_REQUEST,
+                            tool="gsc_list_properties",
+                        ),
+                        response_format="markdown",
+                    )
+                if chosen not in aliases:
+                    return _format_error(
+                        _make_error_envelope(
+                            error=f"Account alias {chosen!r} is not configured.",
+                            error_code=ErrorCode.ACCOUNT_SITE_MISMATCH,
+                            hint=f"Configured: {aliases}.",
+                            tool="gsc_list_properties",
+                            alternatives=aliases,
+                        ),
+                        response_format="markdown",
+                    )
+                targets = [chosen]
+            else:
+                targets = aliases
 
-            if name_contains:
-                needle = name_contains.lower()
-                sites = [s for s in sites if needle in s.get("siteUrl", "").lower()]
+            # Discover per-account sites (non-interactive). Failures are
+            # tolerated per-account so one bad token doesn't break the
+            # whole listing — the failed alias just gets an annotation.
+            rows: List[Tuple[str, str, str]] = []  # (alias, site_url, permission)
+            partial_failures: List[Tuple[str, str]] = []  # (alias, error_code)
+            for alias in targets:
+                service, err_code = await asyncio.to_thread(
+                    _build_service_noninteractive, alias,
+                )
+                if service is None:
+                    partial_failures.append((alias, err_code or ErrorCode.INTERNAL_ERROR))
+                    continue
+                try:
+                    site_list = await asyncio.to_thread(
+                        lambda s=service: s.sites().list().execute(),
+                    )
+                except HttpError as e:
+                    code = _HTTP_STATUS_TO_CODE.get(
+                        getattr(e.resp, "status", None) or 0,
+                        ErrorCode.INTERNAL_ERROR,
+                    )
+                    partial_failures.append((alias, code))
+                    continue
+                for site in site_list.get("siteEntry", []) or []:
+                    site_url = site.get("siteUrl", "")
+                    if name_contains and name_contains.lower() not in site_url.lower():
+                        continue
+                    rows.append((
+                        alias,
+                        site_url,
+                        site.get("permissionLevel", "Unknown permission"),
+                    ))
 
-            if not sites:
+            if not rows and not partial_failures:
                 if name_contains:
                     return f"No Search Console properties matching {name_contains!r}."
                 return "No Search Console properties found."
 
-            total_available = len(sites)
+            total_available = len(rows)
             truncated = total_available > limit
-            shown_sites = sites[:limit]
+            shown = rows[:limit]
 
-            # Format the results for easy reading
-            lines = []
-            for site in shown_sites:
-                site_url = site.get("siteUrl", "Unknown")
-                permission = site.get("permissionLevel", "Unknown permission")
-                lines.append(f"- {site_url} ({permission})")
+            lines: List[str] = []
+            # Only tag rows with the account when listing across
+            # multiple accounts, to keep single-account output compact.
+            tag_account = len(targets) > 1
+            for alias, site_url, permission in shown:
+                prefix = f"[{alias}] " if tag_account else ""
+                lines.append(f"- {prefix}{site_url} ({permission})")
 
             if truncated:
                 lines.append("")
@@ -1000,46 +1769,127 @@ async def gsc_list_properties(
                     f"(max 1000) to see more."
                 )
 
+            if partial_failures:
+                lines.append("")
+                lines.append("Partial failures (not queried):")
+                for alias, err_code in partial_failures:
+                    lines.append(f"- {alias}: {err_code}")
+
             return "\n".join(lines)
-    except FileNotFoundError as e:
-        # Credentials-setup guidance stays as a plain string — it's an
-        # environment-setup concern, not a B.4-style tool failure.
-        return (
-            "Error: Service account credentials file not found.\n\n"
-            "To access Google Search Console, please:\n"
-            "1. Create a service account in Google Cloud Console\n"
-            "2. Download the JSON credentials file\n"
-            "3. Save it as 'service_account_credentials.json' in the same directory as this script\n"
-            "4. Share your GSC properties with the service account email"
-        )
-    except HttpError as e:
-        return _format_error(
-            _http_error_envelope(e, tool="gsc_list_properties"),
-            response_format="markdown",
-        )
     except Exception as e:
         return _format_error(
             _make_error_envelope(
                 error=f"{type(e).__name__}: {e}",
-                hint="Check that the active account has at least one verified "
-                     "GSC property; use `gsc_get_active_account` to confirm.",
+                hint="Check that at least one account has a valid token; "
+                     "see gsc_list_accounts(include_properties=True).",
                 tool="gsc_list_properties",
             ),
             response_format="markdown",
         )
 
 @mcp.tool()
-async def gsc_add_site(site_url: str) -> str:
+async def gsc_add_site(
+    site_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     Add a site to your Search Console properties.
-    
+
+    The resolver's normal "property must already be reachable"
+    verification doesn't apply here — by definition, the property is
+    not yet in GSC. Routing rules for this tool alone:
+
+    - Explicit ``account_alias``: use it directly. No pre-verification.
+    - No alias + exactly one configured account: use it.
+    - No alias + multiple configured accounts: return
+      ``AMBIGUOUS_ACCOUNT`` — the caller must choose which account
+      owns the new property.
+
     Args:
-        site_url: The URL of the site to add (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
+        site_url: The URL of the site to add (must be exact match e.g.
+            https://example.com, or https://www.example.com, or
+            https://subdomain.example.com/path/, for domain properties
+            use format: sc-domain:example.com).
+        account_alias: Optional explicit account. Required when more
+            than one account is configured (cannot auto-resolve since
+            the property isn't yet in GSC).
     """
     try:
-        service = get_gsc_service()
+        aliases = _list_configured_aliases()
+        if not aliases:
+            return _format_error(
+                _make_error_envelope(
+                    error="No GSC accounts configured.",
+                    error_code=ErrorCode.NO_ACCOUNTS_CONFIGURED,
+                    hint="Run `gsc_add_account` with an alias to authorise an account.",
+                    tool="gsc_add_site",
+                    site_url=site_url,
+                ),
+                response_format="markdown",
+            )
+
+        if account_alias is not None:
+            try:
+                chosen = _validate_alias(account_alias)
+            except ValueError as e:
+                return _format_error(
+                    _make_error_envelope(
+                        error=f"Invalid account_alias: {e}",
+                        error_code=ErrorCode.BAD_REQUEST,
+                        tool="gsc_add_site",
+                    ),
+                    response_format="markdown",
+                )
+            if chosen not in aliases:
+                return _format_error(
+                    _make_error_envelope(
+                        error=f"Account alias {chosen!r} is not configured.",
+                        error_code=ErrorCode.ACCOUNT_SITE_MISMATCH,
+                        hint=f"Configured: {aliases}. Use gsc_list_accounts.",
+                        tool="gsc_add_site",
+                        alternatives=aliases,
+                    ),
+                    response_format="markdown",
+                )
+        elif len(aliases) == 1:
+            chosen = aliases[0]
+        else:
+            return _format_error(
+                _make_error_envelope(
+                    error=(
+                        f"Multiple accounts configured ({aliases}); "
+                        f"cannot auto-resolve for gsc_add_site because "
+                        f"the property isn't in GSC yet."
+                    ),
+                    error_code=ErrorCode.AMBIGUOUS_ACCOUNT,
+                    hint="Pass account_alias to choose which account owns the new property.",
+                    tool="gsc_add_site",
+                    alternatives=aliases,
+                    site_url=site_url,
+                ),
+                response_format="markdown",
+            )
+
+        service, err_code = await asyncio.to_thread(
+            _build_service_noninteractive, chosen,
+        )
+        if service is None:
+            return _format_error(
+                _make_error_envelope(
+                    error=f"Could not authenticate account {chosen!r}.",
+                    error_code=err_code or ErrorCode.INTERNAL_ERROR,
+                    hint="Retry, or re-auth via gsc_add_account.",
+                    tool="gsc_add_site",
+                ),
+                response_format="markdown",
+            )
 
         response = service.sites().add(siteUrl=site_url).execute()
+
+        # On success, invalidate the chosen alias's property cache so
+        # the next read-tool call picks up the newly-added property.
+        _invalidate_property_cache(chosen)
 
         result_lines = [f"Site {site_url} has been added to Search Console."]
         if "permissionLevel" in response:
@@ -1064,16 +1914,35 @@ async def gsc_add_site(site_url: str) -> str:
         )
 
 @mcp.tool()
-async def gsc_delete_site(site_url: str) -> str:
+async def gsc_delete_site(
+    site_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     Remove a site from your Search Console properties.
 
     Args:
         site_url: The URL of the site to remove (must be exact match e.g. https://example.com, or https://www.example.com, or https://subdomain.example.com/path/, for domain properties use format: sc-domain:example.com)
+        account_alias: Optional explicit account to route this call to.
+            When omitted, auto-resolves from site_url. Pass this when
+            multiple configured accounts have access to the same
+            property (AMBIGUOUS_ACCOUNT otherwise).
     """
     try:
-        service = get_gsc_service()
-        service.sites().delete(siteUrl=site_url).execute()
+        try:
+            def _do(svc):
+                return svc.sites().delete(siteUrl=site_url).execute()
+            await _call_with_stale_retry(
+                site_url=site_url,
+                account_alias=account_alias,
+                api_call=_do,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_delete_site"),
+                response_format="markdown",
+            )
         return f"Site {site_url} has been removed from Search Console."
     except HttpError as e:
         # 404 is semantically "nothing to delete" — treat as a
@@ -1101,6 +1970,8 @@ async def gsc_get_search_analytics(
     dimensions: str = "query",
     row_limit: int = 100,
     response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Overview of a GSC property's top rows. Pick me for a single-dimension
     summary; use `gsc_get_advanced_search_analytics` for sorting/filtering, or
@@ -1113,13 +1984,18 @@ async def gsc_get_search_analytics(
         row_limit: Max rows returned (default 100; clamped to [1, 25000]).
         response_format: `markdown` (default, table) | `csv` (compact
             for downstream parsing) | `json` (dict with typed rows).
+        account_alias: Optional explicit account to route this call to.
+            When omitted, auto-resolves from site_url. Pass when
+            multiple configured accounts share access (AMBIGUOUS_ACCOUNT).
     """
     try:
-        async with _instrument("gsc_get_search_analytics", site_url=site_url, days=days, row_limit=row_limit):
+        async with _instrument(
+            "gsc_get_search_analytics",
+            site_url=site_url, days=days, row_limit=row_limit,
+            account_alias=account_alias,
+        ):
             days = max(int(days), 1)
             row_limit = max(1, min(int(row_limit), 25000))
-
-            service = get_gsc_service()
 
             end_date = datetime.now().date()
             start_date = end_date - timedelta(days=days)
@@ -1133,7 +2009,17 @@ async def gsc_get_search_analytics(
                 "rowLimit": row_limit,
             }
 
-            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+            try:
+                def _do(svc):
+                    return svc.searchanalytics().query(siteUrl=site_url, body=request).execute()
+                _resolved, _service, response = await _call_with_stale_retry(
+                    site_url=site_url, account_alias=account_alias, api_call=_do,
+                )
+            except AccountResolverError as e:
+                return _format_error(
+                    e.to_envelope(tool="gsc_get_search_analytics"),
+                    response_format=response_format,
+                )
 
             raw_rows = response.get("rows") or []
             if not raw_rows:
@@ -1201,7 +2087,10 @@ async def gsc_get_search_analytics(
 
 @mcp.tool()
 async def gsc_get_site_details(
-    site_url: str, response_format: str = "markdown"
+    site_url: str,
+    response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Show permission level and, when available, verification and
     ownership metadata for a GSC property. Returns only fields the
@@ -1211,6 +2100,7 @@ async def gsc_get_site_details(
     Args:
         site_url: GSC site URL (exact match).
         response_format: "markdown" (default) or "json".
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     fmt = str(response_format or "").strip().lower()
     if fmt not in ("markdown", "json"):
@@ -1220,8 +2110,16 @@ async def gsc_get_site_details(
         )
 
     try:
-        service = get_gsc_service()
-        site_info = service.sites().get(siteUrl=site_url).execute()
+        try:
+            def _do(svc):
+                return svc.sites().get(siteUrl=site_url).execute()
+            _resolved, _service, site_info = await _call_with_stale_retry(
+                site_url=site_url, account_alias=account_alias, api_call=_do,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_get_site_details"), response_format=fmt,
+            )
 
         permission_level = site_info.get("permissionLevel", "Unknown")
 
@@ -1286,7 +2184,12 @@ async def gsc_get_site_details(
         )
 
 @mcp.tool()
-async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> Any:
+async def gsc_get_sitemaps(
+    site_url: str,
+    response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
+) -> Any:
     """List submitted sitemaps for a GSC property. Compact output with
     Valid/Has-errors status. Use `gsc_list_sitemaps_enhanced` for the richer
     table (includes submission + download timestamps + warnings).
@@ -1294,11 +2197,20 @@ async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> 
     Args:
         site_url: GSC site URL (exact match).
         response_format: `markdown` (default) | `csv` | `json`.
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
-        service = get_gsc_service()
-
-        sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
+        try:
+            def _do(svc):
+                return svc.sitemaps().list(siteUrl=site_url).execute()
+            _resolved, _service, sitemaps = await _call_with_stale_retry(
+                site_url=site_url, account_alias=account_alias, api_call=_do,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_get_sitemaps"),
+                response_format=response_format,
+            )
 
         raw = sitemaps.get("sitemap") or []
         if not raw:
@@ -1376,7 +2288,11 @@ async def gsc_get_sitemaps(site_url: str, response_format: str = "markdown") -> 
 
 @mcp.tool()
 async def gsc_inspect_url_enhanced(
-    site_url: str, page_url: str, response_format: str = "markdown"
+    site_url: str,
+    page_url: str,
+    response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Inspect a single URL's indexing status + rich results in Google.
     Pick me for one URL; use `gsc_batch_url_inspection` for up to 10 URLs
@@ -1387,6 +2303,7 @@ async def gsc_inspect_url_enhanced(
             for domain properties).
         page_url: The URL to inspect.
         response_format: "markdown" (default) or "json".
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     fmt = str(response_format or "").strip().lower()
     if fmt not in ("markdown", "json"):
@@ -1396,16 +2313,25 @@ async def gsc_inspect_url_enhanced(
         )
 
     try:
-        service = get_gsc_service()
-
         request = {"inspectionUrl": page_url, "siteUrl": site_url}
 
         async with _instrument(
             "gsc_inspect_url_enhanced",
             site_url=site_url,
             page_url=page_url,
+            account_alias=account_alias,
         ):
-            response = service.urlInspection().index().inspect(body=request).execute()
+            try:
+                def _do(svc):
+                    return svc.urlInspection().index().inspect(body=request).execute()
+                _resolved, _service, response = await _call_with_stale_retry(
+                    site_url=site_url, account_alias=account_alias, api_call=_do,
+                )
+            except AccountResolverError as e:
+                return _format_error(
+                    e.to_envelope(tool="gsc_inspect_url_enhanced"),
+                    response_format=fmt,
+                )
 
         if not response or "inspectionResult" not in response:
             if fmt == "json":
@@ -1560,6 +2486,8 @@ async def gsc_batch_url_inspection(
     offset: int = 0,
     limit: int = 10,
     response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Inspect up to 10 URLs in batch (URL Inspection API quota limit).
     Pick me when you have several URLs and want the same 4-field
@@ -1666,7 +2594,15 @@ async def gsc_batch_url_inspection(
             )
 
         # --- Phase 2: authenticate and inspect ---
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_batch_url_inspection"),
+                response_format=fmt,
+            )
 
         # Telemetry: emit tool_enter/tool_exit around the batch as a
         # whole, not per URL (per-URL would drown the batch-latency
@@ -1817,7 +2753,11 @@ async def gsc_batch_url_inspection(
 
 @mcp.tool()
 async def gsc_check_indexing_issues(
-    site_url: str, urls: str, response_format: str = "markdown"
+    site_url: str,
+    urls: str,
+    response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Bucket up to 10 URLs by indexing problem (not-indexed, canonical
     conflict, robots-blocked, fetch failure, indexed). Pick me when you
@@ -1844,8 +2784,6 @@ async def gsc_check_indexing_issues(
         return msg
 
     try:
-        service = get_gsc_service()
-
         url_list = [url.strip() for url in urls.split('\n') if url.strip()]
 
         if not url_list:
@@ -1856,12 +2794,23 @@ async def gsc_check_indexing_issues(
                 f"Too many URLs provided ({len(url_list)}). Please limit to 10 URLs per batch to avoid API quota issues."
             )
 
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_check_indexing_issues"),
+                response_format=fmt,
+            )
+
         _batch_start = time.perf_counter()
         _log(
             "tool_enter",
             tool="gsc_check_indexing_issues",
             site_url=site_url,
             url_count=len(url_list),
+            account_alias=account_alias,
         )
 
         # Structured buckets. Each entry carries enough context to
@@ -2016,6 +2965,8 @@ async def gsc_get_performance_overview(
     site_url: str,
     days: int = 28,
     response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Totals-plus-daily-trend snapshot for a GSC property. Pick me for a
     quick "how is my site doing?" read; use `gsc_get_search_analytics`
@@ -2025,11 +2976,20 @@ async def gsc_get_performance_overview(
         site_url: GSC site URL (exact match).
         days: Look-back window (default 28, clamped to min 1).
         response_format: `markdown` (default) | `csv` | `json`.
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
         days = max(int(days), 1)
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_get_performance_overview"),
+                response_format=response_format,
+            )
 
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=days)
@@ -2150,6 +3110,8 @@ async def gsc_get_advanced_search_analytics(
     filter_operator: str = "contains",
     filter_expression: str = None,
     response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """GSC search analytics with sorting, filtering, and pagination. Pick me
     when you need more than a plain top-N summary; use `gsc_get_search_analytics`
@@ -2176,7 +3138,15 @@ async def gsc_get_advanced_search_analytics(
     try:
         row_limit = max(1, min(int(row_limit), 25000))
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_get_advanced_search_analytics"),
+                response_format=response_format,
+            )
 
         if not end_date:
             end_date = datetime.now().date().strftime("%Y-%m-%d")
@@ -2334,6 +3304,7 @@ async def gsc_compare_search_periods(
     *,
     upstream_row_limit: int = 500,
     response_format: str = "markdown",
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Compare GSC analytics between two time periods.
 
@@ -2353,7 +3324,15 @@ async def gsc_compare_search_periods(
     try:
         upstream_row_limit = max(1, min(int(upstream_row_limit), 25000))
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_compare_search_periods"),
+                response_format=response_format,
+            )
 
         dimension_list = [d.strip() for d in dimensions.split(",")]
 
@@ -2499,6 +3478,8 @@ async def gsc_get_search_by_page_query(
     row_limit: int = 20,
     response_format: str = "markdown",
     include_summary: Optional[bool] = None,
+    *,
+    account_alias: Optional[str] = None,
 ):
     """Break down GSC queries for a single page. Pick me when you already
     know which URL you want to analyse; use `gsc_get_search_analytics` for
@@ -2555,7 +3536,14 @@ async def gsc_get_search_by_page_query(
             effective_days = max(1, int(days))
             effective_row_limit = max(1, min(int(row_limit), 25000))
 
-            service = get_gsc_service()
+            try:
+                _resolved_alias, service = await get_gsc_service_for_site(
+                    site_url, account_alias,
+                )
+            except AccountResolverError as e:
+                # Markdown branch — caller expects a plain string starting "Error:".
+                env = e.to_envelope(tool="gsc_get_search_by_page_query")
+                return f"Error retrieving page query data: {env['error']}"
 
             # Calculate date range
             end_date = datetime.now().date()
@@ -2583,6 +3571,7 @@ async def gsc_get_search_by_page_query(
                 page_url=page_url,
                 mode="markdown",
                 row_limit=effective_row_limit,
+                account_alias=account_alias,
             ):
                 response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
 
@@ -2625,7 +3614,12 @@ async def gsc_get_search_by_page_query(
         effective_days = max(1, int(days))
         effective_row_limit = max(1, min(int(row_limit), 25000))
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return e.to_envelope(tool="gsc_get_search_by_page_query")
 
         end_date = datetime.now().date()
         start_date = end_date - timedelta(days=effective_days)
@@ -2734,6 +3728,8 @@ async def gsc_get_landing_page_summary(
     low_ctr_ratio: float = 0.5,
     country: Optional[str] = None,
     device: Optional[str] = None,
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Compact top-N landing pages for a GSC property with striking-distance
     and high-impression/low-CTR flags. Returns a dict (~2k tokens) so
@@ -2783,7 +3779,12 @@ async def gsc_get_landing_page_summary(
         except ValueError as e:
             return {"ok": False, "error": str(e), "tool": "gsc_get_landing_page_summary"}
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return e.to_envelope(tool="gsc_get_landing_page_summary")
 
         # Build common filter group (country + device) if needed.
         filter_group: Optional[Dict[str, Any]] = None
@@ -2903,6 +3904,8 @@ async def gsc_compare_periods_landing_pages(
     decay_threshold_pct: float = -0.20,
     sort_by: str = "clicks_delta",
     sort_direction: str = "asc",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """Landing-page period-vs-period diff with decay_flag for content-rot
     detection. 2 API calls (one per period), join on page URL, sort
@@ -2960,7 +3963,12 @@ async def gsc_compare_periods_landing_pages(
                 "tool": "gsc_compare_periods_landing_pages",
             }
 
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return e.to_envelope(tool="gsc_compare_periods_landing_pages")
 
         def _query(start: str, end: str) -> List[Dict[str, Any]]:
             req = {
@@ -3099,6 +4107,8 @@ async def gsc_list_sitemaps_enhanced(
     site_url: str,
     sitemap_index: str = None,
     response_format: str = "markdown",
+    *,
+    account_alias: Optional[str] = None,
 ) -> Any:
     """List submitted sitemaps for a GSC property with submission +
     download timestamps, type, URL counts, and error/warning totals.
@@ -3109,9 +4119,18 @@ async def gsc_list_sitemaps_enhanced(
         site_url: GSC site URL (exact match).
         sitemap_index: Optional sitemap-index URL to list its children.
         response_format: `markdown` (default) | `csv` | `json`.
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_list_sitemaps_enhanced"),
+                response_format=response_format,
+            )
 
         if sitemap_index:
             sitemaps = service.sitemaps().list(
@@ -3226,19 +4245,32 @@ async def gsc_list_sitemaps_enhanced(
         )
 
 @mcp.tool()
-async def gsc_get_sitemap_details(site_url: str, sitemap_url: str) -> str:
+async def gsc_get_sitemap_details(
+    site_url: str,
+    sitemap_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     Get detailed information about a specific sitemap.
-    
+
     Args:
         site_url: The URL of the site in Search Console (must be exact match)
         sitemap_url: The full URL of the sitemap to inspect
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
-        service = get_gsc_service()
-        
-        # Get sitemap details
-        details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+        try:
+            def _do(svc):
+                return svc.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+            _resolved, _service, details = await _call_with_stale_retry(
+                site_url=site_url, account_alias=account_alias, api_call=_do,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_get_sitemap_details"),
+                response_format="markdown",
+            )
         
         if not details:
             return f"No details found for sitemap {sitemap_url}."
@@ -3302,17 +4334,31 @@ async def gsc_get_sitemap_details(site_url: str, sitemap_url: str) -> str:
         return _format_error(env, response_format="markdown")
 
 @mcp.tool()
-async def gsc_submit_sitemap(site_url: str, sitemap_url: str) -> str:
+async def gsc_submit_sitemap(
+    site_url: str,
+    sitemap_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     Submit a new sitemap or resubmit an existing one to Google.
-    
+
     Args:
         site_url: The URL of the site in Search Console (must be exact match)
         sitemap_url: The full URL of the sitemap to submit
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
-        service = get_gsc_service()
-        
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_submit_sitemap"),
+                response_format="markdown",
+            )
+
         # Submit the sitemap
         service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute()
         
@@ -3362,16 +4408,30 @@ async def gsc_submit_sitemap(site_url: str, sitemap_url: str) -> str:
         )
 
 @mcp.tool()
-async def gsc_delete_sitemap(site_url: str, sitemap_url: str) -> str:
+async def gsc_delete_sitemap(
+    site_url: str,
+    sitemap_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     Delete (unsubmit) a sitemap from Google Search Console.
-    
+
     Args:
         site_url: The URL of the site in Search Console (must be exact match)
         sitemap_url: The full URL of the sitemap to delete
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
-        service = get_gsc_service()
+        try:
+            _resolved_alias, service = await get_gsc_service_for_site(
+                site_url, account_alias,
+            )
+        except AccountResolverError as e:
+            return _format_error(
+                e.to_envelope(tool="gsc_delete_sitemap"),
+                response_format="markdown",
+            )
 
         # Pre-check: if the sitemap isn't registered, short-circuit to an
         # idempotent "already deleted" message rather than surfacing an
@@ -3413,36 +4473,44 @@ async def gsc_delete_sitemap(site_url: str, sitemap_url: str) -> str:
         )
 
 @mcp.tool()
-async def gsc_manage_sitemaps(site_url: str, action: str, sitemap_url: str = None, sitemap_index: str = None) -> str:
+async def gsc_manage_sitemaps(
+    site_url: str,
+    action: str,
+    sitemap_url: str = None,
+    sitemap_index: str = None,
+    *,
+    account_alias: Optional[str] = None,
+) -> str:
     """
     All-in-one tool to manage sitemaps (list, get details, submit, delete).
-    
+
     Args:
         site_url: The URL of the site in Search Console (must be exact match)
         action: The action to perform (list, details, submit, delete)
         sitemap_url: The full URL of the sitemap (required for details, submit, delete)
         sitemap_index: Optional sitemap index URL for listing child sitemaps (only used with 'list' action)
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     try:
         # Validate inputs
         action = action.lower().strip()
         valid_actions = ["list", "details", "submit", "delete"]
-        
+
         if action not in valid_actions:
             return f"Invalid action: {action}. Please use one of: {', '.join(valid_actions)}"
-        
+
         if action in ["details", "submit", "delete"] and not sitemap_url:
             return f"The {action} action requires a sitemap_url parameter."
-        
-        # Perform the requested action
+
+        # Perform the requested action (pass account_alias through to inner tools).
         if action == "list":
-            return await gsc_list_sitemaps_enhanced(site_url, sitemap_index)
+            return await gsc_list_sitemaps_enhanced(site_url, sitemap_index, account_alias=account_alias)
         elif action == "details":
-            return await gsc_get_sitemap_details(site_url, sitemap_url)
+            return await gsc_get_sitemap_details(site_url, sitemap_url, account_alias=account_alias)
         elif action == "submit":
-            return await gsc_submit_sitemap(site_url, sitemap_url)
+            return await gsc_submit_sitemap(site_url, sitemap_url, account_alias=account_alias)
         elif action == "delete":
-            return await gsc_delete_sitemap(site_url, sitemap_url)
+            return await gsc_delete_sitemap(site_url, sitemap_url, account_alias=account_alias)
 
     except Exception as e:
         # Dispatcher-level safety net. The underlying tools handle
@@ -3489,31 +4557,114 @@ def _read_account_scopes(token_file_relative: Optional[str]) -> List[str]:
 
 
 @mcp.tool()
-async def gsc_list_accounts() -> str:
+async def gsc_list_accounts(
+    include_properties: bool = False,
+    response_format: str = "markdown",
+) -> Any:
     """
-    Lists all configured Google accounts with their aliases, emails, active
-    status, and granted OAuth scopes.
+    Lists all configured Google accounts with their aliases, emails, and
+    granted OAuth scopes.
+
+    In v1.2.0+ there is no "active account" concept — routing is per-call
+    via site_url auto-resolution or an explicit account_alias argument on
+    the tool.
+
+    Args:
+        include_properties: When True, also returns each account's
+            ``properties[]`` list (site URLs it can see). Default False
+            for privacy + speed — enumerating properties across every
+            configured account can leak cross-client information and
+            requires N discovery calls. Always returns ``property_count``
+            in JSON mode (from cache if warm; null if not).
+        response_format: ``markdown`` (default) | ``json``.
     """
+    fmt = str(response_format or "").strip().lower()
+    if fmt not in ("markdown", "json"):
+        return (
+            "Error listing accounts: "
+            f"response_format must be 'markdown' or 'json', got {response_format!r}"
+        )
+
     try:
         manifest = _load_manifest()
         accounts = manifest.get("accounts", {})
-        active = manifest.get("active_account")
 
         if not accounts:
+            if fmt == "json":
+                return {
+                    "ok": True,
+                    "tool": "gsc_list_accounts",
+                    "accounts": [],
+                    "meta": {"account_count": 0},
+                }
             return (
                 "No accounts configured.\n\n"
-                "Use `gsc_add_account` to add a Google account, or if you have an existing "
-                "token.json it will be auto-migrated on next server restart."
+                "Use `gsc_add_account` to add a Google account."
             )
 
+        # Optionally warm the property cache (one non-interactive call
+        # per account). Errors-per-alias don't abort the whole listing.
+        if include_properties:
+            await asyncio.gather(
+                *(_ensure_property_cache(a) for a in accounts),
+                return_exceptions=True,
+            )
+
+        aliases_sorted = sorted(accounts.keys())
+
+        if fmt == "json":
+            payload: List[Dict[str, Any]] = []
+            for alias in aliases_sorted:
+                info = accounts[alias]
+                entry: Dict[str, Any] = {
+                    "alias": alias,
+                    "email": info.get("email"),
+                    "added_at": info.get("added_at"),
+                    "scopes": _read_account_scopes(info.get("token_file")),
+                }
+                # property_count: from cache if warm, else null.
+                if _account_property_state.get(alias) == "ok":
+                    entry["property_count"] = len(_account_properties.get(alias, set()))
+                else:
+                    entry["property_count"] = None
+                if include_properties:
+                    entry["properties"] = sorted(
+                        _account_properties.get(alias, set())
+                    ) if _account_property_state.get(alias) == "ok" else None
+                    entry["discovery_state"] = _account_property_state.get(alias, "never")
+                    if _account_property_state.get(alias) == "error":
+                        entry["discovery_error"] = _account_property_error.get(alias)
+                payload.append(entry)
+            return {
+                "ok": True,
+                "tool": "gsc_list_accounts",
+                "accounts": payload,
+                "meta": {
+                    "account_count": len(payload),
+                    "include_properties": include_properties,
+                },
+            }
+
+        # Markdown rendering.
         lines = ["# Google Search Console Accounts\n"]
-        for alias, info in sorted(accounts.items()):
-            marker = " **(active)**" if alias == active else ""
+        for alias in aliases_sorted:
+            info = accounts[alias]
             email = info.get("email") or "unknown"
             added = info.get("added_at", "unknown")
-            lines.append(f"- **{alias}**{marker}: {email} (added {added})")
+            lines.append(f"- **{alias}**: {email} (added {added})")
             scopes = _read_account_scopes(info.get("token_file"))
             lines.append(f"  - scopes: {', '.join(scopes)}")
+            if _account_property_state.get(alias) == "ok":
+                count = len(_account_properties.get(alias, set()))
+                lines.append(f"  - property_count: {count}")
+            if include_properties and _account_property_state.get(alias) == "ok":
+                for site in sorted(_account_properties.get(alias, set())):
+                    lines.append(f"    - {site}")
+            elif include_properties and _account_property_state.get(alias) == "error":
+                lines.append(
+                    f"  - discovery error: "
+                    f"{_account_property_error.get(alias, 'unknown')}"
+                )
 
         lines.append(f"\nTotal: {len(accounts)} account(s)")
         return "\n".join(lines)
@@ -3524,46 +4675,91 @@ async def gsc_list_accounts() -> str:
                 hint="Check that the accounts manifest exists and is readable.",
                 tool="gsc_list_accounts",
             ),
-            response_format="markdown",
+            response_format=fmt,
         )
 
 
 @mcp.tool()
-async def gsc_get_active_account() -> str:
+async def gsc_whoami(site_url: str) -> Any:
     """
-    Shows the currently active Google account alias and email.
-    All GSC operations use the active account's credentials.
+    Diagnostic: show which account would serve ``site_url`` without
+    actually running a GSC API call. Useful for pre-flight checks in
+    agent workflows that want to verify routing before an expensive
+    analytics call.
+
+    Returns a JSON envelope (no markdown mode — this is a structured
+    diagnostic). On unique resolution, ``resolved_account`` names the
+    alias and ``alternatives`` is empty. On ambiguous, ``resolved_account``
+    is null and ``alternatives`` lists the candidates.
+
+    Args:
+        site_url: GSC property URL (exact match).
     """
-    # Instrumentation wraps the body ONLY — exception handling sits
-    # outside so _instrument sees the original exception (tool_error
-    # log emitted) before we convert it to a user-facing string.
     try:
-        async with _instrument("gsc_get_active_account"):
-            global _active_account
-            if _active_account is None:
-                manifest = _load_manifest()
-                _active_account = manifest.get("active_account")
-
-            if _active_account is None:
-                return "No active account. Use `gsc_add_account` to add one, or existing token.json will be used as fallback."
-
-            manifest = _load_manifest()
-            acct = manifest.get("accounts", {}).get(_active_account)
-            if not acct:
-                return f"Active account '{_active_account}' not found in manifest. Use `gsc_list_accounts` to see available accounts."
-
-            email = acct.get("email") or "unknown"
-            return f"Active account: **{_active_account}** ({email})"
+        resolved = await _resolve_account(site_url, None)
+        return {
+            "ok": True,
+            "tool": "gsc_whoami",
+            "site_url": site_url,
+            "resolved_account": resolved,
+            "alternatives": [],
+            "meta": {"site_url": site_url},
+        }
+    except AccountResolverError as e:
+        if e.code == ErrorCode.AMBIGUOUS_ACCOUNT:
+            return {
+                "ok": True,
+                "tool": "gsc_whoami",
+                "site_url": site_url,
+                "resolved_account": None,
+                "alternatives": e.alternatives or [],
+                "meta": {"site_url": site_url, "ambiguous": True},
+            }
+        return e.to_envelope(tool="gsc_whoami")
     except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="If the accounts manifest is corrupted, run "
-                     "`gsc_list_accounts` to inspect available aliases.",
-                tool="gsc_get_active_account",
-            ),
-            response_format="markdown",
+        return _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint="Retry after a short backoff; check gsc_list_accounts if persistent.",
+            tool="gsc_whoami",
         )
+
+
+@mcp.tool()
+async def gsc_get_active_account() -> Any:
+    """
+    DEPRECATED (v1.2.0): the "active account" concept has been removed.
+    Routing is per-call via site_url auto-resolution or explicit
+    ``account_alias`` argument on each tool.
+
+    Returns an ``ok: false`` envelope with
+    ``error_code: DEPRECATED_TOOL`` so callers that forgot to update
+    notice. Use :func:`gsc_whoami` (needs a site_url) for routing
+    diagnostics, or :func:`gsc_list_accounts` for the account roster.
+    """
+    print(
+        "[gsc-mcp] DEPRECATED call: gsc_get_active_account. v1.2.0 has no "
+        "active-account concept. Use gsc_whoami(site_url=...) instead.",
+        file=sys.stderr, flush=True,
+    )
+    return _make_error_envelope(
+        error="gsc_get_active_account is deprecated; v1.2.0 has no active-account concept.",
+        error_code=ErrorCode.DEPRECATED_TOOL,
+        retryable=False,
+        hint=(
+            "Use gsc_whoami(site_url=...) to see which account will serve a "
+            "given property, or gsc_list_accounts to view all configured accounts."
+        ),
+        tool="gsc_get_active_account",
+        replacement={
+            # ``suggested_tool`` (not ``tool``) to avoid collision with
+            # the envelope-level ``tool`` field that names the deprecated
+            # caller. Agents branch on ``error_code == DEPRECATED_TOOL``
+            # and then read ``replacement.suggested_tool`` to learn
+            # which tool to migrate to.
+            "suggested_tool": "gsc_whoami",
+            "example": "gsc_whoami(site_url='sc-domain:example.com')",
+        },
+    )
 
 
 @mcp.tool()
@@ -3580,6 +4776,21 @@ async def gsc_add_account(alias: str) -> str:
         alias = _validate_alias(alias)
     except ValueError as e:
         return f"Invalid alias: {str(e)}"
+
+    # v1.2.0: the 'default' alias is reserved. Pre-v1.2.0 installs used
+    # it as a placeholder for the migrated legacy token; keeping it
+    # creatable would let users re-introduce the exact footgun this
+    # refactor removes (a reserved-sounding alias with unclear routing).
+    if alias == "default":
+        return _format_error(
+            _make_error_envelope(
+                error="Alias 'default' is reserved and cannot be created.",
+                error_code=ErrorCode.BAD_REQUEST,
+                hint="Pick a meaningful alias (e.g. a client name or workspace).",
+                tool="gsc_add_account",
+            ),
+            response_format="markdown",
+        )
 
     try:
         manifest = _load_manifest()
@@ -3664,42 +4875,66 @@ async def gsc_add_account(alias: str) -> str:
 
 
 @mcp.tool()
-async def gsc_switch_account(alias: str) -> str:
+async def gsc_switch_account(alias: str) -> Any:
     """
-    Switches the active Google account. All subsequent GSC operations will use this account's credentials.
+    DEPRECATED (v1.2.0): state-changing account switches have been
+    removed — the class of bug this refactor exists to close off.
+    Routing is now per-call via site_url auto-resolution or explicit
+    ``account_alias`` argument on each tool.
+
+    Returns an ``ok: false`` envelope so callers that haven't updated
+    notice. The alias argument is still validated (so the error can
+    distinguish "unknown alias" from "stop calling this tool"), but no
+    server state is mutated.
 
     Args:
-        alias: The alias of the account to switch to. Use `gsc_list_accounts` to see available accounts.
+        alias: Unused; kept for call-signature compatibility with v1.1.x.
     """
+    print(
+        f"[gsc-mcp] DEPRECATED call: gsc_switch_account({alias!r}). "
+        f"v1.2.0 routes per-call via site_url / account_alias.",
+        file=sys.stderr, flush=True,
+    )
+    # Still validate the alias so a typo surfaces distinctly from the
+    # generic deprecation message.
     try:
         alias = _validate_alias(alias)
     except ValueError as e:
-        return f"Invalid alias: {str(e)}"
-
-    try:
-        manifest = _load_manifest()
-
-        if alias not in manifest.get("accounts", {}):
-            available = ", ".join(sorted(manifest.get("accounts", {}).keys())) or "none"
-            return f"Account '{alias}' not found. Available accounts: {available}"
-
-        manifest["active_account"] = alias
-        _save_manifest(manifest)
-
-        global _active_account
-        _active_account = alias
-
-        email = manifest["accounts"][alias].get("email") or "unknown"
-        return f"Switched to account '{alias}' ({email}). All GSC operations now use this account."
-    except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="Run `gsc_list_accounts` to see available aliases.",
-                tool="gsc_switch_account",
-            ),
-            response_format="markdown",
+        return _make_error_envelope(
+            error=f"gsc_switch_account is deprecated, AND the alias is invalid: {e}",
+            error_code=ErrorCode.DEPRECATED_TOOL,
+            retryable=False,
+            hint="Stop calling gsc_switch_account. Pass account_alias on each tool call.",
+            tool="gsc_switch_account",
         )
+    manifest = _load_manifest()
+    known_aliases = sorted(manifest.get("accounts", {}).keys())
+    extras = {
+        "replacement": {
+            # ``suggested_tool`` rather than ``tool`` — see note on
+            # gsc_get_active_account's deprecation envelope.
+            "suggested_tool": "<any site_url-taking tool>",
+            "example": "gsc_get_performance_overview(site_url=..., account_alias='chaser')",
+        },
+    }
+    if alias not in known_aliases:
+        extras["alternatives"] = known_aliases
+
+    return _make_error_envelope(
+        error=(
+            f"gsc_switch_account is deprecated and no longer changes server state "
+            f"(called with alias={alias!r})."
+        ),
+        error_code=ErrorCode.DEPRECATED_TOOL,
+        retryable=False,
+        hint=(
+            "Pass account_alias on each site_url tool call, or omit it and "
+            "let the server auto-resolve from site_url. See gsc_whoami(site_url=...) "
+            "for diagnostics."
+        ),
+        tool="gsc_switch_account",
+        **extras,
+    )
 
 
 @mcp.tool()
@@ -3760,7 +4995,11 @@ async def gsc_remove_account(alias: str) -> str:
 # --- Health check (Add 4) ---
 
 @mcp.tool()
-async def gsc_health_check(site_url: str) -> Any:
+async def gsc_health_check(
+    site_url: str,
+    *,
+    account_alias: Optional[str] = None,
+) -> Any:
     """
     One-shot diagnostic for a GSC property. Used at the start of every audit.
 
@@ -3772,6 +5011,7 @@ async def gsc_health_check(site_url: str) -> Any:
 
     Args:
         site_url: The GSC site URL (exact match, or sc-domain:example.com for domain properties).
+        account_alias: Optional explicit account; omit to auto-resolve.
     """
     result: Dict[str, Any] = {
         "ok": True,
@@ -3794,7 +5034,12 @@ async def gsc_health_check(site_url: str) -> Any:
     }
 
     try:
-        service = get_gsc_service()
+        _resolved_alias, service = await get_gsc_service_for_site(
+            site_url, account_alias,
+        )
+        result["account_alias"] = _resolved_alias
+    except AccountResolverError as e:
+        return e.to_envelope(tool="gsc_health_check")
     except HttpError as e:
         return _http_error_envelope(
             e, tool="gsc_health_check", site_url=site_url
@@ -3803,7 +5048,7 @@ async def gsc_health_check(site_url: str) -> Any:
         return _make_error_envelope(
             error=f"auth failed: {type(e).__name__}: {e}",
             hint="Check that `client_secrets.json` is present and that the "
-                 "active account has a valid token (see `gsc_get_active_account`).",
+                 "configured account has a valid token; see gsc_list_accounts.",
             tool="gsc_health_check",
         )
 

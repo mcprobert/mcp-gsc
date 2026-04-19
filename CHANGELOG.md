@@ -5,6 +5,156 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.2.0] — 2026-04-19 — Agent-first account resolution (BREAKING)
+
+**Breaking change.** The "active account" concept has been removed.
+Every tool that takes `site_url` now auto-resolves which configured
+account serves the request from the property itself. Callers that
+relied on `gsc_switch_account` sticking across calls will break —
+that was the root cause of two production incidents (silent reset on
+MCP restart producing 403s; race between concurrent agents
+stomping each other's routing decision). The fix is to remove the
+state, not to add discipline around managing it.
+
+### New
+
+- `gsc_whoami(site_url=...)` — diagnostic that returns which
+  configured account will serve a given property, without making a
+  real GSC call. Emits `{resolved_account, alternatives}`; on
+  ambiguity, `resolved_account: null` and `alternatives` lists
+  candidates.
+- `account_alias` keyword-only argument on 19 routed tools
+  (search-analytics family, URL inspection family, sitemap CRUD,
+  `gsc_health_check`, etc.). Omit for auto-resolve; pass explicitly
+  to disambiguate or force a specific account.
+- `gsc_list_accounts(include_properties=True)` enriches the listing
+  with each account's `properties[]` list and `property_count`.
+  Default remains False for privacy + speed.
+- `ErrorCode` taxonomy: stable string enum
+  (`ACCOUNT_SITE_MISMATCH`, `AMBIGUOUS_ACCOUNT`,
+  `NO_ACCOUNT_FOR_PROPERTY`, `ACCOUNT_RESOLUTION_INCOMPLETE`,
+  `AUTH_EXPIRED`, `PERMISSION_DENIED`, `QUOTA_EXCEEDED`,
+  `DEPRECATED_TOOL`, etc.). Error envelopes gain `error_code: str`
+  and `retryable: bool` fields; the stable codes are the canonical
+  decision pivot for agents (don't regex the `error` string).
+- `_build_service_noninteractive(alias)`: no browser OAuth, no token
+  deletion on refresh failure, no service-account fallback. Used by
+  the resolver and every routed tool.
+
+### Changed
+
+- `gsc_list_properties(account_alias=None)`: when omitted, lists
+  properties across every configured account and tags each row with
+  its source account. Pass `account_alias="..."` to restrict.
+- `gsc_add_site` uses a different code path (the resolver can't verify
+  a property that isn't yet in GSC): explicit alias → used as-is; no
+  alias + one account → auto-picks; no alias + multiple accounts →
+  `AMBIGUOUS_ACCOUNT`. On success, invalidates that alias's property
+  cache so the next read tool sees the new property.
+- Error envelope `hint` strings updated to reference `gsc_whoami` /
+  `gsc_list_accounts` rather than the deprecated
+  `gsc_get_active_account`.
+- `gsc_list_accounts` no longer renders an "active" marker.
+
+### Deprecated (removed in v1.3.0)
+
+- `gsc_switch_account(alias)` — returns `{ok:false,
+  error_code:"DEPRECATED_TOOL"}`. Still validates `alias` so a typo
+  surfaces distinctly. Mutates no state.
+- `gsc_get_active_account()` — returns `{ok:false,
+  error_code:"DEPRECATED_TOOL"}`. Use `gsc_whoami(site_url=...)`.
+
+### Migration (v1.1.x → v1.2.0)
+
+- Manifest alias `default` → renamed in-place to `legacy` on first
+  startup (`legacy_<timestamp>` on collision). Token file path is
+  left untouched — no filesystem churn; the alias is a pure
+  user-facing label.
+- Bare legacy `token.json` next to the script → copied to
+  `accounts/legacy/token.json` with alias `legacy` (previously was
+  `accounts/default/token.json` with alias `default`). Original
+  `token.json` preserved for rollback.
+- `active_account` field dropped from the manifest on first save;
+  silently ignored on read for back-compat.
+- `gsc_add_account("default")` now rejected with `BAD_REQUEST`.
+
+### Safety contract for routed calls
+
+The resolver + `_build_service_noninteractive` enforce three
+invariants that the review specifically flagged as regression risks:
+
+1. No service-account fallback on the alias-routed path — would be
+   a confused-deputy bug (silently satisfying an alias-routed call
+   with different credentials).
+2. No browser OAuth in the discovery / routed-call path — would
+   wedge an MCP stdio subprocess indefinitely.
+3. No token-file deletion on refresh failure — a transient network
+   error must not force a full manual re-auth.
+
+`gsc_add_account` keeps the interactive path it has always had; it's
+the single tool where a browser prompt is legitimate.
+
+### Resolver cache
+
+In-memory tri-state per alias (`never | ok | error`) — transient
+discovery failures do NOT get conflated with "known empty" (that
+would convert a 500 into a false `NO_ACCOUNT_FOR_PROPERTY` or
+`ACCOUNT_SITE_MISMATCH`). Per-alias `asyncio.Lock` keeps concurrent
+refreshes from fighting each other. Stale-positive 403 on the
+auto-resolved path triggers one invalidate-and-re-resolve retry.
+
+### Tests
+
+- `tests/test_account_resolution.py` — resolver unit tests (19)
+- `tests/test_noninteractive_auth.py` — auth-safety contract (11)
+- `tests/test_gsc_whoami.py` — diagnostic tool (4)
+- `tests/test_list_accounts_enriched.py` — enrichment shape (8)
+- `tests/test_positional_compatibility.py` — keyword-only
+  `account_alias` can't clobber old positional args (30)
+- `tests/test_403_reresolve.py` — stale-positive recovery (4)
+- `tests/test_add_site_special_case.py` — add-site routing (5)
+- `tests/test_migration_default_rename.py` — default→legacy (6)
+- `tests/test_conftest_shim.py` — loud-failure gate on forgotten test setup (1)
+
+Total: 426 tests passing.
+
+### Pre-release review remediation (F11–F17)
+
+The v1.2.0 diff went through two review passes before cutting the
+release. The pre-implementation pass (open-gem `think_deeper`) caught
+four regression risks baked into the plan — keyword-only placement,
+`gsc_add_site` resolver bypass, error-state false-uniqueness,
+service-account fallback — all addressed in the primary implementation.
+The post-implementation review caught seven further issues:
+
+- **F11 (High)** `AUTH_EXPIRED` no longer retryable by default. Four
+  of five emission sites are strictly non-retryable (corrupt/missing
+  token, missing refresh token, expired creds without refresh). Agents
+  auto-retrying on these would spin. The one transient site — token
+  race between discovery and use in `get_gsc_service_for_site` — opts
+  in via `retryable=True` explicitly.
+- **F12** `_make_error_envelope` now raises `TypeError` if
+  `**extras` overlaps with core envelope fields. Prevents future
+  caller bugs that would silently flip `ok=True` on error envelopes.
+- **F13** Rewrote a stale comment in `_ensure_property_cache` that
+  claimed we preserved a "last-known-good" snapshot on discovery
+  failure; in fact we deliberately don't, to avoid confused-deputy
+  risk from a revoked property reading as "reachable via stale alias".
+- **F14** `_migrate_legacy_state` collision fallback now counter-loops
+  (`legacy_<ts>_1`, `_2`, ...) instead of single-shotting the
+  timestamp; closes a sub-second race window.
+- **F15** `replacement.tool` → `replacement.suggested_tool` in both
+  deprecation envelopes, removing the visual collision with the
+  envelope-level `tool` field that names the deprecated caller.
+- **F16** The conftest shim's legacy fallback now gates on
+  identity-matching the original `get_gsc_service`. New tests that
+  forget BOTH manifest setup AND the patch surface
+  `NO_ACCOUNTS_CONFIGURED` loudly — previously limped through to a
+  misleading OAuth-setup error.
+- **F17** Two helper docstrings (`_invalidate_property_cache`,
+  `_list_configured_aliases`) tightened to emphasise WHY over WHAT
+  per the CLAUDE.md steer.
+
 ## [1.1.1] — 2026-04-19 — F1 completion + reviewer-note correction
 
 Closes the gap the analyst flagged when re-verifying v1.1.0: six of
