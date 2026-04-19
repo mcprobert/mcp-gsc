@@ -5,6 +5,72 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.2.1] — 2026-04-19 — Post-analyst review residuals
+
+Non-breaking patch closing out the two residuals the CMO analyst
+flagged while verifying v1.2.0 against its acceptance criteria
+(nine-for-nine pass; verdict "ship"). The same sweep surfaced a
+live production finding — `sc-domain:chaserhq.com` was accessible
+from two accounts, and the pre-refactor server silently routed to
+whichever won the global-state race. The new `AMBIGUOUS_ACCOUNT`
+error caught it on first probe. That's the v1.2.0 refactor's
+safety value made real; this patch is cleanup alongside.
+
+### Added
+
+- `gsc_list_properties(response_format="markdown"|"json")`. JSON
+  mode emits the standard `_format_table` envelope — `{ok, columns,
+  rows, row_count, truncated, truncation_hint, meta}` — with columns
+  `account`, `site_url`, `permission` and meta including
+  `total_available`, `accounts_queried`, `partial_failures`. Every
+  other tabular tool already had this; `gsc_list_properties` had
+  lagged. Markdown remains the default (back-compat).
+- JSON mode always tags rows with `account` for machine-readability,
+  even when only one account is queried. Markdown drops the tag in
+  the single-account case for human compactness.
+
+### Changed
+
+- `gsc_list_properties` return annotation `-> str` → `-> Any` to
+  support the dual-format return. Safe per the FastMCP return-type
+  pin in `tests/test_envelope_annotations.py`.
+- `gsc_add_account` docstring: removed stale "becomes the active
+  account" copy that survived the v1.2.0 refactor; replaced with a
+  description of per-call routing and a note that `default` is a
+  reserved alias.
+- `get_gsc_service_oauth` docstring: removed "active account →
+  legacy fallback" wording; clarified this path is now only for the
+  interactive `gsc_add_account` OAuth flow (routed tool calls go via
+  `_build_service_noninteractive`).
+
+### Out of scope (flagged for later)
+
+- `gsc_remove_account` still contains runtime strings referencing
+  "Active account is now '{_active_account}'". That's functional
+  code, not docstring cleanup — defer to a targeted modernisation
+  pass. The user-facing footprint is zero (no production skill
+  reads that string to branch).
+- The `_active_account` module global stays. It's still consulted by
+  the legacy OAuth fallback in `get_gsc_service_oauth` for
+  back-compat reads of older manifests. Removal is a v1.3.0 concern
+  alongside the deprecated `gsc_switch_account` /
+  `gsc_get_active_account` hard-removal.
+
+### Tests
+
+435 passing (up from 426 at v1.2.0 release; +9 new in
+`tests/test_list_properties.py`).
+
+- `tests/test_list_properties.py` (new) — pins R1:
+  - `test_json_mode_returns_table_envelope`
+  - `test_json_mode_rows_tagged_with_account`
+  - `test_json_mode_respects_name_contains_filter`
+  - `test_json_mode_single_account_still_tags_rows_for_machine_readability`
+  - `test_json_mode_partial_failures_surface_in_meta`
+  - `test_json_mode_empty_manifest_returns_no_accounts_configured_envelope`
+  - `test_markdown_mode_is_default_and_unchanged` (regression pin)
+  - `test_invalid_response_format_returns_validation_string`
+
 ## [1.2.0] — 2026-04-19 — Agent-first account resolution (BREAKING)
 
 **Breaking change.** The "active account" concept has been removed.

@@ -1064,7 +1064,10 @@ def get_gsc_service():
 def get_gsc_service_oauth(token_file: Optional[str] = None):
     """
     Returns an authorized Search Console service object using OAuth.
-    Resolves token file: explicit param → active account → legacy fallback.
+    Resolves token file from explicit param; otherwise consults the
+    manifest for the legacy fallback. Retained for the interactive
+    OAuth path of ``gsc_add_account``; routed tool calls go through
+    ``_build_service_noninteractive`` instead.
     """
     if token_file is None:
         token_file = _get_active_token_file()
@@ -1651,34 +1654,58 @@ def _build_service_noninteractive(alias: str) -> Tuple[Optional[Any], Optional[s
 async def gsc_list_properties(
     name_contains: Optional[str] = None,
     limit: int = 50,
+    response_format: str = "markdown",
     *,
     account_alias: Optional[str] = None,
-) -> str:
+) -> Any:
     """List GSC properties visible to one or all configured accounts.
 
     v1.2.0: when ``account_alias`` is omitted this lists properties
     across every configured account, tagging each row with its source
     account so agents can see the full coverage in one call.
 
+    v1.2.1: ``response_format='json'`` emits the standard tabular
+    envelope (``{ok, columns, rows, row_count, truncated, meta}``) so
+    orchestrating agents don't have to parse markdown.
+
     Args:
         name_contains: Optional case-insensitive substring filter on the
-            site URL (e.g. `name_contains='whitehat'`). Use this first on
-            agency accounts with many properties.
+            site URL (e.g. ``name_contains='whitehat'``). Use this first
+            on agency accounts with many properties.
         limit: Max properties to return (default 50; clamped to [1, 1000]).
+        response_format: ``markdown`` (default) | ``json``. JSON mode
+            always tags rows with ``account`` for machine-readability
+            even when only one account is queried; markdown mode drops
+            the tag in the single-account case for human compactness.
         account_alias: Restrict to a single account. Omit for cross-
             account listing.
     """
+    fmt = str(response_format or "").strip().lower()
+    if fmt not in ("markdown", "json"):
+        return (
+            "Error listing properties: "
+            f"response_format must be 'markdown' or 'json', got {response_format!r}"
+        )
+
     try:
         async with _instrument(
             "gsc_list_properties",
             name_contains=name_contains,
             limit=limit,
             account_alias=account_alias,
+            response_format=fmt,
         ):
             limit = max(1, min(int(limit), 1000))
 
             aliases = _list_configured_aliases()
             if not aliases:
+                if fmt == "json":
+                    return _make_error_envelope(
+                        error="No accounts configured.",
+                        error_code=ErrorCode.NO_ACCOUNTS_CONFIGURED,
+                        hint="Use `gsc_add_account` to authorise a Google account.",
+                        tool="gsc_list_properties",
+                    )
                 return (
                     "No accounts configured.\n\n"
                     "Use `gsc_add_account` to authorise a Google account."
@@ -1694,7 +1721,7 @@ async def gsc_list_properties(
                             error_code=ErrorCode.BAD_REQUEST,
                             tool="gsc_list_properties",
                         ),
-                        response_format="markdown",
+                        response_format=fmt,
                     )
                 if chosen not in aliases:
                     return _format_error(
@@ -1705,7 +1732,7 @@ async def gsc_list_properties(
                             tool="gsc_list_properties",
                             alternatives=aliases,
                         ),
-                        response_format="markdown",
+                        response_format=fmt,
                     )
                 targets = [chosen]
             else:
@@ -1714,14 +1741,17 @@ async def gsc_list_properties(
             # Discover per-account sites (non-interactive). Failures are
             # tolerated per-account so one bad token doesn't break the
             # whole listing — the failed alias just gets an annotation.
-            rows: List[Tuple[str, str, str]] = []  # (alias, site_url, permission)
-            partial_failures: List[Tuple[str, str]] = []  # (alias, error_code)
+            rows: List[Dict[str, Any]] = []
+            partial_failures: List[Dict[str, str]] = []
             for alias in targets:
                 service, err_code = await asyncio.to_thread(
                     _build_service_noninteractive, alias,
                 )
                 if service is None:
-                    partial_failures.append((alias, err_code or ErrorCode.INTERNAL_ERROR))
+                    partial_failures.append({
+                        "account": alias,
+                        "error_code": err_code or ErrorCode.INTERNAL_ERROR,
+                    })
                     continue
                 try:
                     site_list = await asyncio.to_thread(
@@ -1732,19 +1762,36 @@ async def gsc_list_properties(
                         getattr(e.resp, "status", None) or 0,
                         ErrorCode.INTERNAL_ERROR,
                     )
-                    partial_failures.append((alias, code))
+                    partial_failures.append({"account": alias, "error_code": code})
                     continue
                 for site in site_list.get("siteEntry", []) or []:
                     site_url = site.get("siteUrl", "")
                     if name_contains and name_contains.lower() not in site_url.lower():
                         continue
-                    rows.append((
-                        alias,
-                        site_url,
-                        site.get("permissionLevel", "Unknown permission"),
-                    ))
+                    rows.append({
+                        "account": alias,
+                        "site_url": site_url,
+                        "permission": site.get("permissionLevel", "Unknown permission"),
+                    })
 
             if not rows and not partial_failures:
+                if fmt == "json":
+                    return _format_table(
+                        [],
+                        [
+                            {"key": "account", "display": "Account", "type": "str"},
+                            {"key": "site_url", "display": "Site URL", "type": "str"},
+                            {"key": "permission", "display": "Permission", "type": "str"},
+                        ],
+                        response_format="json",
+                        meta={
+                            "total_available": 0,
+                            "limit": limit,
+                            "name_contains": name_contains,
+                            "accounts_queried": targets,
+                            "partial_failures": [],
+                        },
+                    )
                 if name_contains:
                     return f"No Search Console properties matching {name_contains!r}."
                 return "No Search Console properties found."
@@ -1753,13 +1800,38 @@ async def gsc_list_properties(
             truncated = total_available > limit
             shown = rows[:limit]
 
+            if fmt == "json":
+                return _format_table(
+                    shown,
+                    [
+                        {"key": "account", "display": "Account", "type": "str"},
+                        {"key": "site_url", "display": "Site URL", "type": "str"},
+                        {"key": "permission", "display": "Permission", "type": "str"},
+                    ],
+                    response_format="json",
+                    truncated=truncated,
+                    truncation_hint=(
+                        f"Showing first {limit} of {total_available}. "
+                        f"Pass name_contains='…' to filter or raise limit "
+                        f"(max 1000)."
+                    ) if truncated else "",
+                    meta={
+                        "total_available": total_available,
+                        "limit": limit,
+                        "name_contains": name_contains,
+                        "accounts_queried": targets,
+                        "partial_failures": partial_failures,
+                    },
+                )
+
+            # Markdown path (unchanged semantics).
             lines: List[str] = []
             # Only tag rows with the account when listing across
             # multiple accounts, to keep single-account output compact.
             tag_account = len(targets) > 1
-            for alias, site_url, permission in shown:
-                prefix = f"[{alias}] " if tag_account else ""
-                lines.append(f"- {prefix}{site_url} ({permission})")
+            for row in shown:
+                prefix = f"[{row['account']}] " if tag_account else ""
+                lines.append(f"- {prefix}{row['site_url']} ({row['permission']})")
 
             if truncated:
                 lines.append("")
@@ -1772,8 +1844,8 @@ async def gsc_list_properties(
             if partial_failures:
                 lines.append("")
                 lines.append("Partial failures (not queried):")
-                for alias, err_code in partial_failures:
-                    lines.append(f"- {alias}: {err_code}")
+                for pf in partial_failures:
+                    lines.append(f"- {pf['account']}: {pf['error_code']}")
 
             return "\n".join(lines)
     except Exception as e:
@@ -1784,7 +1856,7 @@ async def gsc_list_properties(
                      "see gsc_list_accounts(include_properties=True).",
                 tool="gsc_list_properties",
             ),
-            response_format="markdown",
+            response_format=fmt,
         )
 
 @mcp.tool()
@@ -4766,11 +4838,19 @@ async def gsc_get_active_account() -> Any:
 async def gsc_add_account(alias: str) -> str:
     """
     Adds a new Google account. Opens a browser window for Google OAuth login.
-    The new account becomes the active account after successful authentication.
+
+    After authentication the alias is immediately available for use as
+    ``account_alias`` on any site_url-taking tool, or auto-resolves
+    from site_url when that property is reachable from exactly one
+    configured account. v1.2.0 removed the "active account" concept;
+    routing is per-call.
+
+    The alias ``default`` is reserved and will be rejected (it was a
+    placeholder in pre-v1.2.0 releases and is not user-facing any more).
 
     Args:
         alias: A short name for this account (lowercase alphanumeric and hyphens, 1-30 chars).
-               Examples: 'client-a', 'personal', 'agency-main'
+               Examples: 'client-a', 'personal', 'agency-main'.
     """
     try:
         alias = _validate_alias(alias)
