@@ -1,6 +1,6 @@
 [project]
 name = "mcp-gsc"
-version = "1.2.1"
+version = "1.2.2"
 description = "Google Search Console integration for Model Context Protocol (MCP)"
 readme = "README.md"
 requires-python = ">=3.11"

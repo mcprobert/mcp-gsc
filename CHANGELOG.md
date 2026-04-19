@@ -5,6 +5,63 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.2.2] — 2026-04-19 — gsc_remove_account cleanup + JSON-mode test coverage
+
+Non-breaking patch that closes out the last vestigial active-account
+code path and adds regression pins for three JSON-mode paths that the
+v1.2.1 review verified by inspection only.
+
+### Changed (behaviour)
+
+- `gsc_remove_account` stripped of all active-account manipulation:
+  - No longer checks `manifest["active_account"]` or picks a
+    replacement.
+  - No longer writes `active_account` back into the manifest
+    (any stale field left by a pre-v1.2.2 run is dropped on save).
+  - No longer updates the `_active_account` module global.
+  - Now invalidates the resolver's property cache for the removed
+    alias (belt-and-braces — previously implicit via the next
+    resolve).
+- Return string: `"Account '<alias>' removed. N account(s)
+  remaining."` (or the zero-remaining variant pointing at
+  `gsc_add_account`). Removes the misleading "Active account is
+  now '<x>'." message that referenced a concept the v1.2.0 refactor
+  had already deleted.
+
+### Added (tests)
+
+439 passing (up from 435 at v1.2.1 release; +4 net new).
+
+- `tests/test_list_properties.py::TestJsonModeErrorPaths` — three
+  regression pins for JSON-mode error-envelope paths:
+  - `test_json_mode_unknown_alias_returns_mismatch_envelope`
+  - `test_json_mode_invalid_alias_syntax_returns_bad_request`
+  - `test_json_mode_truncated_rows_emit_hint`
+- `tests/test_account_tools.py::TestRemoveAccount`:
+  - `test_happy_path_sets_new_active` renamed to
+    `test_happy_path_returns_remaining_count`; now asserts both the
+    new return-string shape AND that the string does NOT resurface
+    the dead "active account" concept.
+  - `test_happy_path_strips_stale_active_account_field` (new) —
+    pin that a pre-v1.2.2 manifest carrying `active_account` sees
+    the field dropped on the write.
+  - `test_last_account_removal_falls_back_to_legacy` renamed to
+    `test_last_account_removal_reports_zero_remaining`; asserts the
+    new zero-remaining return message points at `gsc_add_account`.
+
+### Fixed (docs)
+
+- v1.2.1 CHANGELOG entry's `meta` enumeration now lists `limit` and
+  `name_contains` alongside the other fields — reviewer-flagged
+  understatement corrected in place.
+
+### Deferred
+
+Still scheduled for v1.3.0 (gated on the skill library landing
+`account_alias` per-call): hard-removal of `gsc_switch_account`,
+`gsc_get_active_account`, the `_active_account` global, and the
+legacy OAuth fallback path in `get_gsc_service_oauth`.
+
 ## [1.2.1] — 2026-04-19 — Post-analyst review residuals
 
 Non-breaking patch closing out the two residuals the CMO analyst
@@ -22,7 +79,8 @@ safety value made real; this patch is cleanup alongside.
   mode emits the standard `_format_table` envelope — `{ok, columns,
   rows, row_count, truncated, truncation_hint, meta}` — with columns
   `account`, `site_url`, `permission` and meta including
-  `total_available`, `accounts_queried`, `partial_failures`. Every
+  `total_available`, `limit`, `name_contains`, `accounts_queried`,
+  `partial_failures`. Every
   other tabular tool already had this; `gsc_list_properties` had
   lagged. Markdown remains the default (back-compat).
 - JSON mode always tags rows with `account` for machine-readability,

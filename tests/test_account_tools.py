@@ -185,9 +185,11 @@ class TestRemoveAccount:
         out = await gsc_remove_account("nonexistent")
         assert "not found" in out
 
-    async def test_happy_path_sets_new_active(self, fake_accounts_home):
+    async def test_happy_path_returns_remaining_count(self, fake_accounts_home):
+        """v1.2.2: no more active-account manipulation. Return message
+        reports the remaining count; active_account field dropped from
+        the manifest on save."""
         Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
-            "active_account": "a",
             "accounts": {"a": {"alias": "a"}, "b": {"alias": "b"}},
         }))
         # Create directories so shutil.rmtree has something to remove.
@@ -196,18 +198,45 @@ class TestRemoveAccount:
 
         out = await gsc_remove_account("a")
         assert "Account 'a' removed" in out
-        assert "Active account is now 'b'" in out
+        assert "1 account(s) remaining" in out
+        # v1.2.2: string must NOT resurrect the dead "active account" concept.
+        assert "Active account" not in out
+        # Directory gone.
+        assert not (fake_accounts_home / "accounts" / "a").exists()
+        # Manifest no longer carries active_account.
+        manifest = json.loads((fake_accounts_home / "accounts" / "accounts.json").read_text())
+        assert "active_account" not in manifest
 
-    async def test_last_account_removal_falls_back_to_legacy(self, fake_accounts_home):
+    async def test_happy_path_strips_stale_active_account_field(self, fake_accounts_home):
+        """If a pre-v1.2.2 manifest still carries active_account (e.g. from
+        a v1.1.x snapshot whose migration hadn't run yet), remove_account
+        must drop it on the write."""
         Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
-            "active_account": "only",
+            "active_account": "a",  # stale field
+            "accounts": {"a": {"alias": "a"}, "b": {"alias": "b"}},
+        }))
+        (fake_accounts_home / "accounts" / "a").mkdir()
+        (fake_accounts_home / "accounts" / "b").mkdir()
+
+        await gsc_remove_account("a")
+
+        manifest = json.loads((fake_accounts_home / "accounts" / "accounts.json").read_text())
+        assert "active_account" not in manifest
+
+    async def test_last_account_removal_reports_zero_remaining(self, fake_accounts_home):
+        """v1.2.2: the "fall back to legacy token.json" hint is gone —
+        the resolver handles empty manifests with NO_ACCOUNTS_CONFIGURED
+        on the next call. The return string now points users at
+        gsc_add_account."""
+        Path(fake_accounts_home / "accounts" / "accounts.json").write_text(json.dumps({
             "accounts": {"only": {"alias": "only"}},
         }))
         (fake_accounts_home / "accounts" / "only").mkdir()
 
         out = await gsc_remove_account("only")
-        assert "No accounts remaining" in out
-        assert "legacy token.json" in out
+        assert "Account 'only' removed" in out
+        assert "No accounts configured" in out
+        assert "gsc_add_account" in out
 
     async def test_exception_renders_envelope(self, fake_accounts_home, monkeypatch):
         def _explode():

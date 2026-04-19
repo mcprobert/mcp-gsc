@@ -5021,10 +5021,17 @@ async def gsc_switch_account(alias: str) -> Any:
 async def gsc_remove_account(alias: str) -> str:
     """
     Removes a Google account and its stored credentials.
-    If the removed account was active, switches to the first remaining account.
+
+    v1.2.2: cleaned up vestigial active-account manipulation that
+    survived the v1.2.0 refactor. Removal now deletes the manifest
+    entry + token directory and nothing else — the resolver picks
+    per-call from site_url, so there's no "active" concept to keep
+    consistent. Any leftover ``active_account`` field in the manifest
+    is dropped on the write here.
 
     Args:
-        alias: The alias of the account to remove. Use `gsc_list_accounts` to see available accounts.
+        alias: The alias of the account to remove. Use `gsc_list_accounts`
+            to see available accounts.
     """
     try:
         alias = _validate_alias(alias)
@@ -5038,28 +5045,28 @@ async def gsc_remove_account(alias: str) -> str:
             available = ", ".join(sorted(manifest.get("accounts", {}).keys())) or "none"
             return f"Account '{alias}' not found. Available accounts: {available}"
 
-        # Remove account directory
+        # Remove account directory on disk.
         acct_dir = os.path.join(ACCOUNTS_DIR, alias)
         if os.path.isdir(acct_dir):
             shutil.rmtree(acct_dir)
 
-        # Remove from manifest
+        # Remove from manifest; also strip the vestigial active_account
+        # field if a pre-v1.2.2 run had re-persisted it.
         del manifest["accounts"][alias]
-
-        # If this was the active account, switch to first remaining or None
-        global _active_account
-        if manifest.get("active_account") == alias:
-            remaining = sorted(manifest.get("accounts", {}).keys())
-            new_active = remaining[0] if remaining else None
-            manifest["active_account"] = new_active
+        manifest.pop("active_account", None)
         _save_manifest(manifest)
-        # Always sync in-memory state from manifest
-        _active_account = manifest.get("active_account")
 
-        if _active_account:
-            return f"Account '{alias}' removed. Active account is now '{_active_account}'."
-        else:
-            return f"Account '{alias}' removed. No accounts remaining — GSC will fall back to legacy token.json if present."
+        # Invalidate the resolver's cache entry for this alias so a
+        # subsequent auto-resolve doesn't hit stale state.
+        _invalidate_property_cache(alias)
+
+        remaining_count = len(manifest.get("accounts", {}))
+        if remaining_count == 0:
+            return (
+                f"Account '{alias}' removed. No accounts configured; "
+                f"run gsc_add_account to add one."
+            )
+        return f"Account '{alias}' removed. {remaining_count} account(s) remaining."
     except Exception as e:
         return _format_error(
             _make_error_envelope(

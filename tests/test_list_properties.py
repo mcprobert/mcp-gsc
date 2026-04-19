@@ -192,3 +192,53 @@ class TestInvalidInput:
         assert isinstance(out, str)
         assert out.startswith("Error listing properties:")
         assert "markdown" in out and "json" in out
+
+
+class TestJsonModeErrorPaths:
+    """v1.2.2 coverage top-up: JSON-mode error envelopes. Previously
+    verified by inspection only. These tests pin the dict shape so a
+    future refactor that threads ``response_format`` wrongly would
+    surface as a loud failure rather than a silent markdown-fallback."""
+
+    async def test_json_mode_unknown_alias_returns_mismatch_envelope(self, monkeypatch):
+        _write_manifest({"a": {"alias": "a", "token_file": "t"}})
+        out = await gsc_list_properties(response_format="json", account_alias="ghost")
+        assert isinstance(out, dict), f"expected dict envelope, got {type(out).__name__}"
+        assert out["ok"] is False
+        assert out["error_code"] == ErrorCode.ACCOUNT_SITE_MISMATCH
+        assert "ghost" in out["error"]
+        assert out["alternatives"] == ["a"]
+        # Core envelope spine present.
+        assert out["tool"] == "gsc_list_properties"
+        assert "retryable" in out and "hint" in out
+
+    async def test_json_mode_invalid_alias_syntax_returns_bad_request(self):
+        # Must write a manifest first so the empty-manifest short-circuit
+        # doesn't intercept before alias validation runs.
+        _write_manifest({"a": {"alias": "a", "token_file": "t"}})
+        # Space is rejected by _validate_alias regex.
+        out = await gsc_list_properties(response_format="json", account_alias="BAD ALIAS")
+        assert isinstance(out, dict)
+        assert out["ok"] is False
+        assert out["error_code"] == ErrorCode.BAD_REQUEST
+        assert "alias" in out["error"].lower()
+
+    async def test_json_mode_truncated_rows_emit_hint(self, monkeypatch):
+        """When the result set exceeds ``limit``, JSON mode surfaces
+        ``truncated=True`` and a human-readable ``truncation_hint``
+        naming the row counts and the knobs for getting more."""
+        _write_manifest({"a": {"alias": "a", "token_file": "t"}})
+        sites = [
+            {"siteUrl": f"sc-domain:site{i}.com", "permissionLevel": "siteOwner"}
+            for i in range(60)
+        ]
+        monkeypatch.setattr(
+            gsc_server, "_build_service_noninteractive",
+            lambda alias: (_mock_service(sites), None),
+        )
+        out = await gsc_list_properties(limit=10, response_format="json")
+        assert out["truncated"] is True
+        assert out["row_count"] == 10
+        assert out["meta"]["total_available"] == 60
+        assert "10" in out["truncation_hint"]
+        assert out["meta"]["limit"] == 10
