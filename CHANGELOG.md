@@ -28,6 +28,13 @@ tools — the minor bump reflects that, with migration notes below.
   *Migration:* if you were reading `click_pct`, rename to `clicks_pct`
   and multiply by 100 for display. `None` replaces the `"N/A"` string.
 
+  *Note:* markdown rendering of `clicks_pct` now shows 2 decimal places
+  (e.g. `-58.30%`) instead of 1 (`-58.3%`), since the unified
+  `_format_table` `"pct"` column type already used 2 decimals for
+  sibling CTR columns in three older tools. Changing it globally to
+  1 decimal would regress that rendering; the drift is the lesser
+  trade. Consumers reading the JSON float are unaffected.
+
 - **F4 — `gsc_compare_search_periods.rows[].{p1,p2}_position` nullable**.
   When a query is present in one period but absent from the other,
   the missing side's position is now `null` instead of the sentinel
@@ -38,6 +45,11 @@ tools — the minor bump reflects that, with migration notes below.
 
   *Migration:* guard position reads with `is not None` before numeric
   comparison or arithmetic.
+
+  *Note:* rows with a present `keys` entry but a missing `position`
+  field also resolve to `null` now (previously `0`). In practice GSC
+  always populates `position`, so this secondary path is unreachable
+  — just aligns the two edge cases under the same null convention.
 
 - **F7 — sitemap URL counts are int, not string**. Both
   `gsc_get_sitemaps.rows[].indexed_urls` and
@@ -61,6 +73,14 @@ tools — the minor bump reflects that, with migration notes below.
   `summary`+`buckets` (where canonical_conflict/fetch_failure carry
   structured entries) for `check`. Programmatic consumers no longer
   need to regex-parse markdown.
+
+  *Incidental fix (not strictly part of F2):* `gsc_check_indexing_issues`
+  no longer appends spurious entries to the `fetch_failure` bucket
+  when the API omits `pageFetchState`. The pre-F2 guard
+  (`if fetch_state != "SUCCESSFUL"`) fired for empty strings too,
+  producing lines like `"{url} - "` with no state. The F2 refactor
+  added a truthiness check to skip that case. Latent bug; low
+  impact (GSC usually populates the field).
 
 - **F5 — `response_format` on `gsc_get_site_details`**. JSON mode
   emits `{ok, tool, site_url, permission_level, verification|null,
