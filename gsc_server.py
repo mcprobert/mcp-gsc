@@ -2734,7 +2734,7 @@ async def gsc_get_landing_page_summary(
     low_ctr_ratio: float = 0.5,
     country: Optional[str] = None,
     device: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Any:
     """Compact top-N landing pages for a GSC property with striking-distance
     and high-impression/low-CTR flags. Returns a dict (~2k tokens) so
     callers can ingest many pages without blowing context. Makes 2 API
@@ -2903,7 +2903,7 @@ async def gsc_compare_periods_landing_pages(
     decay_threshold_pct: float = -0.20,
     sort_by: str = "clicks_delta",
     sort_direction: str = "asc",
-) -> Dict[str, Any]:
+) -> Any:
     """Landing-page period-vs-period diff with decay_flag for content-rot
     detection. 2 API calls (one per period), join on page URL, sort
     by a chosen delta column. Use `sort_by='clicks_delta'` +
@@ -3760,7 +3760,7 @@ async def gsc_remove_account(alias: str) -> str:
 # --- Health check (Add 4) ---
 
 @mcp.tool()
-async def gsc_health_check(site_url: str) -> Dict[str, Any]:
+async def gsc_health_check(site_url: str) -> Any:
     """
     One-shot diagnostic for a GSC property. Used at the start of every audit.
 
@@ -3908,7 +3908,7 @@ async def gsc_load_from_sf_export(
     site_url: str,
     include_internal: bool = True,
     session_id: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> Any:
     """
     Load a Screaming Frog export folder into an in-memory session for local querying.
 
@@ -4029,7 +4029,7 @@ async def gsc_query_sf_export(
     sort_direction: str = "desc",
     limit: int = 100,
     offset: int = 0,
-) -> Dict[str, Any]:
+) -> Any:
     """
     Query a dataset previously loaded via gsc_load_from_sf_export.
 

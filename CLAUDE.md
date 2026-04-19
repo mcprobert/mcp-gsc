@@ -96,6 +96,16 @@ tabular; otherwise emit a flat dict that satisfies the success spine
 above. Always include `tool` and `meta` so downstream code can identify
 the payload without inspecting keys.
 
+**FastMCP return-type gotcha.** `@mcp.tool()` functions must declare
+`-> Any` (or have no return annotation). Generic types like
+`-> Dict[str, Any]` or `-> list[...]` trigger FastMCP's
+structured-output path, which wraps the payload in `{result: {...}}`
+at the protocol boundary — breaking flat-envelope consistency for
+consumers even though the source returns a flat dict. Verified in the
+installed FastMCP at `mcp/server/fastmcp/utilities/func_metadata.py:121-131`
+(the `wrap_output` branch). `tests/test_envelope_annotations.py` pins
+this rule.
+
 ## Telemetry + stderr channel
 
 Stdio transport reserves **stdout** for JSON-RPC. All telemetry

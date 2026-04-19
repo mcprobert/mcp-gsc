@@ -5,6 +5,55 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.1.1] — 2026-04-19 — F1 completion + reviewer-note correction
+
+Closes the gap the analyst flagged when re-verifying v1.1.0: six of
+seven findings were fully resolved, but F1 (envelope normalisation)
+was only partial. Four tools still emitted `{result: {...}}` wrapping
+at the MCP protocol boundary while the other 10+ emitted flat JSON.
+
+### Root cause (corrected)
+
+FastMCP auto-detects structured output from the return-type annotation
+(`mcp/server/fastmcp/utilities/func_metadata.py:121-131`). Generic
+types like `Dict[str, Any]` trigger the `wrap_output` branch which
+literally wraps the payload in `{"result": ...}` for structured-content
+emission. Tools annotated `-> Any` take the unstructured path and emit
+flat JSON via TextContent.
+
+My v1.1.0 CHANGELOG had a reviewer note dismissing the analyst's
+"wrapped in `result:`" framing as not reflecting the code. That was
+factually right at source level (no `{"result": ...}` string in
+`gsc_server.py`) but wrong in substance — FastMCP emits it at the
+protocol layer based on return annotations. The analyst was right.
+This release closes what F1 should have closed in v1.1.0.
+
+### Fixed
+
+- Flipped five tools from `-> Dict[str, Any]` to `-> Any`:
+  `gsc_get_landing_page_summary`, `gsc_compare_periods_landing_pages`,
+  `gsc_health_check`, `gsc_load_from_sf_export`, `gsc_query_sf_export`.
+  Consumers of these five move from `{result: {ok, ...payload}}` to
+  the flat `{ok, tool, ...payload, meta}` shape that matches every
+  other tool.
+
+  *Migration:* if you were reading `out["result"]["ok"]` on any of
+  these, drop the `["result"]` layer. Shape inside the payload is
+  unchanged.
+
+### Added
+
+- `tests/test_envelope_annotations.py` — regression guard that
+  introspects every `@mcp.tool()`-decorated function and fails if any
+  declare a generic return annotation. The existing 323 tests call
+  tool functions directly and bypass FastMCP, so they couldn't catch
+  this class of bug.
+
+### Docs
+
+- `CLAUDE.md` "Response envelope" section now explicitly names the
+  FastMCP return-type rule and links to the source line responsible.
+
 ## [1.1.0] — 2026-04-18 — post-refactor review remediation (F1–F7)
 
 Resolves the seven findings from the 2026-04-18 analyst review of the
