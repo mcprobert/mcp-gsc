@@ -31,15 +31,21 @@ This release closes what F1 should have closed in v1.1.0.
 ### Fixed
 
 - Flipped five tools from `-> Dict[str, Any]` to `-> Any`:
-  `gsc_get_landing_page_summary`, `gsc_compare_periods_landing_pages`,
-  `gsc_health_check`, `gsc_load_from_sf_export`, `gsc_query_sf_export`.
+  `gsc_get_landing_page_summary` and `gsc_compare_periods_landing_pages`
+  (analyst-flagged), `gsc_load_from_sf_export` and `gsc_query_sf_export`
+  (analyst flagged as unverified; same pattern), plus `gsc_health_check`
+  (preemptive — not in the analyst sweep but matches the pattern).
   Consumers of these five move from `{result: {ok, ...payload}}` to
   the flat `{ok, tool, ...payload, meta}` shape that matches every
   other tool.
 
-  *Migration:* if you were reading `out["result"]["ok"]` on any of
-  these, drop the `["result"]` layer. Shape inside the payload is
-  unchanged.
+  *Migration:* only affects consumers using MCP's structured-content
+  capability. Consumers reading the text-content path (JSON-parsing
+  the TextContent string) were never seeing the `result:` wrapper —
+  FastMCP's `convert_result` emits the unwrapped form as text
+  regardless. Structured-content consumers: if you were reading
+  `out["result"]["ok"]` on any of these, drop the `["result"]` layer.
+  Shape inside the payload is unchanged.
 
 ### Added
 

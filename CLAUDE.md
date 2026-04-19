@@ -97,14 +97,18 @@ above. Always include `tool` and `meta` so downstream code can identify
 the payload without inspecting keys.
 
 **FastMCP return-type gotcha.** `@mcp.tool()` functions must declare
-`-> Any` (or have no return annotation). Generic types like
-`-> Dict[str, Any]` or `-> list[...]` trigger FastMCP's
-structured-output path, which wraps the payload in `{result: {...}}`
-at the protocol boundary — breaking flat-envelope consistency for
-consumers even though the source returns a flat dict. Verified in the
-installed FastMCP at `mcp/server/fastmcp/utilities/func_metadata.py:121-131`
+`-> Any` (or have no return annotation). Any generic type triggers
+FastMCP's structured-output path, which wraps the payload in
+`{result: {...}}` at the protocol boundary — breaking flat-envelope
+consistency for consumers even though the source returns a flat dict.
+Traps include `-> Dict[str, Any]`, `-> list[...]`, and `-> Optional[T]`
+/ `-> Union[...]` (the FastMCP docstring at `func_metadata.py:212`
+lists "list, dict, Union, etc." as the wrapping set). Safe annotations:
+`-> Any`, `-> str`, `-> int`, `-> bool`, or no annotation. Verified
+against `mcp/server/fastmcp/utilities/func_metadata.py:121-131`
 (the `wrap_output` branch). `tests/test_envelope_annotations.py` pins
-this rule.
+the rule — any generic annotation triggers a CI failure with a
+pointer back to this section.
 
 ## Telemetry + stderr channel
 
