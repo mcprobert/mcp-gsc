@@ -40,6 +40,7 @@ def isolated_accounts(monkeypatch, tmp_path):
     monkeypatch.setattr(gsc_server, "ACCOUNTS_DIR", str(accounts_dir))
     monkeypatch.setattr(gsc_server, "ACCOUNTS_MANIFEST", str(manifest_path))
     monkeypatch.setattr(gsc_server, "SCRIPT_DIR", str(tmp_path))
+    monkeypatch.setattr(gsc_server, "GSC_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(gsc_server, "TOKEN_FILE", str(tmp_path / "token.json"))
     # Reset migration guard so the helper under test can hit a clean slate.
     monkeypatch.setattr(gsc_server, "_migration_checked", False)

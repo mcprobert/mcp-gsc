@@ -52,6 +52,7 @@ def _resolver_legacy_shim(monkeypatch, tmp_path):
     accounts_dir = tmp_path / "accounts"
     accounts_dir.mkdir()
     monkeypatch.setattr(gsc_server, "SCRIPT_DIR", str(tmp_path))
+    monkeypatch.setattr(gsc_server, "GSC_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(gsc_server, "ACCOUNTS_DIR", str(accounts_dir))
     monkeypatch.setattr(
         gsc_server, "ACCOUNTS_MANIFEST", str(accounts_dir / "accounts.json"),

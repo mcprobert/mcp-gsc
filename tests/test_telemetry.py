@@ -204,6 +204,7 @@ class TestHotPathToolsEmitTelemetry:
             '{"accounts": {"only": {"alias": "only", "token_file": "t"}}}'
         )
         monkeypatch.setattr(mod, "SCRIPT_DIR", str(tmp_path))
+        monkeypatch.setattr(mod, "GSC_STATE_DIR", str(tmp_path))
         monkeypatch.setattr(mod, "ACCOUNTS_DIR", str(accounts_dir))
         monkeypatch.setattr(mod, "ACCOUNTS_MANIFEST", str(accounts_dir / "accounts.json"))
         monkeypatch.setattr(mod, "_migration_checked", True)

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "gsc": {
+      "type": "stdio",
+      "command": "${HOME}/.venvs/gsc-mcp/bin/gsc-mcp-server",
+      "args": [],
+      "env": {
+        "GSC_STATE_DIR": "${HOME}/.config/gsc-mcp",
+        "GSC_OAUTH_CLIENT_SECRETS_FILE": "${HOME}/.config/gsc-mcp/client_secrets.json"
+      }
+    }
+  }
+}

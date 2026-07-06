@@ -33,6 +33,9 @@ accounts/
 *.swo
 *~
 
+# Claude Code per-user local settings (machine-specific paths/permissions)
+.claude/settings.local.json
+
 # OS-specific files
 .DS_Store
 Thumbs.db
