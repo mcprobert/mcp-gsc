@@ -5,6 +5,65 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.3.0] — 2026-07-06 — mount-independent, multi-user install
+
+Supports running the server from a shared network volume that different
+users (or macOS sessions) mount under different names (e.g.
+`/Volumes/Whitehat` vs `/Volumes/Whitehat-1`, plus duplicate auto-mounts).
+Any absolute `/Volumes/<name>/...` path baked into a client config or a
+venv breaks for whoever is on a different mount name — and, uniquely for
+this server, OAuth tokens and the multi-account manifest were stored
+*next to the script* on the share, so config changes alone could not move
+them.
+
+### Added — relocatable state (`GSC_STATE_DIR`)
+
+- `token.json` and the `accounts/` manifest now live under
+  `GSC_STATE_DIR` (env var; defaults to `~/.config/gsc-mcp`) instead of
+  next to the script. This decouples per-user OAuth state from the shared
+  code and survives a non-editable install (where the script itself moves
+  into the venv's `site-packages`).
+- **Backward-compatible migration.** On first run, if `GSC_STATE_DIR` has
+  no state but the legacy on-script-dir `accounts/` or `token.json`
+  exist, they are **copied** (never moved — the source may still back
+  another user's bare-script install on a different mount). Existing
+  logins are preserved; no re-authentication required. Relative
+  `token_file` paths in the manifest now resolve against `GSC_STATE_DIR`.
+
+### Added — packaging + per-user setup
+
+- **Proper entry point.** `pyproject.toml` now ships `gsc_server` as a
+  top-level module (`py-modules`) with a `gsc-mcp-server` console script
+  (`[project.scripts]` → `gsc_server:main`). Launch commands no longer
+  carry an on-share `.py` path argument. The prior `packages =
+  ["mcp_gsc"]` referenced a directory that did not exist, so
+  `pip install .` never produced a working install.
+- **`scripts/setup_user_env.sh`** — one-command per-user setup that
+  self-locates the repo regardless of mount name and installs everything
+  into `$HOME`: a venv at `~/.venvs/gsc-mcp` with the package installed
+  **non-editable**, `client_secrets.json` copied to `~/.config/gsc-mcp/`,
+  on-share OAuth state migrated, and a portable `.mcp.json` written. It
+  smoke-tests that `gsc_server` imports from the venv, not the share.
+- **Portable `.mcp.json` / `claude-config-template.json`** — use
+  `${HOME}` expansion (supported by Claude Code) plus the console script,
+  so a single config resolves per-user with no hardcoded paths.
+
+### Fixed
+
+- `requirements.txt` synced with `pyproject.toml`. Both now list exactly
+  the four runtime imports (`google-api-python-client`, `google-auth`,
+  `google-auth-oauthlib`, `mcp`). `oauth2client` was dropped — it was
+  listed but never imported.
+
+### Note
+
+When the source lives on a network share, set `git config core.fileMode
+false` in the clone — SMB/AFP mounts report every file as mode `0755`,
+which otherwise shows every tracked file as modified.
+
+439 tests passing (unchanged; three test fixtures updated to pin the new
+`GSC_STATE_DIR` alongside the other state-path globals).
+
 ## [1.2.2] — 2026-04-19 — gsc_remove_account cleanup + JSON-mode test coverage
 
 Non-breaking patch that closes out the last vestigial active-account

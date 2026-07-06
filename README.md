@@ -326,6 +326,55 @@ Open your computer's Terminal (Mac) or Command Prompt (Windows):
 
 When you see `(.venv)` at the beginning of your command prompt, it means the virtual environment is active and the dependencies will be installed there without affecting your system Python installation.
 
+### Shared network volume (multi-user)
+
+If the server lives on a shared network volume that different users (or
+macOS sessions) mount under different names (e.g. `/Volumes/Whitehat` vs
+`/Volumes/Whitehat-1`), **do not** bake any absolute `/Volumes/<name>/...`
+path into a client config or venv — it breaks for whoever is on a
+different mount name. Instead, install per-user into `$HOME`:
+
+```bash
+bash scripts/setup_user_env.sh
+```
+
+This creates a venv at `~/.venvs/gsc-mcp` with the package installed
+**non-editable** (so the running server never reads code off the share),
+copies `client_secrets.json` to `~/.config/gsc-mcp/`, migrates any
+existing OAuth state (`token.json` / `accounts/`) into `~/.config/gsc-mcp/`
+so you don't have to re-authenticate, and writes a portable `.mcp.json`
+using `${HOME}` expansion:
+
+```json
+{
+  "mcpServers": {
+    "gsc": {
+      "type": "stdio",
+      "command": "${HOME}/.venvs/gsc-mcp/bin/gsc-mcp-server",
+      "args": [],
+      "env": {
+        "GSC_STATE_DIR": "${HOME}/.config/gsc-mcp",
+        "GSC_OAUTH_CLIENT_SECRETS_FILE": "${HOME}/.config/gsc-mcp/client_secrets.json"
+      }
+    }
+  }
+}
+```
+
+Notes:
+
+- **Re-run `scripts/setup_user_env.sh` after pulling code changes** — the
+  non-editable install holds a *copy* of the code, so the venv must be
+  refreshed to pick up updates.
+- **OAuth/token state is relocatable** via `GSC_STATE_DIR` (defaults to
+  `~/.config/gsc-mcp`). This is what lets credentials live off the share.
+- **Claude Desktop does not expand `${HOME}`** — its config
+  (`claude_desktop_config.json`) must use absolute home paths, e.g.
+  `/Users/<you>/.venvs/gsc-mcp/bin/gsc-mcp-server`.
+- **Set `git config core.fileMode false`** in the clone — SMB/AFP mounts
+  report every file as mode `0755`, which otherwise shows every tracked
+  file as modified.
+
 ### 5. Connect Claude to Google Search Console
 
 1. Download and install [Claude Desktop](https://claude.ai/download) if you haven't already

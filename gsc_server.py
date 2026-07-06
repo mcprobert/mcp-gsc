@@ -152,8 +152,22 @@ OAUTH_CLIENT_SECRETS_FILE = os.environ.get("GSC_OAUTH_CLIENT_SECRETS_FILE")
 if not OAUTH_CLIENT_SECRETS_FILE:
     OAUTH_CLIENT_SECRETS_FILE = os.path.join(SCRIPT_DIR, "client_secrets.json")
 
+# State directory for OAuth tokens + the multi-account manifest.
+#
+# Defaults to ~/.config/gsc-mcp so that a shared-network-volume install
+# (where SCRIPT_DIR is a per-user mount name like /Volumes/Whitehat vs
+# /Volumes/Whitehat-1, or — after a non-editable pip install — a path
+# inside the venv's site-packages) keeps its credentials in the running
+# user's $HOME rather than next to the code. Override with GSC_STATE_DIR.
+#
+# Legacy installs stored token.json + accounts/ next to the script; those
+# are migrated into GSC_STATE_DIR on first run (see _migrate_state_dir).
+GSC_STATE_DIR = os.environ.get("GSC_STATE_DIR") or os.path.expanduser(
+    "~/.config/gsc-mcp"
+)
+
 # Token file path for storing OAuth tokens
-TOKEN_FILE = os.path.join(SCRIPT_DIR, "token.json")
+TOKEN_FILE = os.path.join(GSC_STATE_DIR, "token.json")
 
 # Environment variable to skip OAuth authentication
 SKIP_OAUTH = os.environ.get("GSC_SKIP_OAUTH", "").lower() in ("true", "1", "yes")
@@ -172,7 +186,7 @@ OAUTH_SCOPES = SCOPES + [
 # write. If this server is ever re-platformed to SSE or HTTP
 # multi-tenant, these three variables become racy and need an asyncio
 # Lock (or a move to per-session state).
-ACCOUNTS_DIR = os.path.join(SCRIPT_DIR, "accounts")
+ACCOUNTS_DIR = os.path.join(GSC_STATE_DIR, "accounts")
 ACCOUNTS_MANIFEST = os.path.join(ACCOUNTS_DIR, "accounts.json")
 _active_account: Optional[str] = None
 
@@ -655,9 +669,9 @@ def _get_active_token_file() -> Optional[str]:
     acct = manifest.get("accounts", {}).get(_active_account)
     if acct and acct.get("token_file"):
         token_path = acct["token_file"]
-        # Resolve relative paths against SCRIPT_DIR
+        # Resolve relative paths against GSC_STATE_DIR
         if not os.path.isabs(token_path):
-            token_path = os.path.join(SCRIPT_DIR, token_path)
+            token_path = os.path.join(GSC_STATE_DIR, token_path)
         return token_path
     return None
 
@@ -679,6 +693,61 @@ def _detect_email(creds) -> Optional[str]:
 
 
 _migration_checked = False
+
+
+def _migrate_state_dir() -> None:
+    """Relocate on-share state into GSC_STATE_DIR ($HOME) on first run.
+
+    Legacy installs kept ``token.json`` and ``accounts/`` next to the
+    script on a shared network volume. When GSC_STATE_DIR (default
+    ``~/.config/gsc-mcp``) has no state yet but the on-share copies
+    exist, copy them so the user keeps their OAuth logins without
+    re-authenticating.
+
+    Copy semantics (never move — the source may still back another
+    user's bare-script install on a different mount name):
+
+    - If ``$GSC_STATE_DIR/accounts/accounts.json`` is absent and the
+      on-share ``accounts/`` tree has a manifest, copy the whole tree.
+      The manifest stores *relative* token paths (``accounts/<a>/
+      token.json``) which then resolve against GSC_STATE_DIR.
+    - Else if ``$GSC_STATE_DIR/token.json`` is absent and the on-share
+      bare ``token.json`` exists, copy just that file (fresh-install
+      path handled downstream by _migrate_legacy_state).
+
+    Idempotent: only copies when the destination is missing. A no-op
+    once the state dir is populated, and a no-op after a non-editable
+    install (site-packages has no on-share state to find).
+    """
+    # Legacy on-share locations, resolved from the *current* SCRIPT_DIR
+    # (read at call time so monkeypatched tests stay isolated, and so a
+    # non-editable install correctly points at site-packages — which has
+    # no on-share state, making this a no-op there).
+    legacy_token_file = os.path.join(SCRIPT_DIR, "token.json")
+    legacy_accounts_dir = os.path.join(SCRIPT_DIR, "accounts")
+
+    # Nothing to do if the source and destination are the same tree
+    # (e.g. GSC_STATE_DIR left at its legacy SCRIPT_DIR value).
+    if os.path.abspath(GSC_STATE_DIR) == os.path.abspath(SCRIPT_DIR):
+        return
+
+    os.makedirs(GSC_STATE_DIR, exist_ok=True)
+
+    legacy_manifest = os.path.join(legacy_accounts_dir, "accounts.json")
+    if not os.path.exists(ACCOUNTS_MANIFEST) and os.path.exists(legacy_manifest):
+        shutil.copytree(legacy_accounts_dir, ACCOUNTS_DIR, dirs_exist_ok=True)
+        print(
+            f"[gsc-mcp] Migrated accounts/ from {legacy_accounts_dir} → "
+            f"{ACCOUNTS_DIR}. Original preserved.",
+            file=sys.stderr, flush=True,
+        )
+    elif not os.path.exists(TOKEN_FILE) and os.path.exists(legacy_token_file):
+        shutil.copy2(legacy_token_file, TOKEN_FILE)
+        print(
+            f"[gsc-mcp] Migrated token.json from {legacy_token_file} → "
+            f"{TOKEN_FILE}. Original preserved.",
+            file=sys.stderr, flush=True,
+        )
 
 
 def _migrate_legacy_state() -> None:
@@ -706,6 +775,11 @@ def _migrate_legacy_state() -> None:
     if _migration_checked:
         return
     _migration_checked = True
+
+    # Relocate on-share state into GSC_STATE_DIR before reading the
+    # manifest, so the manifest we load below is the (possibly just
+    # copied) home-dir copy.
+    _migrate_state_dir()
 
     manifest = _load_manifest()
     mutated = False
@@ -1609,7 +1683,7 @@ def _build_service_noninteractive(alias: str) -> Tuple[Optional[Any], Optional[s
     if not token_path:
         return None, ErrorCode.AUTH_EXPIRED
     if not os.path.isabs(token_path):
-        token_path = os.path.join(SCRIPT_DIR, token_path)
+        token_path = os.path.join(GSC_STATE_DIR, token_path)
     if not os.path.exists(token_path):
         return None, ErrorCode.AUTH_EXPIRED
 
@@ -4610,7 +4684,7 @@ def _read_account_scopes(token_file_relative: Optional[str]) -> List[str]:
         return ["<unavailable>"]
     token_path = token_file_relative
     if not os.path.isabs(token_path):
-        token_path = os.path.join(SCRIPT_DIR, token_path)
+        token_path = os.path.join(GSC_STATE_DIR, token_path)
     if not os.path.exists(token_path):
         return ["<unavailable>"]
     try:
@@ -5600,6 +5674,15 @@ Amin combines technical SEO knowledge with programming skills to create innovati
 """
     return creator_info
 
-if __name__ == "__main__":
+def main() -> None:
+    """Console-script entry point (see [project.scripts] in pyproject.toml).
+
+    Installed non-editable, the server is launched as ``gsc-mcp-server``
+    (or ``python -m gsc_server``) with no on-share path argument.
+    """
     # Start the MCP server on stdio transport
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()

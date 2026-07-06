@@ -25,12 +25,26 @@ Single-file FastMCP server (`gsc_server.py`) with 24 tools covering:
 
 Uses OAuth 2.0 (Desktop app flow). Set `GSC_OAUTH_CLIENT_SECRETS_FILE` env var to point at your `client_secrets.json`. On first run, opens browser for Google login; caches token in `token.json`.
 
+### State location (`GSC_STATE_DIR`, v1.3.0)
+
+OAuth tokens and the multi-account manifest live under `GSC_STATE_DIR`
+(env var; defaults to `~/.config/gsc-mcp`), **not** next to the script.
+This keeps per-user credentials off a shared code volume and survives a
+non-editable install (where `SCRIPT_DIR` becomes the venv's
+`site-packages`). `TOKEN_FILE` and `ACCOUNTS_DIR` derive from it; manifest
+`token_file` entries are relative and resolve against `GSC_STATE_DIR`.
+
+On first run, `_migrate_state_dir` copies legacy on-script-dir `accounts/`
+or `token.json` into `GSC_STATE_DIR` if the state dir is empty (copy, not
+move — preserves logins without forcing re-auth). It reads `SCRIPT_DIR` at
+call time, so it is a no-op post-install and stays test-isolated.
+
 ### Multi-Account Support (v1.2.0 — agent-first)
 
-Multiple Google accounts are supported for agency workflows. Tokens are stored per-account under `accounts/`:
+Multiple Google accounts are supported for agency workflows. Tokens are stored per-account under `$GSC_STATE_DIR/accounts/`:
 
 ```
-accounts/
+$GSC_STATE_DIR/accounts/          # default: ~/.config/gsc-mcp/accounts/
   accounts.json          # manifest: alias → token path, email, timestamps
   client-a/token.json
   client-b/token.json
@@ -77,7 +91,8 @@ do NOT retry (caller chose that credential).
   browser OAuth. Alias `default` is reserved and will be rejected.
 - `gsc_remove_account(alias)` — delete an account and its stored token.
 - `gsc_switch_account(alias)` — **DEPRECATED (v1.2.0)**: returns
-  `ok:false, error_code:DEPRECATED_TOOL`. Removed in v1.3.0.
+  `ok:false, error_code:DEPRECATED_TOOL`. Slated for removal in a
+  future release.
 - `gsc_get_active_account()` — **DEPRECATED (v1.2.0)**: use
   `gsc_whoami(site_url=...)` instead.
 
