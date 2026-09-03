@@ -7,6 +7,18 @@ these releases are executing against.
 
 ## [1.3.1] — 2026-09-03 — project-scope config no longer shadows user scope
 
+### Fixed
+
+- **The server reported the MCP SDK's version, not its own.** `FastMCP` does
+  not forward a version to the lowlevel `Server` it builds, and that `Server`
+  falls back to `pkg_version("mcp")` — so the handshake's `serverInfo.version`
+  advertised the SDK version to every client. It read `1.3.0` purely because
+  the SDK pin happened to match the old package version, which is why this went
+  unnoticed. `gsc_server.py` now sets it from this package's own metadata, so
+  `pyproject.toml` is the single source of truth. Best-effort: if the metadata
+  is absent (a bare source checkout) startup is unaffected and the previous
+  fallback applies.
+
 ### Changed
 
 - **`scripts/setup_user_env.sh` no longer writes `.mcp.json` unconditionally.**

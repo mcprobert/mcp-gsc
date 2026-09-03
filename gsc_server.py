@@ -135,6 +135,21 @@ from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("gsc-server")
 
+# FastMCP (mcp 1.3.0) does not forward a version to the lowlevel Server it
+# builds, and that Server falls back to reporting the *MCP SDK* version in the
+# handshake's serverInfo. So without this, every client -- and any handshake
+# health check -- sees the SDK version where it expects ours. Set it from our
+# own package metadata so there is a single source of truth (pyproject's
+# version). Best-effort: running straight from a source checkout with no
+# installed dist must not break startup, and a private-attribute write is the
+# only route FastMCP leaves open here.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    mcp._mcp_server.version = _pkg_version("mcp-gsc")
+except Exception:  # pragma: no cover - metadata absent or SDK internals moved
+    pass
+
 # Path to your service account JSON or user credentials JSON
 # First check if GSC_CREDENTIALS_PATH environment variable is set
 # Then try looking in the script directory and current working directory as fallbacks
