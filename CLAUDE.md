@@ -12,18 +12,25 @@ uv pip install -r requirements.txt
 
 ## Architecture
 
-Single-file FastMCP server (`gsc_server.py`) with 24 tools covering:
+Single-file FastMCP server (`gsc_server.py`) with 30 tools covering:
 
 - **Properties**: `gsc_list_properties`, `gsc_add_site`, `gsc_delete_site`, `gsc_get_site_details`
 - **Search Analytics**: `gsc_get_search_analytics`, `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`, `gsc_get_search_by_page_query`, `gsc_get_performance_overview`
+- **Landing pages**: `gsc_get_landing_page_summary`, `gsc_compare_periods_landing_pages`
 - **URL Inspection**: `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, `gsc_check_indexing_issues`
 - **Sitemaps**: `gsc_get_sitemaps`, `gsc_list_sitemaps_enhanced`, `gsc_get_sitemap_details`, `gsc_submit_sitemap`, `gsc_delete_sitemap`, `gsc_manage_sitemaps`
-- **Account Management**: `gsc_list_accounts`, `gsc_get_active_account`, `gsc_add_account`, `gsc_switch_account`, `gsc_remove_account`
-- **Meta**: `gsc_get_creator_info`
+- **Account Management**: `gsc_list_accounts`, `gsc_whoami`, `gsc_add_account`, `gsc_remove_account`, plus the deprecated `gsc_get_active_account` and `gsc_switch_account`
+- **Screaming Frog bridge**: `gsc_load_from_sf_export`, `gsc_query_sf_export`
+- **Meta**: `gsc_health_check`, `gsc_get_creator_info`
+
+The count is asserted nowhere in code — if you add or remove a tool, update
+this line and the README's "Available Tools" section together.
 
 ## Auth
 
-Uses OAuth 2.0 (Desktop app flow). Set `GSC_OAUTH_CLIENT_SECRETS_FILE` env var to point at your `client_secrets.json`. On first run, opens browser for Google login; caches token in `token.json`.
+Uses OAuth 2.0 (Desktop app flow). Set `GSC_OAUTH_CLIENT_SECRETS_FILE` env var to point at your `client_secrets.json`. On first run, opens browser for Google login; caches the token under `GSC_STATE_DIR` (see below) — since v1.3.0 it is *not* written next to the script.
+
+Service-account auth is also supported: set `GSC_CREDENTIALS_PATH` and `GSC_SKIP_OAUTH=true`. Note that alias-routed calls never fall back to it (see Auth safety below).
 
 ### State location (`GSC_STATE_DIR`, v1.3.0)
 
@@ -121,10 +128,49 @@ field is dropped on first save.
 
 ## MCP Config
 
-- Claude Code: `.mcp.json` in project root
-- Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json`
+Claude Code resolves MCP servers with **local scope outranking project scope
+(`.mcp.json` in the repo root), which outranks user scope (`~/.claude.json`).**
+So a `.mcp.json` here will override any user-scope server of the same name —
+e.g. a centrally managed `gsc` — for any session started in this repo **or in a
+directory under it** (discovery walks up from the working directory), and it
+wins even when the project file has gone stale. Claude Code normally asks before
+enabling a project-scope server, but the approval is remembered per project, so
+a file later rewritten under an already-approved name — or a checkout with
+`enableAllProjectMcpServers` turned on — takes effect with no prompt at all.
+Pick one of two deployment models rather than mixing them:
 
-Both need `GSC_OAUTH_CLIENT_SECRETS_FILE` updated with the real path to credentials.
+**(i) Centrally managed / user scope.** Keep no `.mcp.json` in the repo. Leave a
+marker so `scripts/setup_user_env.sh` never recreates one:
+
+- `.mcp.json.disabled-shared-tree` in the repo root — this checkout only.
+  Create it **empty**: it is a flag, not a place to park a config. To keep a
+  retired config for reference, archive it under some other name — renaming one
+  onto the marker leaves a live config wearing a filename that reads "disabled",
+  and the restore gesture (`mv` it back) then removes the opt-out at the same
+  time. It is also git-ignored, so `git clean -fdx` removes it; prefer the
+  marker below as the durable one.
+- `.disable-mcp-project-configs` in the directory *containing* your checkouts —
+  survives a re-clone and a `git clean` because it lives outside the repo, and
+  covers every checkout beside it **whose setup script honours it** (this one
+  does; a sibling project's may not).
+
+`GSC_SETUP_NO_MCP_JSON=1` suppresses the step for a single run.
+
+**(ii) Per-user portable.** Run `scripts/setup_user_env.sh`, which writes a
+`${HOME}`-based `.mcp.json` (see README, "Shared network volume (multi-user)").
+`claude-config-template.json` at the repo root is the same content by hand, for
+this model only — copying it to `.mcp.json` bypasses the markers entirely, so do
+not do that on a centrally managed host.
+
+Claude Desktop reads `~/Library/Application Support/Claude/claude_desktop_config.json`
+and does **not** expand `${HOME}` — use absolute home paths there.
+
+Since v1.3.0 the generated config sets both `GSC_STATE_DIR` and
+`GSC_OAUTH_CLIENT_SECRETS_FILE`, and OAuth state is resolved relative to
+`GSC_STATE_DIR`, so neither normally needs hand-editing.
+
+If either marker above is present, this checkout is deliberately running against
+a centrally managed config — find out why before re-enabling anything.
 
 ## Dependencies
 

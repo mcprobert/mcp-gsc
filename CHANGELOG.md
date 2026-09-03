@@ -5,6 +5,26 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.3.1] — 2026-09-03 — project-scope config no longer shadows user scope
+
+### Changed
+
+- **`scripts/setup_user_env.sh` no longer writes `.mcp.json` unconditionally.**
+  Step 4 is now a no-op when `.mcp.json.disabled-shared-tree` exists in the repo
+  root, when `.disable-mcp-project-configs` exists in the parent directory, or
+  when `GSC_SETUP_NO_MCP_JSON` is set. Claude Code gives project scope
+  precedence over user scope, so on a host where MCP config is managed centrally
+  at user scope a re-run of this script would otherwise re-shadow that config
+  with a per-user one — pointing at the non-editable venv and separate
+  `GSC_STATE_DIR` that steps 2 and 3 maintain, which nothing then reads. Those
+  steps are unchanged and still run; only the config that redirects clients to
+  them is now suppressed. The parent-directory marker is resolved with `dirname`
+  so it works through a symlinked checkout, and lives outside the repo, so it
+  survives both a re-clone and `git clean -fdx`. The skip message names which of
+  the three triggers fired, and the closing banner no longer suggests pointing
+  Claude Desktop at the per-user venv when a marker is in force. No change for a
+  checkout with no marker and the variable unset.
+
 ## [1.3.0] — 2026-07-06 — mount-independent, multi-user install
 
 Supports running the server from a shared network volume that different

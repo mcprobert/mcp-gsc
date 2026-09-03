@@ -366,6 +366,18 @@ Notes:
 - **Re-run `scripts/setup_user_env.sh` after pulling code changes** — the
   non-editable install holds a *copy* of the code, so the venv must be
   refreshed to pick up updates.
+- **If MCP config is managed centrally at user scope** (one set of servers
+  serving several logins via `~/.claude.json`), suppress this step — Claude Code
+  gives project scope precedence over user scope, so the generated `.mcp.json`
+  would shadow the central config, including a stale copy of it. Create an empty
+  `.mcp.json.disabled-shared-tree` in the repo root (this checkout only — note
+  it is git-ignored, so `git clean -fdx` removes it), or
+  `.disable-mcp-project-configs` in the directory *containing* your checkouts
+  (survives a re-clone and a `git clean`, and covers every checkout beside it
+  whose own setup script honours the marker — this one does, but a sibling
+  project's script may not, so check before relying on it). Either marker makes
+  the step a no-op on every re-run; setting `GSC_SETUP_NO_MCP_JSON` to any
+  non-empty value does the same for a single run.
 - **OAuth/token state is relocatable** via `GSC_STATE_DIR` (defaults to
   `~/.config/gsc-mcp`). This is what lets credentials live off the share.
 - **Claude Desktop does not expand `${HOME}`** — its config
@@ -396,9 +408,9 @@ Notes:
    ```json
    {
      "mcpServers": {
-       "gscServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
-         "args": ["/FULL/PATH/TO/mcp-gsc-main/gsc_server.py"],
+       "gsc": {
+         "command": "/FULL/PATH/TO/mcp-gsc/.venv/bin/gsc-mcp-server",
+         "args": [],
          "env": {
            "GSC_OAUTH_CLIENT_SECRETS_FILE": "/FULL/PATH/TO/client_secrets.json"
          }
@@ -412,9 +424,9 @@ Notes:
    ```json
    {
      "mcpServers": {
-       "gscServer": {
-         "command": "/FULL/PATH/TO/-main/.venv/bin/python",
-         "args": ["/FULL/PATH/TO/mcp-gsc-main/gsc_server.py"],
+       "gsc": {
+         "command": "/FULL/PATH/TO/mcp-gsc/.venv/bin/gsc-mcp-server",
+         "args": [],
          "env": {
            "GSC_CREDENTIALS_PATH": "/FULL/PATH/TO/service_account_credentials.json",
            "GSC_SKIP_OAUTH": "true"
@@ -425,18 +437,34 @@ Notes:
    ```
 
    **Important:** Replace all paths with the actual locations on your computer:
-   
-   - The first path should point to the Python executable inside your virtual environment
-   - The second path should point to the `gsc_server.py` file inside the folder you unzipped
-   - The third path should point to your Google service account credentials JSON file
-   
-   Examples:
-   - Mac: 
-     - Python path: `/Users/yourname/Documents/mcp-gsc/.venv/bin/python`
-     - Script path: `/Users/yourname/Documents/mcp-gsc/gsc_server.py`
-   - Windows: 
-     - Python path: `C:\\Users\\yourname\\Documents\\mcp-gsc\\.venv\\Scripts\\python.exe`
-     - Script path: `C:\\Users\\yourname\\Documents\\mcp-gsc\\gsc_server.py`
+
+   - `command` points at the `gsc-mcp-server` console script inside your virtual
+     environment. Since v1.3.0 the package installs this entry point, so there is
+     no `gsc_server.py` path to pass — `args` stays empty. (Older instructions
+     used `"command": ".../python"` with the script path in `args`; that still
+     works, but the console script is preferred.)
+   - The credentials path should point to your `client_secrets.json` (OAuth) or
+     your service account JSON.
+
+   Examples for `command`:
+   - Mac: `/Users/yourname/Documents/mcp-gsc/.venv/bin/gsc-mcp-server`
+   - Windows: `C:\\Users\\yourname\\Documents\\mcp-gsc\\.venv\\Scripts\\gsc-mcp-server.exe`
+
+   **Optional — where credentials are stored.** OAuth tokens and the
+   multi-account manifest live under `GSC_STATE_DIR`, which defaults to
+   `~/.config/gsc-mcp`. Set it explicitly if you want them elsewhere:
+
+   ```json
+   "env": {
+     "GSC_STATE_DIR": "/FULL/PATH/TO/state-dir",
+     "GSC_OAUTH_CLIENT_SECRETS_FILE": "/FULL/PATH/TO/client_secrets.json"
+   }
+   ```
+
+   **Note on the server name.** These examples name the server `gsc`. If you also
+   have a `gsc` defined at another scope, Claude Code uses only the
+   highest-precedence one (local, then project `.mcp.json`, then user) — see
+   "Shared network volume (multi-user)" above if you manage config centrally.
 
 5. Save the file:
    - Mac: Press Ctrl+O, then Enter, then Ctrl+X to exit
