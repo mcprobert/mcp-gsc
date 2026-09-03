@@ -24,6 +24,10 @@ accounts/
 
 # Local MCP server config (contains absolute paths to venv + credentials)
 .mcp.json
+.mcp.json.disabled-*
+# ...but a breadcrumb explaining why a config was retired should be committable,
+# so it survives `git clean -fdx` and reaches a fresh clone.
+!.mcp.json.disabled-*.README
 
 # Editor-specific files
 .vscode/

@@ -12,6 +12,7 @@
 #   ~/.config/gsc-mcp/token.json          migrated OAuth token (if one existed)
 #   ~/.config/gsc-mcp/accounts/           migrated multi-account state (if any)
 #   <repo>/.mcp.json                      a portable config using ${HOME}
+#                                         (unless disabled - see step 4)
 #
 # The package is installed NON-editable (copied into the venv), so once set up
 # the server no longer reads code from the share and is immune to mount renames.
@@ -74,7 +75,38 @@ else
 fi
 
 # 4. Write a portable .mcp.json (gitignored). ${HOME} is expanded per-user by Claude Code.
-cat > "$REPO/.mcp.json" <<'JSON'
+#    Opt out where MCP config is managed centrally at user scope (~/.claude.json):
+#    Claude Code gives project scope precedence, so a .mcp.json here would silently
+#    shadow a same-named server defined there. This step is a no-op, on every re-run,
+#    if any of these hold:
+#      <repo>/.mcp.json.disabled-shared-tree   this checkout only
+#      <parent>/.disable-mcp-project-configs   every checkout alongside this one
+#      GSC_SETUP_NO_MCP_JSON set (any value)   this run only
+#    Note: <parent> is computed with dirname, not "$REPO/..". Through a symlinked
+#    checkout the kernel resolves ".." against the physical path, which would look
+#    for the marker beside the real directory instead of beside the visible one.
+#    Both marker tests accept a dangling symlink (-L), so a marker whose target is
+#    on an unmounted volume still suppresses this step rather than failing open.
+PARENT_DIR="$(dirname "$REPO")"
+SKIP_REASON=""
+if [ -e "$REPO/.mcp.json.disabled-shared-tree" ] || [ -L "$REPO/.mcp.json.disabled-shared-tree" ]; then
+  SKIP_REASON="marker present: $REPO/.mcp.json.disabled-shared-tree"
+elif [ -e "$PARENT_DIR/.disable-mcp-project-configs" ] || [ -L "$PARENT_DIR/.disable-mcp-project-configs" ]; then
+  SKIP_REASON="marker present: $PARENT_DIR/.disable-mcp-project-configs"
+elif [ -n "${GSC_SETUP_NO_MCP_JSON:-}" ]; then
+  SKIP_REASON="GSC_SETUP_NO_MCP_JSON is set (this run only)"
+fi
+
+if [ -n "$SKIP_REASON" ]; then
+  echo "Skipping $REPO/.mcp.json - $SKIP_REASON"
+  if [ -e "$REPO/.mcp.json" ]; then
+    echo "WARNING: $REPO/.mcp.json already exists and takes precedence over"
+    echo "         user-scope config, so it is still shadowing. Delete it, or"
+    echo "         move it aside under some name other than the marker above"
+    echo "         (renaming onto the marker would overwrite it)."
+  fi
+else
+  cat > "$REPO/.mcp.json" <<'JSON'
 {
   "mcpServers": {
     "gsc": {
@@ -89,7 +121,8 @@ cat > "$REPO/.mcp.json" <<'JSON'
   }
 }
 JSON
-echo "Wrote $REPO/.mcp.json"
+  echo "Wrote $REPO/.mcp.json"
+fi
 
 # 5. Smoke test: the module must import from the venv, not the share.
 #    Run from $HOME so the repo dir isn't on sys.path (cwd would otherwise
@@ -103,7 +136,19 @@ esac
 
 echo
 echo "Done. Next steps:"
-echo "  - Restart Claude Code, then verify:  claude mcp list | grep gsc"
-echo "  - Claude Desktop does NOT expand \${HOME}: edit the 'gsc' entry in"
-echo "    ~/Library/Application Support/Claude/claude_desktop_config.json to use"
-echo "    absolute home paths, e.g. $VENV/bin/gsc-mcp-server, then restart the app."
+if [ -n "$SKIP_REASON" ]; then
+  # This checkout defers to a centrally-managed config, so do NOT suggest
+  # pointing a client at the per-user venv above - that would re-fork it.
+  echo "  - No project-scope config was written ($SKIP_REASON)."
+  echo "    This checkout defers to whatever defines 'gsc' at user scope; verify"
+  echo "    with:  claude mcp get gsc   (expect Scope: User config)"
+  if [ -e "$REPO/.mcp.json" ]; then
+    echo "  - ACTION REQUIRED: $REPO/.mcp.json still exists and is shadowing."
+    echo "    Delete it, then restart Claude Code."
+  fi
+else
+  echo "  - Restart Claude Code, then verify:  claude mcp list | grep gsc"
+  echo "  - Claude Desktop does NOT expand \${HOME}: edit the 'gsc' entry in"
+  echo "    ~/Library/Application Support/Claude/claude_desktop_config.json to use"
+  echo "    absolute home paths, e.g. $VENV/bin/gsc-mcp-server, then restart the app."
+fi

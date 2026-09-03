@@ -121,10 +121,49 @@ field is dropped on first save.
 
 ## MCP Config
 
-- Claude Code: `.mcp.json` in project root
-- Claude Desktop: `~/Library/Application Support/Claude/claude_desktop_config.json`
+Claude Code resolves MCP servers with **local scope outranking project scope
+(`.mcp.json` in the repo root), which outranks user scope (`~/.claude.json`).**
+So a `.mcp.json` here will override any user-scope server of the same name —
+e.g. a centrally managed `gsc` — for any session started in this repo **or in a
+directory under it** (discovery walks up from the working directory), and it
+wins even when the project file has gone stale. Claude Code normally asks before
+enabling a project-scope server, but the approval is remembered per project, so
+a file later rewritten under an already-approved name — or a checkout with
+`enableAllProjectMcpServers` turned on — takes effect with no prompt at all.
+Pick one of two deployment models rather than mixing them:
 
-Both need `GSC_OAUTH_CLIENT_SECRETS_FILE` updated with the real path to credentials.
+**(i) Centrally managed / user scope.** Keep no `.mcp.json` in the repo. Leave a
+marker so `scripts/setup_user_env.sh` never recreates one:
+
+- `.mcp.json.disabled-shared-tree` in the repo root — this checkout only.
+  Create it **empty**: it is a flag, not a place to park a config. To keep a
+  retired config for reference, archive it under some other name — renaming one
+  onto the marker leaves a live config wearing a filename that reads "disabled",
+  and the restore gesture (`mv` it back) then removes the opt-out at the same
+  time. It is also git-ignored, so `git clean -fdx` removes it; prefer the
+  marker below as the durable one.
+- `.disable-mcp-project-configs` in the directory *containing* your checkouts —
+  survives a re-clone and a `git clean` because it lives outside the repo, and
+  covers every checkout beside it **whose setup script honours it** (this one
+  does; a sibling project's may not).
+
+`GSC_SETUP_NO_MCP_JSON=1` suppresses the step for a single run.
+
+**(ii) Per-user portable.** Run `scripts/setup_user_env.sh`, which writes a
+`${HOME}`-based `.mcp.json` (see README, "Shared network volume (multi-user)").
+`claude-config-template.json` at the repo root is the same content by hand, for
+this model only — copying it to `.mcp.json` bypasses the markers entirely, so do
+not do that on a centrally managed host.
+
+Claude Desktop reads `~/Library/Application Support/Claude/claude_desktop_config.json`
+and does **not** expand `${HOME}` — use absolute home paths there.
+
+Since v1.3.0 the generated config sets both `GSC_STATE_DIR` and
+`GSC_OAUTH_CLIENT_SECRETS_FILE`, and OAuth state is resolved relative to
+`GSC_STATE_DIR`, so neither normally needs hand-editing.
+
+If either marker above is present, this checkout is deliberately running against
+a centrally managed config — find out why before re-enabling anything.
 
 ## Dependencies
 

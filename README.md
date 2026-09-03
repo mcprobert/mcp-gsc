@@ -366,6 +366,18 @@ Notes:
 - **Re-run `scripts/setup_user_env.sh` after pulling code changes** — the
   non-editable install holds a *copy* of the code, so the venv must be
   refreshed to pick up updates.
+- **If MCP config is managed centrally at user scope** (one set of servers
+  serving several logins via `~/.claude.json`), suppress this step — Claude Code
+  gives project scope precedence over user scope, so the generated `.mcp.json`
+  would shadow the central config, including a stale copy of it. Create an empty
+  `.mcp.json.disabled-shared-tree` in the repo root (this checkout only — note
+  it is git-ignored, so `git clean -fdx` removes it), or
+  `.disable-mcp-project-configs` in the directory *containing* your checkouts
+  (survives a re-clone and a `git clean`, and covers every checkout beside it
+  whose own setup script honours the marker — this one does, but a sibling
+  project's script may not, so check before relying on it). Either marker makes
+  the step a no-op on every re-run; setting `GSC_SETUP_NO_MCP_JSON` to any
+  non-empty value does the same for a single run.
 - **OAuth/token state is relocatable** via `GSC_STATE_DIR` (defaults to
   `~/.config/gsc-mcp`). This is what lets credentials live off the share.
 - **Claude Desktop does not expand `${HOME}`** — its config
