@@ -5,7 +5,7 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
-## [Unreleased]
+## [1.3.1] — 2026-09-03 — project-scope config no longer shadows user scope
 
 ### Changed
 
