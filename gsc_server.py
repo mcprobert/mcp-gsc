@@ -7724,6 +7724,7 @@ _FETCH_HEADERS = {
     "Accept-Language": "en-GB,en;q=0.9",
 }
 _FETCH_MAX_BYTES = 10 * 1024 * 1024
+_CHALLENGE_RE = re.compile(rb"Checking browser|Just a moment|challenge-platform|cf-chl|Attention Required", re.IGNORECASE)
 _FETCH_TIMEOUT_SEC = 15.0
 _SITEMAP_MAX_DEPTH = 3
 _SITEMAP_MAX_URLS = 50_000
@@ -7774,7 +7775,7 @@ async def _safe_fetch(client: Any, url: str, site_url: str, *, extra_hosts: Tupl
         raise _FetchRefused(f"host {parts.hostname!r} is outside property {site_url!r}")
     port = parts.port or (443 if parts.scheme == "https" else 80)
     infos = await asyncio.to_thread(socket.getaddrinfo, parts.hostname, port, 0, socket.SOCK_STREAM)
-    addrs = sorted({i[4][0] for i in infos})
+    addrs = list(dict.fromkeys(i[4][0] for i in infos))  # the OS's preference order (RFC 6724)
     if not addrs or not all(_is_public_ip(a) for a in addrs):
         raise _FetchRefused(f"{parts.hostname!r} resolves to a non-public address")
     # Pin the connection to the address just validated (no second DNS
@@ -7792,7 +7793,18 @@ async def _safe_fetch(client: Any, url: str, site_url: str, *, extra_hosts: Tupl
         peer = stream.get_extra_info("server_addr") if stream is not None else None
         if peer and not _is_public_ip(str(peer[0])):
             raise _FetchRefused(f"connected to non-public address {peer[0]!r}")
-        out: Dict[str, Any] = {"url": url, "status": resp.status_code, "location": resp.headers.get("location")}
+        out: Dict[str, Any] = {"url": url, "status": resp.status_code, "location": resp.headers.get("location"),
+                               "retry_after": resp.headers.get("retry-after")}
+        if resp.status_code in (403, 429, 503) and not want_body:
+            # A CDN bot check answers with a challenge page, not the page's
+            # real status: detect it so it is never reported as one.
+            head = b""
+            async for chunk in resp.aiter_bytes():
+                head += chunk
+                if len(head) >= 8192:
+                    break
+            if resp.headers.get("cf-mitigated") == "challenge" or _CHALLENGE_RE.search(head[:8192]):
+                out["bot_challenge"] = True
         if want_body:
             chunks, size = [], 0
             async for chunk in resp.aiter_bytes():
@@ -7801,6 +7813,8 @@ async def _safe_fetch(client: Any, url: str, site_url: str, *, extra_hosts: Tupl
                     raise _FetchRefused(f"response over {max_bytes} bytes: {url!r}")
                 chunks.append(chunk)
             out["body"] = b"".join(chunks)
+            if resp.status_code in (403, 429, 503) and _CHALLENGE_RE.search(out["body"][:8192]):
+                out["bot_challenge"] = True
         return out
 
 
@@ -7809,19 +7823,50 @@ def _new_fetch_client() -> Any:
     return httpx.AsyncClient(follow_redirects=False, timeout=_FETCH_TIMEOUT_SEC)
 
 
+_FETCH_RATE_LIMIT_STATUSES = (429, 503)
+_FETCH_MAX_ATTEMPTS = 4
+_FETCH_DEFAULT_CONCURRENCY = 3
+
+
+_FETCH_PACING_SEC = 0.3  # per worker, between requests: a burst trips CDN bot checks
+
+
+async def _fetch_with_backoff(client: Any, url: str, site_url: str, **kw: Any) -> Dict[str, Any]:
+    """_safe_fetch, retrying a 429/503 with backoff (Retry-After honoured
+    up to 10 s). A persistent one comes back with ``rate_limited: True``."""
+    for attempt in range(1, _FETCH_MAX_ATTEMPTS + 1):
+        r = await _safe_fetch(client, url, site_url, **kw)
+        if r.get("bot_challenge"):
+            return dict(r, rate_limited=True)  # a challenge won't clear in seconds
+        if r.get("status") not in _FETCH_RATE_LIMIT_STATUSES:
+            return r
+        if attempt == _FETCH_MAX_ATTEMPTS:
+            return dict(r, rate_limited=True)
+        try:
+            wait = float(r.get("retry_after") or 0)
+        except ValueError:
+            wait = 0.0
+        await _async_retry_sleep(min(_RETRY_AFTER_MAX_WAIT, max(wait, 2.0 * 2 ** (attempt - 1))))
+    return r
+
+
 async def _fetch_statuses(client: Any, urls: List[str], site_url: str, *, extra_hosts: Tuple[str, ...] = (),
-                          concurrency: int = 8) -> Dict[str, Dict[str, Any]]:
+                          concurrency: int = _FETCH_DEFAULT_CONCURRENCY) -> Dict[str, Dict[str, Any]]:
+    """Live status of each URL. A 429/503 (a CDN rate-limiting us) is backed
+    off and retried — honouring Retry-After up to 10 s — and, if it persists,
+    marked ``rate_limited``: the page was not checked, it is not broken."""
     sem = asyncio.Semaphore(max(1, concurrency))
     out: Dict[str, Dict[str, Any]] = {}
 
     async def one(u: str) -> None:
         async with sem:
             try:
-                out[u] = await _safe_fetch(client, u, site_url, extra_hosts=extra_hosts)
+                out[u] = await _fetch_with_backoff(client, u, site_url, extra_hosts=extra_hosts)
             except _FetchRefused as e:
                 out[u] = {"url": u, "status": None, "refused": str(e)}
             except Exception as e:  # noqa: BLE001 — network failure is data
                 out[u] = {"url": u, "status": None, "error": f"{type(e).__name__}: {e}"}
+            await _async_retry_sleep(_FETCH_PACING_SEC)
     await asyncio.gather(*(one(u) for u in urls))
     return out
 
@@ -7841,7 +7886,7 @@ async def _control_ok(client: Any, site_url: str, sample_url: Optional[str]) -> 
     within the property) or every live check is inconclusive."""
     home = _site_home(site_url, sample_url)
     try:
-        r = await _safe_fetch(client, home, site_url)
+        r = await _fetch_with_backoff(client, home, site_url)
     except Exception as e:  # noqa: BLE001
         return {"url": home, "ok": False, "error": f"{type(e).__name__}: {e}"}
     if r["status"] in (301, 302, 303, 307, 308):
@@ -7907,7 +7952,7 @@ async def _read_sitemap_urls(client: Any, sitemap_url: str, site_url: str) -> Di
             errors.append({"sitemap": sm, "error": "fetch budget exhausted"})
             break
         try:
-            r = await _safe_fetch(client, sm, site_url, extra_hosts=(sm_host,), want_body=True)
+            r = await _fetch_with_backoff(client, sm, site_url, extra_hosts=(sm_host,), want_body=True)
         except Exception as e:  # noqa: BLE001
             errors.append({"sitemap": sm, "error": f"{type(e).__name__}: {e}"})
             continue
@@ -7940,8 +7985,9 @@ async def gsc_sitemap_diff(
     session_id: Optional[str] = None,
     *,
     dataset: str = "internal_all",
-    check_limit: int = 500,
-    concurrency: int = 8,
+    check_limit: int = 100,
+    check_offset: int = 0,
+    concurrency: int = _FETCH_DEFAULT_CONCURRENCY,
     save_to_file: Optional[str] = None,
 ) -> Any:
     """Compare a sitemap with the site's live pages: live 200 URLs missing
@@ -7955,7 +8001,10 @@ async def gsc_sitemap_diff(
         urls_from: `list` (pass `urls`) | `sf_session` (a Screaming Frog
             session from gsc_load_from_sf_export; rows of `dataset` with
             status 200 and an HTML content type count as live).
-        check_limit: max sitemap URLs whose live status is checked (default 500).
+        check_limit / check_offset: which sitemap URLs get a live check this
+            call (default the first 100; ~20 s at the polite default pace).
+            Page through a large sitemap with check_offset; `next_check_offset`
+            says where to continue.
         save_to_file: absolute .json path for the full result.
     """
     tool = "gsc_sitemap_diff"
@@ -7989,12 +8038,16 @@ async def gsc_sitemap_diff(
             live_200 = [u for u in live_candidates if live_known.get(u) == 200 or (fetched.get(u) or {}).get("status") == 200]
             absent = sorted(u for u in live_200 if _normalize_url(u) not in in_sitemap)
             # Sitemap URLs that do not answer 200.
-            sample = sm["urls"][:check_limit]
+            check_offset = max(0, int(check_offset))
+            sample = sm["urls"][check_offset:check_offset + max(0, int(check_limit))]
             statuses = await _fetch_statuses(client, sample, site_url, concurrency=concurrency)
         out_of_scope = sorted(u for u, s in statuses.items() if s.get("refused"))
+        rate_limited = sorted(u for u, s in statuses.items() if s.get("rate_limited"))
+        challenged = sum(1 for s in statuses.values() if s.get("bot_challenge"))
         bad = [
             {"url": u, "status": s.get("status"), "location": s.get("location"), "error": s.get("error")}
-            for u, s in statuses.items() if s.get("status") != 200 and not s.get("refused")
+            for u, s in statuses.items()
+            if s.get("status") != 200 and not s.get("refused") and not s.get("rate_limited")
         ]
         bad.sort(key=lambda r: (str(r["status"]), r["url"]))
         out = {
@@ -8015,9 +8068,14 @@ async def gsc_sitemap_diff(
                 "other": [b for b in bad if b["status"] not in (301, 302, 303, 307, 308, 404, 410)],
             },
             "sitemap_urls_out_of_scope": out_of_scope,
+            # Still rate-limited after retries: NOT checked, not known broken.
+            "sitemap_urls_unchecked_rate_limited": rate_limited,
             "checked": {
-                "sitemap_urls": len(sample),
-                "sitemap_urls_unchecked": max(0, len(sm["urls"]) - len(sample)),
+                "sitemap_urls": len(sample) - len(rate_limited),
+                "sitemap_urls_unchecked": max(0, len(sm["urls"]) - len(sample)) + len(rate_limited),
+                "check_offset": check_offset,
+                "next_check_offset": (check_offset + len(sample)) if check_offset + len(sample) < len(sm["urls"]) else None,
+                "blocked_by_bot_check": challenged,
                 "live_candidates_supplied": len(live_candidates),
                 "live_known_from_crawl": len(live_known),
                 "live_fetched": len(fetched),
@@ -8029,11 +8087,16 @@ async def gsc_sitemap_diff(
                                        "bot blocking, not the site."])
                                    + ([] if sm["complete"] else [
                                        "The sitemap was not read completely (see sitemap_errors); absence "
-                                       "from it is reported as 'possibly' only."])),
+                                       "from it is reported as 'possibly' only."])
+                                   + ([] if not rate_limited else [
+                                       f"{len(rate_limited)} sitemap URL(s) were not checked: rate-limited (429/503) "
+                                       f"after retries, or served a CDN bot-check page ({challenged}). Rerun later "
+                                       f"or lower concurrency."])),
         }
         if save_to_file:
             return await _save_and_trim(out, save_to_file, (
-                "missing_from_sitemap", "possibly_missing_from_sitemap", "sitemap_urls_out_of_scope"))
+                "missing_from_sitemap", "possibly_missing_from_sitemap", "sitemap_urls_out_of_scope",
+                "sitemap_urls_unchecked_rate_limited"))
         return out
     except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
         return _tool_error(e, tool=tool, site_url=site_url)

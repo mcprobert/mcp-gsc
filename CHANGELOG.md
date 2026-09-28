@@ -5,6 +5,35 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.5.1] — 2026-09-28 — live checks that survive a CDN
+
+### Fixed
+
+- **Rate-limited and bot-checked URLs were reported as broken.** A full
+  `gsc_sitemap_diff` over a ~600-URL sitemap at 8 parallel fetches tripped the
+  CDN: a third of the URLs came back 429 and were listed under "other", as if
+  the pages were broken. Now:
+  - a 429/503 is backed off and retried (Retry-After honoured up to 10 s);
+  - a CDN bot-check page ("Checking browser", `cf-mitigated: challenge`) is
+    detected and never read as the page's status, and is not retried;
+  - URLs still limited or challenged are listed as
+    `sitemap_urls_unchecked_rate_limited` (not checked, not broken), with a
+    warning; the control request and sitemap fetches use the same logic.
+- **The fetcher now connects in the OS's address order** (RFC 6724, usually
+  IPv6 first), as a normal client does; it had sorted the validated addresses,
+  which could pin every request to one flagged IPv4 edge.
+
+### Changed
+
+- Politer defaults: 3 workers with 0.3 s between requests per worker, and
+  `gsc_sitemap_diff` checks 100 sitemap URLs per call (about 20 s) — page
+  through a large sitemap with the new `check_offset`; `next_check_offset`
+  says where to continue. `checked.blocked_by_bot_check` counts challenges.
+
+### Tests
+
+- 569 passing (4 new).
+
 ## [1.5.0] — 2026-09-28 — analysis tools, recrawl worklist, sitemap diff, UI-export SQL
 
 ### Added

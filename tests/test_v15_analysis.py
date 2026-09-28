@@ -731,3 +731,80 @@ class TestUiExportRealLayout:
             ["Top pages", "01/02/2026 - 07/02/2026 Clicks", "01/03/2026 - 07/03/2026 Clicks"])
         assert [p["month"] for p in periods] == [None, None]
         assert {a for a, _ in aliases} == {"clicks_a", "clicks_b"}
+
+
+class TestFetchRateLimits:
+    async def test_429_retried_then_reported_unchecked(self, monkeypatch):
+        calls = {}
+
+        async def fake(client, url, site_url, **kw):
+            calls[url] = calls.get(url, 0) + 1
+            if url.endswith("/flaky") and calls[url] < 3:
+                return {"url": url, "status": 429, "location": None, "retry_after": "1"}
+            if url.endswith("/always"):
+                return {"url": url, "status": 429, "location": None, "retry_after": None}
+            return {"url": url, "status": 200, "location": None}
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_server._fetch_statuses(None, ["https://example.com/flaky", "https://example.com/always"], SITE)
+        assert out["https://example.com/flaky"]["status"] == 200 and calls["https://example.com/flaky"] == 3
+        assert out["https://example.com/always"]["rate_limited"] is True
+        assert calls["https://example.com/always"] == gsc_server._FETCH_MAX_ATTEMPTS
+
+    async def test_sitemap_diff_separates_rate_limited(self, monkeypatch):
+        body = b"""<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+          <url><loc>https://www.example.com/ok</loc></url><url><loc>https://www.example.com/busy</loc></url></urlset>"""
+
+        async def fake(client, url, site_url, *, extra_hosts=(), want_body=False, max_bytes=0):
+            if url.endswith("sitemap.xml"):
+                return {"url": url, "status": 200, "location": None, "body": body}
+            if url.endswith("/busy"):
+                return {"url": url, "status": 429, "location": None}
+            return {"url": url, "status": 200, "location": None}
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_sitemap_diff(SITE, "https://www.example.com/sitemap.xml", urls=[])
+        assert out["sitemap_urls_unchecked_rate_limited"] == ["https://www.example.com/busy"]
+        assert out["sitemap_urls_not_200"]["other"] == []
+        assert out["checked"]["sitemap_urls"] == 1 and any("rate-limited" in w for w in out["meta"]["warnings"])
+
+
+class TestBotChallenge:
+    def _client(self, status, body, seen):
+        class _Resp:
+            status_code = status
+            headers = {}
+            extensions = {}
+
+            async def aiter_bytes(self):
+                yield body
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Resp()
+
+            async def __aexit__(self, *a):
+                return False
+
+        class _Client:
+            def stream(self, method, url, headers=None, extensions=None):
+                seen.append(url)
+                return _Ctx()
+        return _Client()
+
+    async def test_challenge_page_flagged_and_not_retried(self, monkeypatch):
+        monkeypatch.setattr(gsc_server.socket, "getaddrinfo", lambda *a, **k: [
+            (None, None, None, None, ("2606:4700::1", 443, 0, 0)), (None, None, None, None, ("93.184.216.34", 443))])
+        seen = []
+        client = self._client(429, b"<html><title>Checking browser</title></html>", seen)
+        r = await gsc_server._fetch_with_backoff(client, "https://www.example.com/p", SITE)
+        assert r["bot_challenge"] is True and r["rate_limited"] is True
+        assert len(seen) == 1  # no pointless retries against a challenge
+        assert seen[0].startswith("https://[2606:4700::1]/")  # OS order kept: IPv6 first
+
+    async def test_plain_429_still_retried(self, monkeypatch):
+        monkeypatch.setattr(gsc_server.socket, "getaddrinfo",
+                            lambda *a, **k: [(None, None, None, None, ("93.184.216.34", 443))])
+        seen = []
+        client = self._client(429, b"slow down", seen)
+        r = await gsc_server._fetch_with_backoff(client, "https://www.example.com/p", SITE)
+        assert r.get("bot_challenge") is None and r["rate_limited"] is True
+        assert len(seen) == gsc_server._FETCH_MAX_ATTEMPTS
