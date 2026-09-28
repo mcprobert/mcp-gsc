@@ -5,6 +5,50 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.6.0] — 2026-09-29 — coverage everywhere, sitemap redirect classification
+
+### Added
+
+- **Coverage on every result that samples, caps, pages or skips.** A
+  `coverage` block — `checked` N `of` M (null when the total is unknown),
+  `unit`, `partial`, and a one-line `summary` — in `meta` of every analytics
+  tool (from the engine: rows returned of rows that exist), the comparison
+  tools (per period plus rows shown), movers (gainers/losers shown),
+  cannibalisation and striking distance (shown vs qualifying), inspection
+  status (inspected and shown), the recrawl worklist (URLs classified) and
+  UI-export SQL (rows returned). Markdown output prints a `Coverage:` line
+  when partial. Prompted by a sitemap check that reported "4 redirects" from
+  40 of 591 URLs with nothing saying so.
+- **`gsc_sitemap_diff` states coverage up front** (`partial`, `coverage`
+  before any counts; a warning naming the next `check_offset`), and
+  **classifies each redirect** after following it hop by hop (≤ 5 hops,
+  loops detected, paced): `equivalent`, `hub` (/, /blog, /events, /about,
+  plus — not instead of — the site config's `hub_paths` / `hub_regex`),
+  `chain` (more than one hop) or `unverified` (the destination could not be
+  fetched, so it might redirect again). Coverage counts redirects with a
+  verified destination, excludes refused and rate-limited URLs from
+  "live-checked", and counts sitemap documents left unread. Rows carry `final_url`, `hops`, `chain` and `target_status`;
+  `redirect_summary` counts each class.
+- **`cms_state` hook** on `gsc_sitemap_diff`: a CMS-aware caller passes
+  `{url: state}`; redirect rows gain `cms_state` and
+  `published_but_redirected` (a published page behind a redirect rule stays
+  in a CMS-generated sitemap).
+- Site config keys `hub_paths` and `hub_regex`.
+
+### Notes for agents (also in the README)
+
+- `days=N` means the last N days of final data (Pacific Time), since 1.4.0.
+- UI exports use the account's date locale — often day-first; periods are
+  parsed from the column headers into `meta`.
+- The Generative AI features export has pages only: no queries, no clicks.
+- The Indexing API cannot request indexing for normal pages.
+- Full-sitemap liveness sweeps go through `gsc_sitemap_diff` only; bursts
+  against Cloudflare-fronted sites trigger bot challenges.
+
+### Tests
+
+- 578 passing (9 new).
+
 ## [1.5.1] — 2026-09-28 — live checks that survive a CDN
 
 ### Fixed

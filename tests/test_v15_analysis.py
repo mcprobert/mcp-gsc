@@ -808,3 +808,138 @@ class TestBotChallenge:
         r = await gsc_server._fetch_with_backoff(client, "https://www.example.com/p", SITE)
         assert r.get("bot_challenge") is None and r["rate_limited"] is True
         assert len(seen) == gsc_server._FETCH_MAX_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# v1.6.0: coverage on every sampled / capped result; redirect classification
+# ---------------------------------------------------------------------------
+
+
+class TestCoverage:
+    def test_coverage_helper(self):
+        c = gsc_server._coverage(40, 591, "sitemap URLs")
+        assert c["partial"] is True and c["summary"] == "checked 40 of 591 sitemap URLs — PARTIAL"
+        assert gsc_server._coverage(5, 5, "rows")["partial"] is False
+        assert gsc_server._coverage(5, None, "rows")["partial"] is True
+
+    async def test_query_coverage_partial_when_truncated(self, monkeypatch):
+        _patch(monkeypatch, _service(lambda b: {"rows": [_row(f"q{i}", 1, 1) for i in range(b["rowLimit"])]}))
+        out = await gsc_server.gsc_query(SITE, "2026-09-01", "2026-09-25", row_limit=10, include_totals=False)
+        assert out["meta"]["coverage"]["partial"] is True and out["meta"]["coverage"]["of"] is None
+        md = await gsc_server.gsc_query(SITE, "2026-09-01", "2026-09-25", row_limit=10, include_totals=False,
+                                        response_format="markdown")
+        assert "Coverage: checked 10 of an unknown total" in md
+
+    async def test_query_coverage_complete(self, monkeypatch):
+        _patch(monkeypatch, _service(lambda b: {"rows": [_row("q", 1, 1)]}))
+        out = await gsc_server.gsc_query(SITE, "2026-09-01", "2026-09-25", include_totals=False)
+        assert out["meta"]["coverage"] == {"checked": 1, "of": 1, "unit": "rows", "partial": False,
+                                           "summary": "checked 1 of 1 rows"}
+
+    async def test_cannibalisation_shown_vs_total(self, monkeypatch):
+        rows = []
+        for i in range(5):
+            rows += [_row([f"q{i}", "https://example.com/x"], 1, 50), _row([f"q{i}", "https://example.com/y"], 1, 50)]
+        _patch(monkeypatch, _service(lambda b: {"rows": rows}))
+        out = await gsc_cannibalisation(SITE, limit=2)
+        shown = out["meta"]["coverage"]["queries_shown"]
+        assert (shown["checked"], shown["of"], shown["partial"]) == (2, 5, True)
+
+
+class TestSitemapRedirectClassification:
+    async def test_equivalent_hub_chain_and_cms_state(self, monkeypatch):
+        W = "https://www.example.com"
+        body = ("<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\">" + "".join(
+            f"<url><loc>{W}/{p}</loc></url>" for p in ("old-post", "old-news", "hop1", "loop", "fine", "unchecked")
+        ) + "</urlset>").encode()
+        pages = {
+            f"{W}/": (200, None), f"{W}/fine": (200, None),
+            f"{W}/old-post": (301, "/new-post"), f"{W}/new-post": (200, None),
+            f"{W}/old-news": (301, f"{W}/blog/"), f"{W}/blog/": (200, None),
+            f"{W}/hop1": (301, "/hop2"), f"{W}/hop2": (302, "/final"), f"{W}/final": (200, None),
+            f"{W}/loop": (301, "/loop2"), f"{W}/loop2": (301, "/loop"),
+            f"{W}/unchecked": (200, None),
+        }
+
+        async def fake(client, url, site_url, *, extra_hosts=(), want_body=False, max_bytes=0):
+            if url.endswith("sitemap.xml"):
+                return {"url": url, "status": 200, "location": None, "body": body}
+            status, loc = pages[url]
+            return {"url": url, "status": status, "location": loc}
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_sitemap_diff(SITE, f"{W}/sitemap.xml", urls=[], check_limit=5,
+                                     cms_state={f"{W}/old-post": "PUBLISHED", f"{W}/old-news": "archived"})
+        by = {r["url"].rsplit("/", 1)[-1]: r for r in out["sitemap_urls_not_200"]["redirect"]}
+        assert by["old-post"]["classification"] == "equivalent" and by["old-post"]["final_url"] == f"{W}/new-post"
+        assert by["old-news"]["classification"] == "hub"
+        assert by["hop1"]["classification"] == "chain" and by["hop1"]["hops"] == 2
+        assert by["loop"]["classification"] == "chain" and by["loop"]["note"] == "redirect loop"
+        assert by["old-post"]["published_but_redirected"] is True and by["old-news"]["published_but_redirected"] is False
+        assert out["redirect_summary"] == {"equivalent": 1, "hub": 1, "chain": 2, "unverified": 0, "published_but_redirected": 1}
+        # 5 of 6 sitemap URLs checked: partial, and said so up front.
+        assert out["partial"] is True
+        assert out["coverage"]["sitemap_urls_live_checked"]["summary"] == "checked 5 of 6 sitemap URLs live-checked — PARTIAL"
+        assert any("continue with check_offset=5" in w for w in out["meta"]["warnings"])
+
+    async def test_hub_paths_from_site_config(self, monkeypatch):
+        W = "https://www.example.com"
+        _write_config({SITE: {"hub_paths": ["/news"], "hub_regex": "^/tag/"}})
+        body = f"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>{W}/a</loc></url><url><loc>{W}/b</loc></url></urlset>".encode()
+        pages = {f"{W}/": (200, None), f"{W}/a": (301, "/news/"), f"{W}/news/": (200, None),
+                 f"{W}/b": (301, "/tag/x"), f"{W}/tag/x": (200, None)}
+
+        async def fake(client, url, site_url, *, extra_hosts=(), want_body=False, max_bytes=0):
+            if url.endswith("sitemap.xml"):
+                return {"url": url, "status": 200, "location": None, "body": body}
+            status, loc = pages[url]
+            return {"url": url, "status": status, "location": loc}
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_sitemap_diff(SITE, f"{W}/sitemap.xml", urls=[])
+        assert {r["classification"] for r in out["sitemap_urls_not_200"]["redirect"]} == {"hub"}
+        assert out["partial"] is False
+
+
+class TestReviewFixesV16:
+    async def test_unverified_destination_and_refused_not_counted(self, monkeypatch):
+        W = "https://www.example.com"
+        body = (f"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>{W}/a</loc></url>"
+                f"<url><loc>{W}/b</loc></url></urlset>").encode()
+
+        async def fake(client, url, site_url, *, extra_hosts=(), want_body=False, max_bytes=0):
+            if url.endswith("sitemap.xml"):
+                return {"url": url, "status": 200, "location": None, "body": body}
+            if url == f"{W}/":
+                return {"url": url, "status": 200, "location": None}
+            if url == f"{W}/a":
+                return {"url": url, "status": 301, "location": "/busy"}
+            if url == f"{W}/busy":
+                return {"url": url, "status": 429, "location": None}
+            raise gsc_server._FetchRefused("outside")
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_sitemap_diff(SITE, f"{W}/sitemap.xml", urls=[])
+        red = out["sitemap_urls_not_200"]["redirect"][0]
+        assert red["classification"] == "unverified"
+        cov = out["coverage"]
+        assert cov["sitemap_urls_live_checked"]["checked"] == 1  # /b was refused, not checked
+        assert cov["redirects_classified"]["partial"] is True and out["partial"] is True
+
+    def test_hub_paths_extend_defaults(self):
+        hubs = {"/", "/blog", "/events", "/about", "/news"}
+        info = {"hops": 1, "final_url": "https://x.test/blog/", "target_status": 200}
+        assert gsc_server._classify_redirect(info, hubs, None) == "hub"
+
+    async def test_configured_hubs_keep_defaults(self, monkeypatch):
+        W = "https://www.example.com"
+        _write_config({SITE: {"hub_paths": ["/news"]}})
+        body = f"<urlset xmlns=\"http://www.sitemaps.org/schemas/sitemap/0.9\"><url><loc>{W}/a</loc></url></urlset>".encode()
+        pages = {f"{W}/": (200, None), f"{W}/a": (301, "/blog"), f"{W}/blog": (200, None)}
+
+        async def fake(client, url, site_url, *, extra_hosts=(), want_body=False, max_bytes=0):
+            if url.endswith("sitemap.xml"):
+                return {"url": url, "status": 200, "location": None, "body": body}
+            status, loc = pages[url]
+            return {"url": url, "status": status, "location": loc}
+        monkeypatch.setattr(gsc_server, "_safe_fetch", fake)
+        out = await gsc_sitemap_diff(SITE, f"{W}/sitemap.xml", urls=[])
+        assert out["sitemap_urls_not_200"]["redirect"][0]["classification"] == "hub"
+        assert "/news" in out["meta"]["hub_paths"] and "/blog" in out["meta"]["hub_paths"]

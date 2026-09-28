@@ -706,10 +706,35 @@ def _format_error(
     return "\n".join(parts)
 
 
+def _coverage(checked: int, of: Optional[int], unit: str, note: Optional[str] = None) -> Dict[str, Any]:
+    """How much of the whole a result looked at (v1.6.0): ``checked`` of
+    ``of`` (None = unknown, more exist). ``partial`` is true whenever the
+    result is a sample, a cap, a page or a skip — so "4 redirects" from 40
+    of 591 URLs can never read as the whole answer."""
+    partial = of is None or checked < of
+    total = "an unknown total (more exist)" if of is None else str(of)
+    out: Dict[str, Any] = {
+        "checked": checked, "of": of, "unit": unit, "partial": partial,
+        "summary": f"checked {checked} of {total} {unit}" + (" — PARTIAL" if partial else ""),
+    }
+    if note:
+        out["note"] = note
+    return out
+
+
+def _coverage_rollup(parts: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """Several coverages under one key; partial if any part is."""
+    return {"partial": any(c["partial"] for c in parts.values()),
+            "summary": "; ".join(f"{k}: {c['summary']}" for k, c in parts.items()), **parts}
+
+
 def _markdown_meta_footer(meta: Dict[str, Any]) -> List[str]:
     """Compact meta lines under a markdown table: the totals-honesty gap and
     any warnings (the window itself is a header line)."""
     lines: List[str] = []
+    cov = meta.get("coverage")
+    if isinstance(cov, dict) and cov.get("partial"):
+        lines.append(f"Coverage: {cov.get('summary')}")
     share = meta.get("unattributed_share")
     total = meta.get("page_total")
     if isinstance(share, dict) and isinstance(total, dict):
@@ -2691,6 +2716,12 @@ async def _sa_run(
         "first_incomplete_date": fresh["first_incomplete_date"],
         "first_incomplete_hour": fresh["first_incomplete_hour"],
         "sort_applied": "client" if client_sort else "api_order",
+        # Rows returned of rows that exist: when the fetch ran to the end the
+        # total is known (rows before a start_row offset included).
+        "coverage": _coverage(
+            len(rows), (fetch_origin + len(all_rows)) if complete else None, "rows",
+            None if complete else "the API has more rows than were fetched (row_limit / max_rows)",
+        ),
         "totals": totals,
         "warnings": warnings,
         "filter_groups": groups,
@@ -2707,6 +2738,7 @@ def _sa_meta(res: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
         "row_count": len(res["rows"]),
         "truncated": res["truncated"],
         "sort_applied": res["sort_applied"],
+        "coverage": res["coverage"],
     }
     if res["totals"] is not None:
         fields["page_total"] = res["totals"]["page_total"]
@@ -4271,7 +4303,11 @@ async def gsc_inspect_status(
             "elapsed_seconds": round(elapsed, 1),
             "quota": quota,
             "meta": _standard_meta(None, site_url=job["site_url"], account_alias=job["account_alias"],
-                                   row_count=len(page), truncated=next_offset is not None),
+                                   row_count=len(page), truncated=next_offset is not None,
+                                   coverage=_coverage_rollup({
+                                       "inspected": _coverage(progress["done"], progress["total"], "URLs inspected"),
+                                       "shown": _coverage(len(page), len(rows), "results on this page"),
+                                   })),
         }
     except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
         return _tool_error(e, tool=tool, response_format=fmt if fmt in _RESPONSE_FORMATS else "json")
@@ -5439,6 +5475,10 @@ async def gsc_compare_search_periods(
             coverage={
                 "p1": "complete" if p1_complete else "truncated",
                 "p2": "complete" if p2_complete else "truncated",
+                **_coverage_rollup({
+                    "period1_rows": res1["coverage"], "period2_rows": res2["coverage"],
+                    "shown": _coverage(len(rows), total_matched, "matched keys"),
+                }),
             },
             data_state=data_state,
             latest_final_date=w2["latest_final_date"],
@@ -6053,6 +6093,10 @@ async def gsc_compare_periods_landing_pages(
                 coverage={
                     "a": "complete" if a_complete else "truncated",
                     "b": "complete" if b_complete else "truncated",
+                    **_coverage_rollup({
+                        "period_a_rows": a_res["coverage"], "period_b_rows": b_res["coverage"],
+                        "shown": _coverage(len(sliced), len(diffs), "matched pages"),
+                    }),
                 },
                 data_state=data_state,
                 latest_final_date=wb["latest_final_date"],
@@ -7395,6 +7439,7 @@ async def gsc_brand_split(
             rows, columns, response_format="json",
             meta=_standard_meta(w, site_url=site_url, granularity=gran, brand_regex=brand_re,
                                 login_regex=login_re, row_count=len(rows), truncated=False,
+                                coverage=_coverage(len(total), len(total), "days with data (all fetched)"),
                                 brand_terms_source="site_config" if brand_terms is None else "argument"),
         )
         out["tool"] = tool
@@ -7465,11 +7510,13 @@ async def gsc_striking_distance(
                 click_upside=(gap * r["impressions"]) if gap is not None else None,
             ))
         candidates.sort(key=lambda c: (-(c["click_upside"] or 0), c["page"]))
+        qualified = len(candidates)
         candidates = candidates[:max(1, int(limit))]
 
         by_page: Dict[str, List[Dict[str, Any]]] = {c["page"]: [] for c in candidates}
         daily: Dict[str, Dict[str, List[float]]] = {}
         daily_complete = True
+        daily_rows = 0
         for chunk in _chunks(list(by_page), 20):
             page_filter = [{"filters": [{"dimension": "page", "operator": "includingRegex",
                                          "expression": _url_regex(chunk)}]}]
@@ -7484,6 +7531,7 @@ async def gsc_striking_distance(
                 filter_groups=page_filter, fetch_all=True, step=f"{tool}.daily",
             )
             daily_complete = daily_complete and dq["complete"]
+            daily_rows += len(dq["rows"])
             for row in dq["rows"]:
                 daily.setdefault(row["page"], {}).setdefault(row["query"], []).append(float(row.get("impressions") or 0))
         for c in candidates:
@@ -7503,7 +7551,13 @@ async def gsc_striking_distance(
                              thresholds={"min_impressions": min_impressions, "pos_from": pos_from,
                                          "pos_to": pos_to, "ctr_below_expected": ctr_below_expected},
                              excluded_urls=sorted(excluded), row_count=len(candidates),
-                             spike_evidence="complete" if daily_complete else "partial (max_rows cap)"),
+                             spike_evidence="complete" if daily_complete else "partial (max_rows cap)",
+                             coverage=_coverage_rollup({
+                                 "page_rows": res["coverage"],
+                                 "candidates_shown": _coverage(len(candidates), qualified, "qualifying pages"),
+                                 "daily_spike_evidence": _coverage(daily_rows, daily_rows if daily_complete else None,
+                                                                   "daily query rows"),
+                             })),
         }
         return await _save_and_trim(out, save_to_file, ("candidates",)) if save_to_file else out
     except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
@@ -7605,7 +7659,12 @@ async def gsc_movers(
             "meta": _standard_meta(
                 None, site_url=site_url, period_a=_window_meta(wa), period_b=_window_meta(wb),
                 coverage={"a": "complete" if a["complete"] else "truncated",
-                          "b": "complete" if b["complete"] else "truncated"},
+                          "b": "complete" if b["complete"] else "truncated",
+                          **_coverage_rollup({
+                              "period_a_rows": a["coverage"], "period_b_rows": b["coverage"],
+                              "gainers_shown": _coverage(len(gainers), sum(1 for r in scored if sign * r[f"{metric}_delta"] > 0), "gainers"),
+                              "losers_shown": _coverage(len(losers), sum(1 for r in scored if sign * r[f"{metric}_delta"] < 0), "losers"),
+                          })},
                 data_state=data_state, latest_final_date=wb["latest_final_date"], timezone=_PT_LABEL,
                 row_count=len(gainers) + len(losers), truncated=False,
                 warnings=list(wa["warnings"]) + list(wb["warnings"]),
@@ -7697,7 +7756,12 @@ async def gsc_cannibalisation(
             "total_cannibalised_queries": len(groups),
             "meta": _sa_meta(res, site_url=site_url, query_regex=query_regex, page_regex=page_regex,
                              min_pages=min_pages, min_impressions=min_impressions,
-                             row_count=min(len(groups), max(1, int(limit)))),
+                             row_count=min(len(groups), max(1, int(limit))),
+                             coverage=_coverage_rollup({
+                                 "query_page_rows": res["coverage"],
+                                 "queries_shown": _coverage(len(groups) if save_to_file else min(len(groups), max(1, int(limit))),
+                                                            len(groups), "cannibalised queries"),
+                             })),
         }
         return await _save_and_trim(out, save_to_file, ("queries",)) if save_to_file else out
     except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
@@ -7972,8 +8036,76 @@ async def _read_sitemap_urls(client: Any, sitemap_url: str, site_url: str) -> Di
             errors.append({"sitemap": sm, "error": f"URL cap {_SITEMAP_MAX_URLS} reached"})
             urls = urls[:_SITEMAP_MAX_URLS]
             break
+    unread = {sm for sm, _ in queue if sm not in seen_maps}
     return {"urls": urls, "sitemaps_read": sorted(seen_maps), "errors": errors,
-            "complete": not errors and not queue}
+            "sitemaps_unread": sorted(unread), "complete": not errors and not unread}
+
+
+_REDIRECT_STATUSES = (301, 302, 303, 307, 308)
+_REDIRECT_MAX_HOPS = 5
+_DEFAULT_HUB_PATHS = ("/", "/blog", "/events", "/about")
+
+
+def _url_path(u: str) -> str:
+    from urllib.parse import urlsplit
+    path = urlsplit(u).path or "/"
+    return path.rstrip("/") or "/"
+
+
+async def _follow_redirect(client: Any, url: str, location: Optional[str], site_url: str) -> Dict[str, Any]:
+    """Follow a sitemap URL's redirect hop by hop (each hop via the safe,
+    paced fetcher; ≤ 5 hops; loops detected) to its final destination."""
+    from urllib.parse import urljoin
+    chain = [url]
+    current = urljoin(url, location or "")
+    note: Optional[str] = None
+    final_status: Optional[int] = None
+    while True:
+        if current in chain:
+            note = "redirect loop"
+            chain.append(current)
+            break
+        chain.append(current)
+        try:
+            r = await _fetch_with_backoff(client, current, site_url)
+        except _FetchRefused as e:
+            note = f"destination not fetched: {e}"
+            break
+        except Exception as e:  # noqa: BLE001 — a failed hop is reported, not fatal
+            note = f"{type(e).__name__}: {e}"
+            break
+        finally:
+            await _async_retry_sleep(_FETCH_PACING_SEC)
+        if r.get("rate_limited"):
+            note = "destination rate-limited or bot-checked; not verified"
+            break
+        if r.get("status") in _REDIRECT_STATUSES and r.get("location"):
+            if len(chain) - 1 >= _REDIRECT_MAX_HOPS:
+                note = f"more than {_REDIRECT_MAX_HOPS} hops"
+                break
+            current = urljoin(current, r["location"])
+            continue
+        final_status = r.get("status")
+        break
+    return {"final_url": chain[-1], "hops": len(chain) - 1, "chain": chain,
+            "target_status": final_status, "note": note}
+
+
+def _classify_redirect(info: Dict[str, Any], hub_paths: set, hub_rx: Optional["re.Pattern"]) -> str:
+    """``chain`` (more than one hop, or a loop), ``unverified`` (the
+    destination could not be fetched), ``hub`` (lands on a listing page:
+    /, /blog, /events, /about plus the site config's hub_paths / hub_regex),
+    else ``equivalent`` (a comparable page)."""
+    if info["hops"] > 1 or info.get("note") == "redirect loop":
+        return "chain"
+    if info.get("target_status") is None:
+        # The destination was not observed (rate-limited, refused, failed):
+        # it could redirect again, so neither hub nor equivalent is known.
+        return "unverified"
+    path = _url_path(info["final_url"])
+    if path in hub_paths or (hub_rx is not None and hub_rx.search(path)):
+        return "hub"
+    return "equivalent"
 
 
 @mcp.tool()
@@ -7988,13 +8120,26 @@ async def gsc_sitemap_diff(
     check_limit: int = 100,
     check_offset: int = 0,
     concurrency: int = _FETCH_DEFAULT_CONCURRENCY,
+    classify_redirects: bool = True,
+    cms_state: Optional[Dict[str, str]] = None,
     save_to_file: Optional[str] = None,
 ) -> Any:
     """Compare a sitemap with the site's live pages: live 200 URLs missing
     from the sitemap, and sitemap URLs that redirect or 404. Fetches with a
     browser user agent after a control request to the home page; if the
-    control fails, live results are marked inconclusive. Redirects are
-    reported, never followed. Only URLs inside the property are fetched.
+    control fails, live results are marked inconclusive. Only URLs inside
+    the property are fetched. This is the approved route for a full-sitemap
+    liveness sweep: it paces itself, because bursts against a CDN-fronted
+    site (e.g. Cloudflare) trigger bot challenges.
+
+    Every result states its coverage (`coverage.summary`, e.g. "checked 100
+    of 591 sitemap URLs — PARTIAL"); `partial` is true until every sitemap
+    URL has been checked across calls (see `next_check_offset`).
+
+    Each redirect is followed hop by hop and classified: `equivalent` (lands
+    on a comparable page), `hub` (lands on a listing page — /, /blog,
+    /events, /about, plus the site config's `hub_paths` / `hub_regex`) or
+    `chain` (more than one hop).
 
     Args:
         site_url: GSC property. sitemap_url: sitemap or sitemap index URL.
@@ -8005,6 +8150,12 @@ async def gsc_sitemap_diff(
             call (default the first 100; ~20 s at the polite default pace).
             Page through a large sitemap with check_offset; `next_check_offset`
             says where to continue.
+        classify_redirects: follow and classify each redirect (default true;
+            one paced request per hop).
+        cms_state: optional {url: state} from a CMS-aware caller (e.g.
+            "published", "draft"); redirect rows then carry `cms_state`, and
+            `published_but_redirected` when a published page is behind a
+            redirect (it stays in a CMS-generated sitemap).
         save_to_file: absolute .json path for the full result.
     """
     tool = "gsc_sitemap_diff"
@@ -8041,6 +8192,11 @@ async def gsc_sitemap_diff(
             check_offset = max(0, int(check_offset))
             sample = sm["urls"][check_offset:check_offset + max(0, int(check_limit))]
             statuses = await _fetch_statuses(client, sample, site_url, concurrency=concurrency)
+            follow: Dict[str, Dict[str, Any]] = {}
+            if classify_redirects:
+                for u, st in statuses.items():
+                    if st.get("status") in _REDIRECT_STATUSES:
+                        follow[u] = await _follow_redirect(client, u, st.get("location"), site_url)
         out_of_scope = sorted(u for u, s in statuses.items() if s.get("refused"))
         rate_limited = sorted(u for u, s in statuses.items() if s.get("rate_limited"))
         challenged = sum(1 for s in statuses.values() if s.get("bot_challenge"))
@@ -8050,8 +8206,48 @@ async def gsc_sitemap_diff(
             if s.get("status") != 200 and not s.get("refused") and not s.get("rate_limited")
         ]
         bad.sort(key=lambda r: (str(r["status"]), r["url"]))
+        cfg = _load_site_config(site_url)
+        hub_paths = {(_url_path(p) if p.startswith("http") else (p.rstrip("/") or "/"))
+                     for p in list(_DEFAULT_HUB_PATHS) + list(cfg.get("hub_paths") or [])}
+        hub_rx = re.compile(cfg["hub_regex"]) if cfg.get("hub_regex") else None
+        cms = {_normalize_url(k): str(v) for k, v in (cms_state or {}).items()}
+        redirect_summary: Dict[str, int] = {"equivalent": 0, "hub": 0, "chain": 0, "unverified": 0,
+                                            "published_but_redirected": 0}
+        for b in bad:
+            if b["status"] not in _REDIRECT_STATUSES:
+                continue
+            info = follow.get(b["url"])
+            if info:
+                b.update(final_url=info["final_url"], hops=info["hops"], chain=info["chain"],
+                         target_status=info["target_status"], classification=_classify_redirect(info, hub_paths, hub_rx))
+                if info.get("note"):
+                    b["note"] = info["note"]
+                redirect_summary[b["classification"]] += 1
+            state = cms.get(_normalize_url(b["url"]))
+            if state is not None:
+                b["cms_state"] = state
+                b["published_but_redirected"] = state.strip().lower() == "published"
+                redirect_summary["published_but_redirected"] += int(b["published_but_redirected"])
+        live_checked = len(sample) - len(set(rate_limited) | set(out_of_scope))
+        n_redirects = sum(1 for b in bad if b["status"] in _REDIRECT_STATUSES)
+        n_verified = sum(1 for b in bad if b.get("classification") not in (None, "unverified")
+                         and b["status"] in _REDIRECT_STATUSES)
+        parts = {
+            "sitemap_urls_live_checked": _coverage(live_checked, len(sm["urls"]), "sitemap URLs live-checked"),
+            "sitemap_documents_read": _coverage(
+                len(sm["sitemaps_read"]) - len(sm["errors"]),
+                len(sm["sitemaps_read"]) + len(sm.get("sitemaps_unread") or []), "sitemap documents read"),
+            "live_candidates_checked": _coverage(len(live_known) + len(fetched), len(live_candidates),
+                                                 "live candidate URLs checked"),
+        }
+        if classify_redirects:
+            parts["redirects_classified"] = _coverage(n_verified, n_redirects, "redirects with a verified destination")
+        coverage = _coverage_rollup(parts)
         out = {
             "ok": True, "tool": tool, "site_url": site_url, "sitemap_url": sitemap_url,
+            # Coverage first: counts below cover only what was checked.
+            "partial": coverage["partial"],
+            "coverage": coverage,
             "inconclusive": not control["ok"],
             "control": control,
             "sitemap_url_count": len(sm["urls"]),
@@ -8062,6 +8258,7 @@ async def gsc_sitemap_diff(
             # only "possibly" missing.
             "missing_from_sitemap": absent if sm["complete"] else [],
             "possibly_missing_from_sitemap": [] if sm["complete"] else absent,
+            "redirect_summary": redirect_summary if classify_redirects else None,
             "sitemap_urls_not_200": {
                 "redirect": [b for b in bad if b["status"] in (301, 302, 303, 307, 308)],
                 "not_found": [b for b in bad if b["status"] in (404, 410)],
@@ -8081,8 +8278,14 @@ async def gsc_sitemap_diff(
                 "live_fetched": len(fetched),
                 "live_unchecked": max(0, len(to_check) - check_limit),
             },
-            "meta": _standard_meta(None, site_url=site_url, urls_from=source,
-                                   warnings=([] if control["ok"] else [
+            "meta": _standard_meta(None, site_url=site_url, urls_from=source, coverage=coverage,
+                                   hub_paths=sorted(hub_paths),
+                                   warnings=([] if not coverage["sitemap_urls_live_checked"]["partial"] else [
+                                       f"Live-checked {live_checked} of {len(sm['urls'])} sitemap URLs: redirect "
+                                       f"and 404 counts cover only those"
+                                       + (f"; continue with check_offset={check_offset + len(sample)}."
+                                          if check_offset + len(sample) < len(sm["urls"]) else ".")])
+                                   + ([] if control["ok"] else [
                                        "Control request to the home page failed; live statuses may reflect "
                                        "bot blocking, not the site."])
                                    + ([] if sm["complete"] else [
@@ -8324,7 +8527,9 @@ async def gsc_recrawl_worklist(
             "counts": {"needs_request_indexing": len(needs), "canonical_mismatches": len(mismatches),
                        "no_action_needed": len(fine), "unresolved": len(unresolved)},
             "live_check_control": control,
+            "coverage": _coverage(len(urls) - len(unresolved), len(urls), "URLs classified"),
             "meta": _standard_meta(None, site_url=site_url, daily_cap=cap, job_id=(job or {}).get("job_id"),
+                                   coverage=_coverage(len(urls) - len(unresolved), len(urls), "URLs classified"),
                                    api_limits={"request_indexing": _API_LIMITS["request_indexing"]}),
         }
     except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
@@ -8831,7 +9036,8 @@ async def gsc_query_ui_export(
             truncation_hint=f"More rows exist; raise limit (max {_UI_MAX_RESULT_ROWS}) or add a WHERE/LIMIT.",
             meta=_standard_meta(None, session_id=session_id, source_file=sess["meta"].get("source_file"),
                                 export_date_range=sess["meta"].get("date_range"),
-                                row_count=len(dict_rows), truncated=more, warnings=warnings),
+                                row_count=len(dict_rows), truncated=more, warnings=warnings,
+                                coverage=_coverage(len(dict_rows), None if more else len(dict_rows), "result rows")),
             text_meta=True,
         )
         if isinstance(out, dict):

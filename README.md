@@ -90,6 +90,47 @@ Here's what you can ask Claude to do once you've set up this integration:
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
 
+### Read this first (notes for agents)
+
+- **`days=N` means the last N days of *final* data**, ending on
+  `meta.latest_final_date` (Pacific Time) — the window the GSC UI shows, not
+  "N days ending today". Pass `data_state="all"` for preliminary days.
+- **Check `coverage` before quoting a count.** Every tool that samples, caps,
+  pages or skips returns `coverage` (`checked` N `of` M, `partial`,
+  `summary`). When `partial` is true the numbers describe only what was
+  checked — "4 redirects" from 40 of 591 URLs is not "the sitemap has 4
+  redirects".
+- **The API cannot request indexing for normal pages** (the Indexing API
+  covers only JobPosting and BroadcastEvent). `gsc_recrawl_worklist` produces
+  the list for a human to submit in Search Console.
+- **UI exports use the account's date locale.** Compare-mode headers are
+  often day-first (`01/08/2026 - 27/08/2026 Impressions`); the importer
+  decides the order from all headers together and writes ISO ranges to the
+  `meta` table (`period_a`, `period_b`) — the Filters tab records only the
+  first range.
+- **The Generative AI features export is pages only**: Pages, Countries,
+  Devices and Filters tabs, impressions only — no queries and no clicks.
+- **Live checks against CDN-fronted sites** (e.g. Cloudflare): bursts trigger
+  bot challenges ("Checking browser"), after which every request from that
+  address is refused for a while and results look like broken pages.
+  `gsc_sitemap_diff` is the only approved route for a full-sitemap liveness
+  sweep: it paces itself (3 workers, 0.3 s apart), backs off on 429/503,
+  detects challenge pages and reports them as unchecked, and pages a large
+  sitemap 100 URLs per call via `check_offset`. Don't raise `concurrency`
+  against client sites, and don't script your own sweep.
+
+### v1.6.0 — coverage everywhere, redirect classification
+
+- `coverage` on every sampled, capped or paged result (see above);
+  `gsc_sitemap_diff` puts `partial` and `coverage` at the top of its output.
+- `gsc_sitemap_diff` follows each redirect hop by hop and classifies it:
+  `equivalent` (a comparable page), `hub` (/, /blog, /events, /about, plus
+  the site config's `hub_paths` / `hub_regex`), `chain` (more than one hop)
+  or `unverified` (the destination could not be fetched).
+  Pass `cms_state={url: "published", ...}` to flag published pages sitting
+  behind a redirect (`published_but_redirected`) — a CMS keeps those in its
+  sitemap.
+
 ### v1.5.0 — analysis tools
 
 - **Per-site config** in `$GSC_STATE_DIR/site-config.json`:

@@ -266,6 +266,12 @@ tabular; otherwise emit a flat dict that satisfies the success spine
 above. Always include `tool` and `meta` so downstream code can identify
 the payload without inspecting keys.
 
+**Coverage (v1.6.0).** A tool that samples, caps, pages or skips anything
+must put `coverage` in `meta` — `_coverage(checked, of, unit)` (``of=None``
+when the total is unknown) or `_coverage_rollup({...})` for several parts —
+so a partial result can never read as the whole answer. Engine-based tools
+get it from `_sa_meta` automatically.
+
 **FastMCP return-type gotcha.** `@mcp.tool()` functions must declare
 `-> Any` (or have no return annotation). Any generic type triggers
 FastMCP's structured-output path, which wraps the payload in

@@ -353,7 +353,9 @@ class TestComparisonCompleteness:
         assert by_q["c"]["p1_clicks"] is None  # unknown, not 0: period 1 was capped
         assert by_q["c"]["click_diff"] is None
         assert by_q["b"]["p2_clicks"] == 0     # period 2 was complete
-        assert out["meta"]["coverage"] == {"p1": "truncated", "p2": "complete"}
+        cov = out["meta"]["coverage"]
+        assert (cov["p1"], cov["p2"]) == ("truncated", "complete")
+        assert cov["partial"] is True and cov["period1_rows"]["partial"] is True  # v1.6.0
 
 
 # ---------------------------------------------------------------------------
