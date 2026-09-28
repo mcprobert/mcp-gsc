@@ -12,12 +12,12 @@ uv pip install -r requirements.txt
 
 ## Architecture
 
-Single-file FastMCP server (`gsc_server.py`) with 30 tools covering:
+Single-file FastMCP server (`gsc_server.py`) with 33 tools covering:
 
 - **Properties**: `gsc_list_properties`, `gsc_add_site`, `gsc_delete_site`, `gsc_get_site_details`
-- **Search Analytics**: `gsc_get_search_analytics`, `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`, `gsc_get_search_by_page_query`, `gsc_get_performance_overview`
+- **Search Analytics**: `gsc_query` (raw passthrough), `gsc_get_search_analytics`, `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`, `gsc_get_search_by_page_query`, `gsc_get_performance_overview`
 - **Landing pages**: `gsc_get_landing_page_summary`, `gsc_compare_periods_landing_pages`
-- **URL Inspection**: `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, `gsc_check_indexing_issues`
+- **URL Inspection**: `gsc_inspect_start` + `gsc_inspect_status` (async jobs), `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, `gsc_check_indexing_issues`
 - **Sitemaps**: `gsc_get_sitemaps`, `gsc_list_sitemaps_enhanced`, `gsc_get_sitemap_details`, `gsc_submit_sitemap`, `gsc_delete_sitemap`, `gsc_manage_sitemaps`
 - **Account Management**: `gsc_list_accounts`, `gsc_whoami`, `gsc_add_account`, `gsc_remove_account`, plus the deprecated `gsc_get_active_account` and `gsc_switch_account`
 - **Screaming Frog bridge**: `gsc_load_from_sf_export`, `gsc_query_sf_export`
@@ -121,6 +121,34 @@ stays put — only the user-visible alias changes. Legacy bare
 `accounts/legacy/token.json` with alias `legacy`. The `active_account`
 field is dropped on first save.
 
+## Execution, windows and inspection (v1.4.0)
+
+- **Every Google call goes through `_gsc_execute`** (async, in a worker
+  thread) or `_gsc_execute_sync` (already in a thread): retries 429 / 5xx /
+  timeouts / connection resets with jittered backoff, never a spent daily
+  quota or a caller error, and sleeps a `Retry-After` only up to 10 s. Never
+  call `.execute()` on the event loop — a blocked loop can't answer
+  `gsc_inspect_status` or pings.
+- **Search Analytics goes through `_sa_run`** (validation, window,
+  pagination, client-side sort, freshness markers, totals honesty). The API
+  orders rows by clicks (by date when grouped by date) and has no `orderBy`
+  field; any other order must be sorted client-side over the full result.
+- **Dates are Pacific Time** (`_today_pt`). `days=N` = the last N days of
+  final data, ending on `_latest_final_date` (a cached `dataState=all`
+  probe: `first_incomplete_date − 1`). The API reference names the
+  metadata fields in snake_case; `_response_metadata` accepts both cases.
+- **State store** `$GSC_STATE_DIR/gsc-state.sqlite`: the 6-hour inspection
+  cache and the quota ledger, shared by every process and login. Rollback
+  journal, not WAL. The ledger reserves before every outbound inspection
+  attempt; Google's quota error is identical for every limit, so the ledger
+  decides daily vs per-minute.
+- **Test seams** (`tests/conftest.py`): `_retry_sleep` / `_async_retry_sleep`
+  are no-ops, `_today_pt` is frozen at 2026-09-28, `_latest_final_date`
+  returns 2026-09-25 without a call (opt out with
+  `@pytest.mark.real_freshness`), `_state_db_path` is in `tmp_path`,
+  `_clone_service` is the identity, and `_live_discovery_enums` never hits
+  the network.
+
 ## Git Remotes
 
 - `origin` — `mcprobert/mcp-gsc` (our fork, primary development)
@@ -174,7 +202,7 @@ a centrally managed config — find out why before re-enabling anything.
 
 ## Dependencies
 
-Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth-oauthlib`, `oauth2client`.
+Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth`, `google-auth-oauthlib` (`oauth2client` was dropped in v1.3.0). Everything added in v1.4.0 is stdlib (`sqlite3`, `zoneinfo`).
 
 ## Response envelope convention
 
@@ -194,6 +222,11 @@ wrapper. These invariants hold across the server:
      `AMBIGUOUS_ACCOUNT` / `ACCOUNT_SITE_MISMATCH`, `site_url: str`
      for routing failures, `replacement: {tool, example}` for
      `DEPRECATED_TOOL`.
+   - HTTP-derived envelopes (v1.4.0) add `http_status`, `google_reason`
+     and, when the call went through `_gsc_execute`, `step` and
+     `attempts`. v1.4.0 codes: `QUOTA_EXHAUSTED` (daily quota spent;
+     `retry_after` = seconds to PT midnight; not retryable), `TIMEOUT`
+     (retryable), `JOB_NOT_FOUND` (unknown/evicted inspection job).
 3. **Tabular tools** (analytics family, `gsc_get_sitemaps`,
    `gsc_list_sitemaps_enhanced`, `gsc_compare_search_periods`,
    `gsc_batch_url_inspection`) use the
@@ -209,8 +242,9 @@ wrapper. These invariants hold across the server:
 House conventions for numeric fields:
 
 - **Percentages** are raw float ratios (`-0.5353` = −53.53%). Callers
-  format for display. `_format_table`'s `"pct"` column type handles
-  markdown/CSV rendering (line 412 in `gsc_server.py`).
+  format for display. `_format_table`'s `"pct"` column type formats them
+  for markdown only; since v1.4.0 CSV cells are raw values, and the CSV
+  formula guard applies to string columns only.
 - **Positions** are 1-indexed floats. Absent data is `null`, never `0`
   — `0` would falsely imply "ranked first" (see compare_search_periods F4).
 - **Counts** are ints. String coercion from the Google API is handled

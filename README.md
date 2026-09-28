@@ -58,6 +58,7 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_add_site`                      | Adds a new site to your GSC properties                      | Your website URL                                                |
 | `gsc_delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `gsc_get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
+| `gsc_query`                         | Raw Search Analytics: every API parameter (regex/multi filters, searchAppearance, fresh/hourly data, News/Discover), pagination, client-side sort, `save_to_file` | Your website URL and explicit dates |
 | `gsc_get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
 | `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with a configurable striking-distance band | Your website URL and time period                                |
 | `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
@@ -66,6 +67,8 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_check_indexing_issues`         | Checks if pages have indexing problems                      | Your website URL and list of pages to check                     |
 | `gsc_inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
 | `gsc_batch_url_inspection`          | Inspect up to 10 URLs (now accepts URLs from an SF session) | Your website URL and URL list (or an SF session id)             |
+| `gsc_inspect_start`                 | Start a background inspection job for any number of URLs (cached, quota-aware) | Your website URL and URL list |
+| `gsc_inspect_status`                | Progress and partial results of an inspection job           | The job id                                                      |
 | `gsc_get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
 | `gsc_submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
 | `gsc_load_from_sf_export`       | Ingests a Screaming Frog export folder for offline querying | Path to the SF export folder and the site URL                   |
@@ -78,6 +81,31 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
+
+### v1.4.0 — full API coverage, honest windows, inspection that finishes
+
+- **`days=N` is the last N days of final data** (Pacific Time), the same
+  window the GSC UI shows. Every analytics response echoes the exact window
+  in `meta`: `start_date`, `end_date`, `window_days`, `data_state`,
+  `latest_final_date`, `non_final_days`. Pass `data_state="all"` for
+  preliminary data; those rows carry `preliminary: true`.
+- **`sort_by` works.** The API only orders by clicks, so other orders are
+  applied client-side over the full result set.
+- **Query-grouped responses state the anonymised-query gap**:
+  `meta.page_total`, `meta.query_rows_sum`, `meta.unattributed_share`.
+- **`gsc_query`** exposes the whole API, e.g. a word-boundary regex:
+  `filter_groups=[{"dimension": "query", "operator": "includingRegex", "expression": "\\bsage\\b"}]`.
+- **URL inspection**: `gsc_inspect_start` returns a job id at once; poll
+  `gsc_inspect_status`. Results are cached for 6 hours per URL, and a
+  shared quota ledger (Google: 2,000/day, 600/minute per property) stops a
+  job cleanly with `QUOTA_EXHAUSTED` instead of timing out.
+- **Reliability**: retries with backoff on 429/5xx/timeouts; errors name the
+  step, Google's status and reason, and whether a retry is safe.
+- **What the API cannot do** (reported by `gsc_health_check` under
+  `api_limits`): Generative AI features data (UI only — import an export),
+  Request Indexing for normal pages, a brand dimension, and anonymised
+  queries. `unknown_values` flags new API values, the early warning for
+  AI-features support.
 
 ### Screaming Frog CSV bridge (new in v0.4.0)
 

@@ -42,8 +42,12 @@ def _mock_two_period_service(period1_rows, period2_rows):
 
     def _query(*, siteUrl, body):
         req = MagicMock()
-        # First call is period1, second is period2 (order matches the
-        # tool's implementation).
+        if not body["dimensions"]:
+            # v1.4.0 query-less totals call (one per period).
+            req.execute.return_value = {"rows": []}
+            return req
+        # First grouped call is period1, second is period2 (order matches
+        # the tool's implementation).
         if calls["count"] == 0:
             req.execute.return_value = {"rows": period1_rows}
         else:
@@ -135,7 +139,7 @@ class TestGetSearchAnalyticsMigration:
         )
         assert isinstance(out, str)
         assert "Query,Clicks,Impressions,CTR,Position" in out
-        assert "kw a,5,50,10.00%,1.0" in out
+        assert "kw a,5,50,0.1,1.0" in out  # v1.4.0: CSV cells are raw
 
 
 # =============================================================================
@@ -423,9 +427,12 @@ class TestCompareSearchPeriodsMigration:
             period2_end="2026-02-28",
             upstream_row_limit=250,
         )
-        assert len(captured_bodies) == 2
-        assert captured_bodies[0]["rowLimit"] == 250
-        assert captured_bodies[1]["rowLimit"] == 250
+        # v1.4.0 adds one query-less totals call per period; check the two
+        # grouped period queries.
+        period_bodies = [b for b in captured_bodies if b["dimensions"]]
+        assert len(period_bodies) == 2
+        assert period_bodies[0]["rowLimit"] == 250
+        assert period_bodies[1]["rowLimit"] == 250
 
 
 # =============================================================================

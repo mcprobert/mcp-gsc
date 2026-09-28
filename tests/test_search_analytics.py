@@ -38,7 +38,8 @@ def _build_mock_service(rows, captured):
 
     def _query(*, siteUrl, body):
         captured["siteUrl"] = siteUrl
-        captured["body"] = body
+        captured.setdefault("body", body)  # first call = the main query
+        captured.setdefault("bodies", []).append(body)
         request = MagicMock()
         request.execute.return_value = {"rows": rows} if rows is not None else {}
         return request
@@ -84,22 +85,39 @@ class TestMarkdownModeBackwardCompat:
             {"keys": ["seo agency"], "clicks": 20.0, "impressions": 500.0, "ctr": 0.04, "position": 5.0},
             {"keys": ["local seo"], "clicks": 12.0, "impressions": 400.0, "ctr": 0.03, "position": 10.0},
         ]
-        captured: dict = {}
-        _patch_service(monkeypatch, _build_mock_service(rows, captured))
+        service = MagicMock()
+
+        def _query(*, siteUrl, body):
+            request = MagicMock()
+            if body["dimensions"] == []:
+                # v1.4.0: the query-less page total (includes anonymised queries).
+                request.execute.return_value = {"rows": [
+                    {"clicks": 50.0, "impressions": 1250.0, "ctr": 0.04, "position": 6.0},
+                ]}
+            else:
+                request.execute.return_value = {"rows": rows}
+            return request
+
+        service.searchanalytics.return_value.query.side_effect = _query
+        _patch_service(monkeypatch, service)
 
         result = await gsc_get_search_by_page_query(
             site_url="https://example.com/",
             page_url="https://example.com/foo",
         )
 
-        # Hand-constructed to match pre-0.5 rendering exactly:
+        # Pre-0.5 rendering, plus the v1.4.0 window line and page-total /
+        # unattributed-share footer:
         # - raw float clicks/impressions in data rows ("10.0" not "10")
         # - float sums in TOTAL row ("42.0", "1000.0")
         # - avg_ctr_pct = 42.0/1000.0*100 = 4.2 → "4.20%"
         # - TOTAL position shown as "-"
+        # - unattributed = 1 - 42/50 = 16.00% clicks, 1 - 1000/1250 = 20.00%
         dash = "-" * 80
         expected = (
             "Search queries for page https://example.com/foo (last 28 days):"
+            "\nWindow: 2026-08-29 → 2026-09-25 (28 days, data_state=final, "
+            "latest final 2026-09-25, Pacific Time)"
             "\n\n" + dash + "\n"
             "\nQuery | Clicks | Impressions | CTR | Position"
             "\n" + dash +
@@ -108,6 +126,8 @@ class TestMarkdownModeBackwardCompat:
             "\nlocal seo | 12.0 | 400.0 | 3.00% | 10.0"
             "\n" + dash +
             "\nTOTAL | 42.0 | 1000.0 | 4.20% | -"
+            "\nPAGE TOTAL (query-less, incl. anonymised) | 50.0 | 1250.0 | - | -"
+            "\nUnattributed share: clicks 16.00%, impressions 20.00% (query rows: all_rows)"
         )
         assert result == expected
 
@@ -120,7 +140,11 @@ class TestMarkdownModeBackwardCompat:
             page_url="https://example.com/foo",
         )
 
-        assert result == "No search data found for page https://example.com/foo in the last 28 days."
+        assert result == (
+            "No search data found for page https://example.com/foo in the last 28 days."
+            "\nWindow: 2026-08-29 → 2026-09-25 (28 days, data_state=final, "
+            "latest final 2026-09-25, Pacific Time)"
+        )
 
     async def test_markdown_unknown_default_for_missing_keys(self, monkeypatch):
         """Pre-0.5 used row.get('keys', ['Unknown'])[0]. Markdown mode must
@@ -356,7 +380,8 @@ class TestJsonDaysClamping:
         end = captured["body"]["endDate"]
         start_d = dt.strptime(start, "%Y-%m-%d").date()
         end_d = dt.strptime(end, "%Y-%m-%d").date()
-        assert (end_d - start_d).days == 1
+        # v1.4.0: days=N is N days inclusive, so days=1 is a single day.
+        assert (end_d - start_d).days == 0
 
 
 # =============================================================================

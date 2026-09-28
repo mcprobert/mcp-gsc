@@ -7,6 +7,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 import pytest
+from datetime import date
 
 # Capture the unpatched ``get_gsc_service`` once at conftest load.
 # The autouse shim uses identity comparison against this to decide
@@ -86,4 +87,46 @@ def _resolver_legacy_shim(monkeypatch, tmp_path):
         return ("test", service)
 
     monkeypatch.setattr(gsc_server, "get_gsc_service_for_site", _shim)
+    yield
+
+
+# Fixed "today" for v1.4.0 date logic: every window resolves against it.
+FROZEN_TODAY_PT = date(2026, 9, 28)
+FROZEN_LATEST_FINAL = "2026-09-25"
+
+
+@pytest.fixture(autouse=True)
+def _v14_seams(monkeypatch, request, tmp_path):
+    """v1.4.0 test seams.
+
+    * ``_retry_sleep`` is a no-op, so retry paths never really sleep.
+    * ``_today_pt`` is frozen at FROZEN_TODAY_PT.
+    * ``_latest_final_date`` returns FROZEN_LATEST_FINAL without an API
+      call, so a tool's request count and captured bodies stay what the
+      test expects. Mark a test ``@pytest.mark.real_freshness`` to run the
+      real probe against its mock service.
+    * The inspection state store lives in tmp_path.
+    """
+    import gsc_server
+
+    monkeypatch.setattr(gsc_server, "_retry_sleep", lambda s: None)
+    monkeypatch.setattr(gsc_server, "_today_pt", lambda: FROZEN_TODAY_PT)
+    gsc_server._latest_final_cache.clear()
+    if "real_freshness" not in request.keywords:
+        async def _fake_latest(ctx, search_type=None):
+            return {"date": FROZEN_LATEST_FINAL, "source": "metadata", "warning": None}
+        monkeypatch.setattr(gsc_server, "_latest_final_date", _fake_latest)
+    monkeypatch.setattr(gsc_server, "_state_db_path", lambda: str(tmp_path / "gsc-state.sqlite"))
+    gsc_server._inspect_jobs.clear()
+
+    async def _no_sleep(_delay):
+        return None
+    monkeypatch.setattr(gsc_server, "_async_retry_sleep", _no_sleep)
+    # Workers share the test's mock service instead of building real clients.
+    monkeypatch.setattr(gsc_server, "_clone_service", lambda service: service)
+    # The health check's live discovery-doc fetch never hits the network.
+    monkeypatch.setattr(
+        gsc_server, "_live_discovery_enums",
+        lambda: {k: sorted(v) for k, v in gsc_server._KNOWN_DISCOVERY_ENUMS.items()},
+    )
     yield

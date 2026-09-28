@@ -116,12 +116,18 @@ class TestBatchUrlInspection:
                 }
             },
         ]
-        def _execute_side_effect(*args, **kwargs):
-            r = responses.pop(0)
+        # v1.4.0 inspects concurrently, so key responses by URL, not call order.
+        by_url = dict(zip(["https://example.com/a", "https://example.com/b"], responses))
+
+        def _inspect(body):
+            req = MagicMock()
+            r = by_url[body["inspectionUrl"]]
             if isinstance(r, Exception):
-                raise r
-            return r
-        service.urlInspection.return_value.index.return_value.inspect.return_value.execute.side_effect = _execute_side_effect
+                req.execute.side_effect = r
+            else:
+                req.execute.return_value = r
+            return req
+        service.urlInspection.return_value.index.return_value.inspect.side_effect = _inspect
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
 
         out = await gsc_batch_url_inspection(
@@ -290,10 +296,15 @@ class TestCheckIndexingIssuesJson:
             },
         ]
 
-        def _execute_side_effect(*args, **kwargs):
-            return responses.pop(0)
+        # v1.4.0 inspects concurrently, so key responses by URL, not call order.
+        by_url = dict(zip(["https://example.com/a", "https://example.com/b"], responses))
 
-        service.urlInspection.return_value.index.return_value.inspect.return_value.execute.side_effect = _execute_side_effect
+        def _inspect(body):
+            req = MagicMock()
+            req.execute.return_value = by_url[body["inspectionUrl"]]
+            return req
+
+        service.urlInspection.return_value.index.return_value.inspect.side_effect = _inspect
         monkeypatch.setattr(gsc_server, "get_gsc_service", lambda: service)
 
         out = await gsc_check_indexing_issues(

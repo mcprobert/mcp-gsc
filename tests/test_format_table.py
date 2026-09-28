@@ -91,8 +91,8 @@ class TestCsv:
         out = _format_table(ROWS, COLUMNS, response_format="csv")
         lines = out.split("\r\n")
         assert lines[0] == "Query,Clicks,CTR,Position"
-        assert lines[1] == "chaser,672,2.16%,6.3"
-        assert lines[2] == "chaser login,58,47.93%,1.3"
+        assert lines[1] == "chaser,672,0.0216,6.3"  # v1.4.0: CSV cells are raw
+        assert lines[2] == "chaser login,58,0.4793,1.3"
 
     def test_csv_quoting_for_comma_cells(self):
         rows = [{"query": "a,b", "clicks": 1, "ctr": 0.1, "position": 1.0}]
@@ -138,6 +138,25 @@ class TestCsv:
         assert "'+evil()" in out
         assert "'@cmd" in out
         assert "'-minus" in out
+
+    def test_csv_negative_numbers_are_not_escaped(self):
+        # v1.4.0: the guard applies to string columns only, so a negative
+        # ratio stays a number a spreadsheet or parser can read.
+        cols = [
+            {"key": "query", "display": "Query", "type": "str"},
+            {"key": "pct", "display": "Pct", "type": "pct"},
+            {"key": "delta", "display": "Delta", "type": "signed_int"},
+        ]
+        rows = [{"query": "kw", "pct": -0.5353, "delta": -12}]
+        out = _format_table(rows, cols, response_format="csv")
+        assert out.split("\r\n")[1] == "kw,-0.5353,-12"
+
+    def test_csv_meta_line_when_requested(self):
+        out = _format_table(
+            [{"query": "kw", "clicks": 1, "ctr": 0.1, "position": 1.0}], COLUMNS,
+            response_format="csv", meta={"start_date": "2026-09-01"}, text_meta=True,
+        )
+        assert '# meta: {"start_date":"2026-09-01"}' in out.split("\r\n")
 
     def test_csv_normal_cells_unchanged_by_formula_guard(self):
         rows = [{"query": "normal text", "clicks": 1, "ctr": 0.1, "position": 1.0}]

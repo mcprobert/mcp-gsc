@@ -1,4 +1,4 @@
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 import asyncio
 import os
 import json
@@ -7,14 +7,17 @@ import shutil
 import csv
 import heapq
 import math
+import random
+import socket
+import sqlite3
+import stat
 import sys
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
-
-URL_INSPECTION_PACING_SEC = 0.1
+from zoneinfo import ZoneInfo
 
 # B.5 (gsc_get_search_by_page_query): when `row_limit` is at or below
 # this threshold, the JSON `summary` block is suppressed by default
@@ -129,6 +132,7 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+import httplib2
 
 # MCP
 from mcp.server.fastmcp import FastMCP
@@ -143,10 +147,12 @@ mcp = FastMCP("gsc-server")
 # version). Best-effort: running straight from a source checkout with no
 # installed dist must not break startup, and a private-attribute write is the
 # only route FastMCP leaves open here.
+_SERVER_VERSION = "unknown"
 try:
     from importlib.metadata import version as _pkg_version
 
-    mcp._mcp_server.version = _pkg_version("mcp-gsc")
+    _SERVER_VERSION = _pkg_version("mcp-gsc")
+    mcp._mcp_server.version = _SERVER_VERSION
 except Exception:  # pragma: no cover - metadata absent or SDK internals moved
     pass
 
@@ -240,6 +246,11 @@ class ErrorCode:
     # Lifecycle
     DEPRECATED_TOOL = "DEPRECATED_TOOL"
 
+    # Reliability (new in v1.4.0)
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"  # daily quota spent; retry after PT midnight
+    TIMEOUT = "TIMEOUT"                  # request timed out after every retry
+    JOB_NOT_FOUND = "JOB_NOT_FOUND"      # unknown / evicted async job id
+
 
 # Codes where retrying the identical request is likely to succeed
 # (transient server-side conditions). Agents that do automated retries
@@ -261,6 +272,7 @@ _RETRYABLE_CODES: frozenset = frozenset({
     ErrorCode.QUOTA_EXCEEDED,
     ErrorCode.INTERNAL_ERROR,
     ErrorCode.SERVICE_UNAVAILABLE,
+    ErrorCode.TIMEOUT,
 })
 
 
@@ -274,7 +286,9 @@ _HTTP_STATUS_TO_CODE: Dict[int, str] = {
     404: ErrorCode.NOT_FOUND,
     429: ErrorCode.QUOTA_EXCEEDED,
     500: ErrorCode.INTERNAL_ERROR,
+    502: ErrorCode.SERVICE_UNAVAILABLE,
     503: ErrorCode.SERVICE_UNAVAILABLE,
+    504: ErrorCode.SERVICE_UNAVAILABLE,
 }
 
 
@@ -343,6 +357,93 @@ def _make_error_envelope(
     return envelope
 
 
+# --- Pacific Time (v1.4.0) ---
+# The Search Console API reports and bounds dates in Pacific Time, so every
+# "today", window end and quota reset is computed there -- never in the
+# server's local zone.
+_PT = ZoneInfo("America/Los_Angeles")
+_PT_LABEL = "America/Los_Angeles (Pacific Time, API convention)"
+
+
+def _now_pt() -> datetime:
+    return datetime.now(_PT)
+
+
+def _today_pt():
+    """Today's date in Pacific Time. Tests stub this (see conftest)."""
+    return _now_pt().date()
+
+
+def _seconds_until_pt_midnight() -> float:
+    now = _now_pt()
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time(), tzinfo=_PT)
+    return max(1.0, (midnight - now).total_seconds())
+
+
+# --- Google error classification (v1.4.0) ---
+_DAILY_QUOTA_REASONS = frozenset({"dailyLimitExceeded", "dailyLimitExceededUnreg"})
+_RATE_LIMIT_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded"})
+_DAILY_QUOTA_MESSAGE_RE = re.compile(r"per\s+day|daily", re.IGNORECASE)
+
+
+class _GscTimeoutError(HttpError):
+    """Raised by ``_gsc_execute_sync`` when a request timed out on every
+    attempt. Subclasses ``HttpError`` (as a synthetic 504) so every tool's
+    existing ``except HttpError`` branch renders it -- as ``TIMEOUT``."""
+
+    def __init__(self, *, step: str, attempts: int, cause: BaseException) -> None:
+        content = json.dumps({"error": {"message": (
+            f"Request timed out at step {step!r} after {attempts} attempt(s): "
+            f"{type(cause).__name__}: {cause}"
+        )}}).encode()
+        super().__init__(httplib2.Response({"status": 504}), content)
+        self.gsc_step = step
+        self.gsc_attempts = attempts
+
+
+def _http_error_details(e: HttpError) -> Dict[str, Any]:
+    """Pull ``status``, Google's ``message`` and ``reason`` out of an
+    HttpError and classify it: ``daily_quota`` | ``rate_limit`` |
+    ``server`` | ``timeout`` | ``other``."""
+    message = str(e)
+    reason: Optional[str] = None
+    try:
+        content = json.loads(e.content.decode("utf-8"))
+        err = content.get("error", {}) or {}
+        message = err.get("message", message)
+        errors = err.get("errors") or []
+        if errors and isinstance(errors[0], dict):
+            reason = errors[0].get("reason")
+        if not reason:
+            reason = err.get("status")  # e.g. RESOURCE_EXHAUSTED
+    except Exception:
+        pass
+    status = getattr(e.resp, "status", None)
+    # getattr returns the attribute's value — if it's literally 0, treat
+    # that as "unknown" (HTTP has no status 0; it usually indicates a
+    # transport-layer failure surfaced without a proper code).
+    try:
+        status = int(status) if status else None
+    except (TypeError, ValueError):
+        status = None
+
+    if isinstance(e, _GscTimeoutError):
+        kind = "timeout"
+    elif (
+        status == 429
+        or reason in _RATE_LIMIT_REASONS
+        or reason in _DAILY_QUOTA_REASONS
+        or reason == "quotaExceeded"
+    ):
+        daily = reason in _DAILY_QUOTA_REASONS or bool(_DAILY_QUOTA_MESSAGE_RE.search(message or ""))
+        kind = "daily_quota" if daily else "rate_limit"
+    elif status in (500, 502, 503, 504):
+        kind = "server"
+    else:
+        kind = "other"
+    return {"status": status, "message": message, "reason": reason, "kind": kind}
+
+
 def _http_error_envelope(
     e: HttpError,
     *,
@@ -351,24 +452,30 @@ def _http_error_envelope(
 ) -> Dict[str, Any]:
     """Map a googleapiclient ``HttpError`` to an error envelope with
     status-aware hints so agents can recover without a retry storm.
-    """
-    try:
-        content = json.loads(e.content.decode("utf-8"))
-        message = content.get("error", {}).get("message", str(e))
-    except Exception:
-        message = str(e)
 
-    status = getattr(e.resp, "status", None)
-    # getattr returns the attribute's value — if it's literally 0, treat
-    # that as "unknown" (HTTP has no status 0; it usually indicates a
-    # transport-layer failure surfaced without a proper code).
-    if not status:
-        status = None
+    v1.4.0: also names the failing ``step`` and attempt count (when the
+    call went through ``_gsc_execute``), Google's ``http_status`` and
+    ``google_reason``, and distinguishes a spent daily quota
+    (``QUOTA_EXHAUSTED``) and a timeout (``TIMEOUT``) from a rate limit.
+    """
+    info = _http_error_details(e)
+    message = info["message"]
+    status = info["status"]
+    kind = info["kind"]
 
     hint = ""
     retry_after: Optional[float] = None
 
-    if status == 400:
+    if kind == "timeout":
+        hint = "Google did not answer in time on any attempt. Retry shortly; for URL inspection use gsc_inspect_start."
+        retry_after = 30.0
+    elif kind == "daily_quota":
+        hint = "Daily Google quota is spent for this property. It resets at midnight Pacific Time."
+        retry_after = _seconds_until_pt_midnight()
+    elif kind == "rate_limit" and status != 429:
+        hint = "Rate limited by GSC. Wait then retry."
+        retry_after = _parse_retry_after(e.resp)
+    elif status == 400:
         hint = "Request rejected by GSC. Check the arguments you passed."
     elif status == 401:
         hint = (
@@ -399,12 +506,24 @@ def _http_error_envelope(
     status_text = f"HTTP {status}" if status else "HTTP (unknown status)"
     # Unknown / missing status → INTERNAL_ERROR (transient assumption).
     error_code = _HTTP_STATUS_TO_CODE.get(status, ErrorCode.INTERNAL_ERROR) if status else ErrorCode.INTERNAL_ERROR
+    if kind == "timeout":
+        error_code = ErrorCode.TIMEOUT
+    elif kind == "daily_quota":
+        error_code = ErrorCode.QUOTA_EXHAUSTED
+    elif kind == "rate_limit":
+        error_code = ErrorCode.QUOTA_EXCEEDED
+    extras: Dict[str, Any] = {"http_status": status, "google_reason": info["reason"]}
+    step = getattr(e, "gsc_step", None)
+    if step:
+        extras["step"] = step
+        extras["attempts"] = getattr(e, "gsc_attempts", None)
     return _make_error_envelope(
         error=f"{status_text}: {message}",
         hint=hint,
         error_code=error_code,
         retry_after=retry_after,
         tool=tool,
+        **extras,
     )
 
 
@@ -433,6 +552,122 @@ def _parse_retry_after(resp: Any) -> float:
         return max(0.0, min(delta, 3600.0))
     except Exception:
         return 60.0
+
+
+# --- Retrying executor (v1.4.0) ---
+# Every Google API ``.execute()`` in this file goes through
+# ``_gsc_execute`` (async, off the event loop) or ``_gsc_execute_sync``
+# (already inside a worker thread). Retries rate limits, 5xx and
+# transport timeouts with jittered exponential backoff; never retries a
+# spent daily quota or a caller error. The step name and attempt count
+# are attached to the raised HttpError so the envelope can name them.
+_RETRY_MAX_ATTEMPTS = 4
+_RETRY_BASE_DELAY = 1.0
+_RETRY_MAX_DELAY = 30.0
+# A Retry-After longer than this is handed back to the caller (in the
+# envelope's retry_after) instead of being slept inside the tool call,
+# which would eat most of a 60 s client timeout.
+_RETRY_AFTER_MAX_WAIT = 10.0
+_retry_sleep = time.sleep  # test seam: conftest replaces it with a no-op
+
+
+def _backoff_delay(attempt: int) -> float:
+    """Equal-jitter exponential backoff: attempt 1 → 0.5–1 s, 2 → 1–2 s, …"""
+    cap = min(_RETRY_MAX_DELAY, _RETRY_BASE_DELAY * (2 ** (attempt - 1)))
+    return cap / 2 + random.uniform(0, cap / 2)
+
+
+def _retry_after_header(e: HttpError) -> Optional[float]:
+    try:
+        raw = e.resp.get("retry-after")
+    except Exception:
+        raw = None
+    if raw is None:
+        return None
+    return _parse_retry_after(e.resp)
+
+
+def _retry_delay(e: HttpError, attempt: int) -> Optional[float]:
+    """Delay before retrying ``e``, or None to hand it back to the caller:
+    backoff, raised to any Retry-After the server sent (rate limits and
+    5xx alike); a Retry-After above _RETRY_AFTER_MAX_WAIT is not slept."""
+    delay = _backoff_delay(attempt)
+    wait = _retry_after_header(e)
+    if wait is not None:
+        if wait > _RETRY_AFTER_MAX_WAIT:
+            return None
+        delay = max(delay, wait)
+    return delay
+
+
+def _gsc_execute_sync(request_fn, *, step: str, max_attempts: int = _RETRY_MAX_ATTEMPTS):
+    """Run ``request_fn()`` (a zero-arg callable ending in ``.execute()``)
+    with retries. Blocking: call from a worker thread, or use
+    :func:`_gsc_execute` from async code."""
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return request_fn()
+        except HttpError as e:
+            kind = _http_error_details(e)["kind"]
+            # Honour Retry-After rather than retrying early; a wait longer
+            # than _RETRY_AFTER_MAX_WAIT belongs to the caller, not a tool call.
+            delay = _retry_delay(e, attempt) if kind in ("rate_limit", "server") else None
+            if delay is None or attempt >= max_attempts:
+                e.gsc_step = step
+                e.gsc_attempts = attempt
+                raise
+        except (TimeoutError, socket.timeout) as e:
+            if attempt >= max_attempts:
+                raise _GscTimeoutError(step=step, attempts=attempt, cause=e) from e
+            delay = _backoff_delay(attempt)
+        except ConnectionError:
+            if attempt >= max_attempts:
+                raise
+            delay = _backoff_delay(attempt)
+        _log("api_retry", step=step, attempt=attempt, delay_s=round(delay, 2))
+        _retry_sleep(delay)
+
+
+async def _gsc_execute(request_fn, *, step: str, max_attempts: int = _RETRY_MAX_ATTEMPTS):
+    """Async front for :func:`_gsc_execute_sync`: runs in a worker thread so
+    a slow Google call never blocks the event loop (and other tool calls,
+    e.g. ``gsc_inspect_status``, keep answering)."""
+    return await asyncio.to_thread(
+        _gsc_execute_sync, request_fn, step=step, max_attempts=max_attempts,
+    )
+
+
+def _write_token_file(path: str, text: str) -> None:
+    """Atomically replace an OAuth token file (temp file + ``os.replace``)
+    so a concurrent reader never sees half-written JSON.
+
+    Keeps the existing file's mode: on the shared multi-login tree tokens
+    are group/world-writable so every login can persist a refresh, and a
+    umask-default replacement would lock the others out. A new file gets
+    0o666 when its directory is world-writable (shared tree), else 0o600.
+    """
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        dir_mode = stat.S_IMODE(os.stat(directory).st_mode)
+        mode = 0o666 if dir_mode & stat.S_IWOTH else 0o600
+    tmp = os.path.join(directory, f".{os.path.basename(path)}.{os.getpid()}.{uuid4().hex}.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _format_error(
@@ -470,6 +705,25 @@ def _format_error(
     return "\n".join(parts)
 
 
+def _markdown_meta_footer(meta: Dict[str, Any]) -> List[str]:
+    """Compact meta lines under a markdown table: the totals-honesty gap and
+    any warnings (the window itself is a header line)."""
+    lines: List[str] = []
+    share = meta.get("unattributed_share")
+    total = meta.get("page_total")
+    if isinstance(share, dict) and isinstance(total, dict):
+        def _pct(v: Any) -> str:
+            return "n/a" if v is None else f"{v * 100:.2f}%"
+        lines.append(
+            f"Total (query-less, incl. anonymised): {total.get('clicks')} clicks, "
+            f"{total.get('impressions')} impressions; unattributed share: clicks "
+            f"{_pct(share.get('clicks'))}, impressions {_pct(share.get('impressions'))}"
+        )
+    for warning in meta.get("warnings") or []:
+        lines.append(f"Warning: {warning}")
+    return [""] + lines if lines else []
+
+
 def _format_table(
     rows: List[Dict[str, Any]],
     columns: List[Dict[str, str]],
@@ -479,6 +733,7 @@ def _format_table(
     truncated: bool = False,
     truncation_hint: str = "",
     meta: Optional[Dict[str, Any]] = None,
+    text_meta: bool = False,
 ) -> Any:
     """Render a tabular result as markdown, csv, or a json dict.
 
@@ -501,8 +756,14 @@ def _format_table(
             and more rows exist.
         truncation_hint: agent-facing sentence explaining how to get
             more rows. Rendered prominently when ``truncated=True``.
-        meta: extra key/value pairs to surface only in the json shape
-            (e.g. totals, thresholds).
+        meta: extra key/value pairs for the json shape (e.g. totals,
+            thresholds). With ``text_meta=True`` the csv shape also carries
+            it, as one ``# meta: {json}`` comment line, and markdown gets a
+            footer with the unattributed share and any warnings.
+
+    CSV cells are raw values (v1.4.0): ratios stay ratios and floats are
+    not rounded; the formula-injection guard applies to string columns
+    only, so a negative number is still a number.
 
     Returns:
         str for markdown and csv, dict for json. On unknown
@@ -588,6 +849,8 @@ def _format_table(
         lines.append(" | ".join("---" for _ in headers))
         for row in data_rows:
             lines.append(" | ".join(row))
+        if text_meta and meta:
+            lines.extend(_markdown_meta_footer(meta))
         return "\n".join(lines)
 
     # csv — RFC-4180-ish: comma separator, CRLF newlines, quote cells
@@ -597,12 +860,31 @@ def _format_table(
     # formulas — OWASP CSV-injection mitigation.
     _FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
-    def _csv_quote(cell: str) -> str:
-        if cell and cell[0] in _FORMULA_TRIGGERS:
-            cell = "'" + cell
+    def _csv_quote_plain(cell: str) -> str:
         if any(ch in cell for ch in (",", '"', "\n", "\r")):
             return '"' + cell.replace('"', '""') + '"'
         return cell
+
+    def _csv_quote(cell: str) -> str:
+        if cell and cell[0] in _FORMULA_TRIGGERS:
+            cell = "'" + cell
+        return _csv_quote_plain(cell)
+
+    def _raw_cell(value: Any, col_type: str) -> str:
+        if value is None:
+            return ""
+        if col_type in ("int", "signed_int"):
+            try:
+                f = float(value)
+                return str(int(f)) if f.is_integer() else repr(f)
+            except (TypeError, ValueError):
+                return str(value)
+        if col_type in ("float", "signed_float", "pct"):
+            try:
+                return repr(float(value))
+            except (TypeError, ValueError):
+                return str(value)
+        return str(value)
 
     lines = []
     if truncated:
@@ -612,9 +894,19 @@ def _format_table(
         lines.append(f"# TRUNCATED: {effective_hint}")
     if header_lines:
         lines.extend(f"# {line}" for line in header_lines)
+    if text_meta and meta:
+        lines.append("# meta: " + json.dumps(meta, default=str, separators=(",", ":")))
     lines.append(",".join(_csv_quote(h) for h in headers))
-    for row in data_rows:
-        lines.append(",".join(_csv_quote(c) for c in row))
+    for row in rows:
+        cells = []
+        for c in columns:
+            col_type = c.get("type", "str")
+            cell = _raw_cell(row.get(c["key"]), col_type)
+            if col_type == "str":
+                cells.append(_csv_quote(cell))
+            else:
+                cells.append(_csv_quote_plain(cell))
+        lines.append(",".join(cells))
     return "\r\n".join(lines)
 
 
@@ -870,7 +1162,7 @@ def _parse_gsc_date(s: str) -> str:
     if not isinstance(s, str) or not s.strip():
         raise ValueError(f"invalid date: {s!r}")
     normalized = s.strip().lower()
-    today = datetime.now().date()
+    today = _today_pt()  # v1.4.0: Pacific Time, the API's date convention
     if normalized == "today":
         return today.isoformat()
     if normalized == "yesterday":
@@ -1181,8 +1473,7 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
             try:
                 creds.refresh(Request())
                 # Save the refreshed credentials
-                with open(token_file, 'w') as token:
-                    token.write(creds.to_json())
+                _write_token_file(token_file, creds.to_json())
             except Exception as e:
                 # If refresh fails, delete the bad token and trigger new OAuth flow
                 if os.path.exists(token_file):
@@ -1204,9 +1495,7 @@ def get_gsc_service_oauth(token_file: Optional[str] = None):
             creds = _start_oauth_flow(flow, context="token refresh / initial login")
 
             # Save the credentials for future use
-            os.makedirs(os.path.dirname(token_file), exist_ok=True)
-            with open(token_file, 'w') as token:
-                token.write(creds.to_json())
+            _write_token_file(token_file, creds.to_json())
 
     # Build and return the service
     return build("searchconsole", "v1", credentials=creds)
@@ -1337,8 +1626,8 @@ async def _ensure_property_cache(
             return
 
         try:
-            site_list = await asyncio.to_thread(
-                lambda: service.sites().list().execute()
+            site_list = await _gsc_execute(
+                lambda: service.sites().list().execute(), step="sites.list",
             )
         except Exception:
             # Discovery failed (403, 500, network). Mark state="error"
@@ -1623,6 +1912,7 @@ async def _call_with_stale_retry(
     site_url: str,
     account_alias: Optional[str],
     api_call,
+    step: str = "api_call",
 ) -> Tuple[str, Any, Any]:
     """Resolve → build service → invoke ``api_call(service)``.
 
@@ -1641,7 +1931,7 @@ async def _call_with_stale_retry(
     """
     resolved_alias, service = await get_gsc_service_for_site(site_url, account_alias)
     try:
-        result = await asyncio.to_thread(api_call, service)
+        result = await _gsc_execute(lambda: api_call(service), step=step)
         return resolved_alias, service, result
     except HttpError as e:
         if account_alias is not None:
@@ -1659,7 +1949,7 @@ async def _call_with_stale_retry(
         if new_alias == resolved_alias:
             # Resolution picked the same alias — no recovery possible.
             raise e
-        result = await asyncio.to_thread(api_call, new_service)
+        result = await _gsc_execute(lambda: api_call(new_service), step=step)
         return new_alias, new_service, result
 
 
@@ -1723,8 +2013,7 @@ def _build_service_noninteractive(alias: str) -> Tuple[Optional[Any], Optional[s
             # a disk error here is not fatal because creds are valid
             # in-memory for this call.
             try:
-                with open(token_path, "w") as f:
-                    f.write(creds.to_json())
+                _write_token_file(token_path, creds.to_json())
             except OSError:
                 pass
         else:
@@ -1737,6 +2026,792 @@ def _build_service_noninteractive(alias: str) -> Tuple[Optional[Any], Optional[s
     except Exception:
         # discovery/build failure — treat as transient upstream.
         return None, ErrorCode.SERVICE_UNAVAILABLE
+
+
+# --- Search Analytics engine (v1.4.0) ---
+# One code path for every searchanalytics.query caller: request validation,
+# date windows in Pacific Time, pagination, client-side sorting, freshness
+# metadata and the page-total vs query-sum gap. `gsc_query` exposes it
+# directly; the older analytics tools call it and keep their own output
+# shapes.
+
+
+class _SaValidationError(ValueError):
+    """Caller error in a Search Analytics request; rendered as BAD_REQUEST."""
+
+    def __init__(self, message: str, hint: str = "") -> None:
+        super().__init__(message)
+        self.hint = hint
+
+
+def _norm_key(value: Any) -> str:
+    return str(value).strip().replace("_", "").replace("-", "").replace(" ", "").lower()
+
+
+def _norm_enum(value: Any, table: Dict[str, str], *, field: str) -> str:
+    key = _norm_key(value)
+    if key not in table:
+        raise _SaValidationError(
+            f"Unknown {field}: {value!r}.",
+            f"Valid {field} values: {sorted(set(table.values()))}.",
+        )
+    return table[key]
+
+
+_SA_DIMENSIONS = {
+    "date": "date", "hour": "hour", "query": "query", "page": "page",
+    "country": "country", "device": "device", "searchappearance": "searchAppearance",
+}
+_SA_FILTER_DIMENSIONS = {k: v for k, v in _SA_DIMENSIONS.items() if v not in ("date", "hour")}
+_SA_TYPES = {
+    "web": "web", "image": "image", "video": "video", "news": "news",
+    "googlenews": "googleNews", "discover": "discover",
+}
+_SA_OPERATORS = {
+    "equals": "equals", "notequals": "notEquals", "contains": "contains",
+    "notcontains": "notContains", "includingregex": "includingRegex",
+    "excludingregex": "excludingRegex",
+}
+_SA_AGGREGATIONS = {
+    "auto": "auto", "bypage": "byPage", "byproperty": "byProperty",
+    "bynewsshowcasepanel": "byNewsShowcasePanel",
+}
+_SA_DATA_STATES = {"final": "final", "all": "all", "hourlyall": "hourly_all"}
+_SA_SORT_METRICS = ("clicks", "impressions", "ctr", "position")
+_SA_PAGE_SIZE = 25000          # API maximum rowLimit
+_SA_DEFAULT_MAX_ROWS = 100_000  # fetch_all hard cap unless the caller raises it
+_SA_LOOKAROUND_RE = re.compile(r"\(\?(?:[=!]|<[=!])")
+
+# Freshness: the latest date whose data is final, per (site, type), cached
+# for an hour. See _latest_final_date.
+_LATEST_FINAL_TTL_SEC = 3600
+_latest_final_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+
+
+def _parse_dimensions(dimensions: Any, *, allow_empty: bool = False) -> List[str]:
+    if dimensions is None:
+        items: List[Any] = []
+    elif isinstance(dimensions, str):
+        items = [d for d in dimensions.split(",") if d.strip()]
+    else:
+        items = list(dimensions)
+    dims = [_norm_enum(d, _SA_DIMENSIONS, field="dimension") for d in items]
+    if len(set(dims)) != len(dims):
+        raise _SaValidationError(f"Duplicate dimension in {dims}.", "List each dimension once.")
+    if not dims and not allow_empty:
+        raise _SaValidationError("At least one dimension is required.", "e.g. dimensions=['query'].")
+    return dims
+
+
+def _normalize_filter_groups(filter_groups: Any) -> List[Dict[str, Any]]:
+    """Accept ``[{group_type:'and', filters:[{dimension, operator, expression}]}]``,
+    or a flat list of filters (one AND group). Returns API-shaped groups."""
+    if not filter_groups:
+        return []
+    if isinstance(filter_groups, dict):
+        filter_groups = [filter_groups]
+    if not isinstance(filter_groups, list):
+        raise _SaValidationError("filter_groups must be a list.", "See the gsc_query docstring for the shape.")
+    if all(isinstance(g, dict) and "filters" not in g for g in filter_groups):
+        filter_groups = [{"filters": filter_groups}]
+    groups: List[Dict[str, Any]] = []
+    for group in filter_groups:
+        if not isinstance(group, dict) or not isinstance(group.get("filters"), list):
+            raise _SaValidationError("Each filter group needs a 'filters' list.", "")
+        group_type = group.get("group_type", group.get("groupType", "and"))
+        if _norm_key(group_type) != "and":
+            raise _SaValidationError(f"Unsupported group_type {group_type!r}.", "The API supports only 'and'.")
+        filters = []
+        for f in group["filters"]:
+            if not isinstance(f, dict):
+                raise _SaValidationError(f"Filter must be an object, got {f!r}.", "")
+            dim = _norm_enum(f.get("dimension"), _SA_FILTER_DIMENSIONS, field="filter dimension")
+            op = _norm_enum(f.get("operator", "equals"), _SA_OPERATORS, field="filter operator")
+            expr = f.get("expression")
+            if not isinstance(expr, str) or expr == "":
+                raise _SaValidationError(f"Filter on {dim} needs a non-empty expression.", "")
+            if op in ("includingRegex", "excludingRegex"):
+                if _SA_LOOKAROUND_RE.search(expr):
+                    raise _SaValidationError(
+                        f"Regex {expr!r} uses lookaround, which Google's RE2 engine does not support.",
+                        "Rewrite without (?=, (?!, (?<= or (?<!; e.g. use excludingRegex for negation.",
+                    )
+                try:
+                    re.compile(expr)
+                except re.error as e:
+                    raise _SaValidationError(f"Invalid regex {expr!r}: {e}.", "The API uses RE2 syntax.")
+            filters.append({"dimension": dim, "operator": op, "expression": expr})
+        if filters:
+            groups.append({"filters": filters})
+    return groups
+
+
+def _check_sa_compat(
+    *,
+    dimensions: List[str],
+    filter_groups: List[Dict[str, Any]],
+    search_type: str,
+    aggregation_type: Optional[str],
+    data_state: str,
+) -> None:
+    """Reject combinations the API documents as invalid (searchanalytics.query
+    reference, last updated 2026-08-11). Anything else passes through, and a
+    Google 400 surfaces as BAD_REQUEST naming the step."""
+    filters = [f for g in filter_groups for f in g["filters"]]
+    uses_page = "page" in dimensions or any(f["dimension"] == "page" for f in filters)
+    if "hour" in dimensions and data_state != "hourly_all":
+        raise _SaValidationError(
+            "The 'hour' dimension needs data_state='hourly_all'.",
+            "Pass data_state='hourly_all' (hourly data covers roughly the last 10 days).",
+        )
+    if aggregation_type == "byProperty" and uses_page:
+        raise _SaValidationError(
+            "If you group or filter by page, you cannot aggregate by property.",
+            "Use aggregation_type='byPage' or 'auto'.",
+        )
+    if aggregation_type == "byProperty" and search_type in ("discover", "googleNews"):
+        raise _SaValidationError(
+            f"byProperty aggregation is not supported for type={search_type!r}.",
+            "Use aggregation_type='byPage' or 'auto'.",
+        )
+    if aggregation_type == "byNewsShowcasePanel":
+        showcase = any(
+            f["dimension"] == "searchAppearance" and f["operator"] == "equals"
+            and f["expression"].upper() == "NEWS_SHOWCASE"
+            for f in filters
+        )
+        other_appearance = any(
+            f["dimension"] == "searchAppearance" and f["expression"].upper() != "NEWS_SHOWCASE"
+            for f in filters
+        )
+        if search_type not in ("discover", "googleNews") or not showcase or uses_page or other_appearance:
+            raise _SaValidationError(
+                "byNewsShowcasePanel needs type discover or googleNews, a searchAppearance "
+                "equals NEWS_SHOWCASE filter, and no page grouping/filter or other appearance filter.",
+                "See the searchanalytics.query reference for aggregationType.",
+            )
+
+
+def _build_sa_body(
+    *,
+    start_date: str,
+    end_date: str,
+    dimensions: List[str],
+    search_type: Optional[str] = None,
+    filter_groups: Optional[List[Dict[str, Any]]] = None,
+    aggregation_type: Optional[str] = None,
+    data_state: Optional[str] = None,
+    row_limit: int = 1000,
+    start_row: int = 0,
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {
+        "startDate": start_date,
+        "endDate": end_date,
+        "dimensions": list(dimensions),
+        "rowLimit": row_limit,
+    }
+    if start_row:
+        body["startRow"] = start_row
+    if search_type:
+        body["type"] = search_type
+    if filter_groups:
+        body["dimensionFilterGroups"] = filter_groups
+    if aggregation_type:
+        body["aggregationType"] = aggregation_type
+    if data_state and data_state != "final":
+        body["dataState"] = data_state
+    return body
+
+
+class _SaContext:
+    """A resolved account + service for one tool call. Carries the 403
+    stale-cache re-resolve so every analytics call gets it once."""
+
+    def __init__(self, site_url: str, account_alias: Optional[str], alias: str, service: Any) -> None:
+        self.site_url = site_url
+        self.account_alias = account_alias
+        self.alias = alias
+        self.service = service
+        self.re_resolved = False
+
+
+async def _sa_context(site_url: str, account_alias: Optional[str]) -> _SaContext:
+    alias, service = await get_gsc_service_for_site(site_url, account_alias)
+    return _SaContext(site_url, account_alias, alias, service)
+
+
+async def _sa_exec(ctx: _SaContext, body: Dict[str, Any], *, step: str) -> Dict[str, Any]:
+    def _call(svc):
+        return lambda: svc.searchanalytics().query(siteUrl=ctx.site_url, body=body).execute()
+
+    try:
+        return await _gsc_execute(_call(ctx.service), step=step) or {}
+    except HttpError as e:
+        info = _http_error_details(e)
+        if ctx.account_alias is not None or ctx.re_resolved or info["status"] != 403 or info["kind"] != "other":
+            raise
+        ctx.re_resolved = True
+        _invalidate_property_cache(ctx.alias)
+        try:
+            new_alias, new_service = await get_gsc_service_for_site(ctx.site_url, None)
+        except AccountResolverError:
+            raise e
+        if new_alias == ctx.alias:
+            raise
+        ctx.alias, ctx.service = new_alias, new_service
+        return await _gsc_execute(_call(new_service), step=step) or {}
+
+
+def _response_metadata(resp: Dict[str, Any]) -> Dict[str, Optional[str]]:
+    """Freshness markers. The reference documents snake_case names; accept
+    camelCase too in case the wire form differs."""
+    meta = resp.get("metadata") or {}
+    return {
+        "first_incomplete_date": meta.get("first_incomplete_date") or meta.get("firstIncompleteDate"),
+        "first_incomplete_hour": meta.get("first_incomplete_hour") or meta.get("firstIncompleteHour"),
+    }
+
+
+async def _latest_final_date(ctx: _SaContext, search_type: Optional[str] = None) -> Dict[str, Any]:
+    """Latest date with FINAL data for ``ctx.site_url``, cached for an hour.
+
+    Primary: one date-grouped probe over the last 10 days with
+    dataState=all; final data stops the day before ``first_incomplete_date``.
+    Fallbacks: the max populated date from a final-data probe (sparse
+    properties), then today PT − 3 with a warning. ``source`` says which.
+    """
+    stype = search_type or "web"
+    key = (ctx.site_url, stype)
+    hit = _latest_final_cache.get(key)
+    if hit and time.time() - hit[0] < _LATEST_FINAL_TTL_SEC:
+        return dict(hit[1])
+    today = _today_pt()
+    base = {
+        "startDate": (today - timedelta(days=10)).isoformat(),
+        "endDate": today.isoformat(),
+        "dimensions": ["date"],
+        "rowLimit": 20,
+    }
+    if search_type and search_type != "web":
+        base["type"] = search_type
+    result: Dict[str, Any] = {"date": None, "source": None, "warning": None}
+    # A failing probe must not fail the caller's query: fall through to the
+    # next source (a real auth/permission problem surfaces on the main call).
+    try:
+        resp = await _sa_exec(ctx, dict(base, dataState="all"), step="freshness_probe")
+    except HttpError:
+        resp = {}
+    fid = _response_metadata(resp)["first_incomplete_date"]
+    if fid:
+        try:
+            result["date"] = (datetime.strptime(fid, "%Y-%m-%d").date() - timedelta(days=1)).isoformat()
+            result["source"] = "metadata"
+        except ValueError:
+            pass
+    if result["date"] is None:
+        try:
+            resp = await _sa_exec(ctx, base, step="freshness_probe_final")
+        except HttpError:
+            resp = {}
+        dates = [r["keys"][0] for r in resp.get("rows") or [] if r.get("keys") and r["keys"][0]]
+        if dates:
+            result["date"] = max(dates)
+            result["source"] = "populated"
+    if result["date"] is None:
+        result["date"] = (today - timedelta(days=3)).isoformat()
+        result["source"] = "fallback"
+        result["warning"] = "No freshness data for this property; assumed final data ends 3 days ago (PT)."
+    _latest_final_cache[key] = (time.time(), dict(result))
+    return result
+
+
+def _as_date(value: Any):
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        return value
+    return datetime.strptime(_parse_gsc_date(str(value)), "%Y-%m-%d").date()
+
+
+async def _resolve_window(
+    ctx: _SaContext,
+    *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    data_state: str = "final",
+    search_type: Optional[str] = None,
+    default_days: int = 28,
+) -> Dict[str, Any]:
+    """Resolve the query window and describe it for ``meta``.
+
+    Explicit dates win. Otherwise ``days=N`` means the last N days of final
+    data (inclusive, ending on ``latest_final_date``, like the GSC UI), or N
+    days ending today PT when ``data_state`` is ``all``/``hourly_all``.
+    """
+    freshness = await _latest_final_date(ctx, search_type)
+    latest_final = datetime.strptime(freshness["date"], "%Y-%m-%d").date()
+    warnings: List[str] = []
+    if freshness.get("warning"):
+        warnings.append(freshness["warning"])
+    fresh_end = _today_pt() if data_state in ("all", "hourly_all") else latest_final
+    n = None
+    if days is not None:
+        n = max(1, int(days))
+    if start_date or end_date:
+        end = _as_date(end_date) if end_date else fresh_end
+        if start_date:
+            start = _as_date(start_date)
+        else:
+            start = end - timedelta(days=(n or default_days) - 1)
+    else:
+        n = n or default_days
+        end = fresh_end
+        start = end - timedelta(days=n - 1)
+    if start > end:
+        raise _SaValidationError(
+            f"start_date {start.isoformat()} is after end_date {end.isoformat()}.", "Swap the dates.",
+        )
+    non_final = []
+    d = max(start, latest_final + timedelta(days=1))
+    while d <= end:
+        non_final.append(d.isoformat())
+        d += timedelta(days=1)
+    if non_final and data_state == "final":
+        warnings.append(
+            f"end_date {end.isoformat()} is after the latest final date {latest_final.isoformat()}; "
+            f"{len(non_final)} day(s) have no final data yet. Pass data_state='all' for preliminary data."
+        )
+    return {
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "window_days": (end - start).days + 1,
+        "days_requested": n if not (start_date or end_date) else None,
+        "data_state": data_state,
+        "latest_final_date": latest_final.isoformat(),
+        "latest_final_date_source": freshness["source"],
+        "non_final_days": non_final,
+        "timezone": _PT_LABEL,
+        "warnings": warnings,
+    }
+
+
+async def _resolve_comparison_windows(
+    ctx: _SaContext,
+    *,
+    days: int,
+    data_state: str = "final",
+    search_type: Optional[str] = None,
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Two equal-length adjacent windows for ``days=N`` comparisons:
+    ``(earlier, later)``. The later one is the last N final days; the
+    earlier one is the N days before it, so both end on final data."""
+    later = await _resolve_window(ctx, days=days, data_state=data_state, search_type=search_type)
+    later_start = datetime.strptime(later["start_date"], "%Y-%m-%d").date()
+    n = later["window_days"]
+    earlier_end = later_start - timedelta(days=1)
+    earlier = await _resolve_window(
+        ctx,
+        start_date=(earlier_end - timedelta(days=n - 1)).isoformat(),
+        end_date=earlier_end.isoformat(),
+        data_state=data_state,
+        search_type=search_type,
+    )
+    return earlier, later
+
+
+def _comparison_mode(explicit: List[Optional[str]], days: Optional[int]) -> bool:
+    """True to use ``days`` windows. Explicit dates win when all four are
+    given (the caller then warns that days was ignored); a partial set is
+    ambiguous and rejected."""
+    if all(explicit):
+        return False
+    if any(explicit):
+        raise _SaValidationError(
+            "Pass all four period dates, or days=N alone (a partial set of dates is ambiguous).",
+            "days=N compares the last N final days with the N days before them.",
+        )
+    if days is None:
+        raise _SaValidationError(
+            "Pass all four period dates, or days=N.",
+            "days=N compares the last N final days with the N days before them.",
+        )
+    return True
+
+
+def _window_line(w: Dict[str, Any]) -> str:
+    extra = f", {len(w['non_final_days'])} non-final" if w.get("non_final_days") else ""
+    return (
+        f"Window: {w['start_date']} → {w['end_date']} ({w['window_days']} days{extra}, "
+        f"data_state={w['data_state']}, latest final {w['latest_final_date']}, Pacific Time)"
+    )
+
+
+def _window_meta(w: Dict[str, Any]) -> Dict[str, Any]:
+    keys = (
+        "start_date", "end_date", "window_days", "data_state", "latest_final_date",
+        "latest_final_date_source", "non_final_days", "timezone",
+    )
+    return {k: w.get(k) for k in keys}
+
+
+def _standard_meta(w: Optional[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:
+    """§5 meta block: the window echo plus row/aggregation facts and the
+    server version. Extra keys are merged in; warnings are concatenated."""
+    meta: Dict[str, Any] = {}
+    if w is not None:
+        meta.update(_window_meta(w))
+    warnings = list(w.get("warnings", [])) if w else []
+    warnings.extend(extra.pop("warnings", None) or [])
+    meta.update(extra)
+    meta["warnings"] = warnings
+    meta["server_version"] = _SERVER_VERSION
+    return meta
+
+
+def _sa_shape_rows(raw_rows: List[Dict[str, Any]], dims: List[str]) -> List[Dict[str, Any]]:
+    rows = []
+    for r in raw_rows:
+        keys = r.get("keys") or []
+        row: Dict[str, Any] = {dim: (keys[i] if i < len(keys) else "") for i, dim in enumerate(dims)}
+        row["clicks"] = r.get("clicks", 0)
+        row["impressions"] = r.get("impressions", 0)
+        row["ctr"] = r.get("ctr", 0)
+        row["position"] = r.get("position", 0)
+        rows.append(row)
+    return rows
+
+
+def _sa_sort(rows: List[Dict[str, Any]], dims: List[str], sort_by: str, direction: str) -> List[Dict[str, Any]]:
+    """Sort on a metric with a deterministic tie-break on the dimension keys.
+    Missing values go last whichever the direction."""
+    desc = _norm_key(direction) in ("desc", "descending")
+    real = [r for r in rows if r.get(sort_by) is not None]
+    none = [r for r in rows if r.get(sort_by) is None]
+    real.sort(key=lambda r: tuple(str(r.get(d, "")) for d in dims))
+    real.sort(key=lambda r: float(r[sort_by]), reverse=desc)
+    return real + none
+
+
+def _mark_preliminary(rows: List[Dict[str, Any]], dims: List[str], fid: Optional[str], fih: Optional[str]) -> None:
+    if fid and "date" in dims:
+        for r in rows:
+            r["preliminary"] = str(r.get("date", "")) >= fid
+    if fih and "hour" in dims:
+        try:
+            cutoff = datetime.fromisoformat(fih)
+        except ValueError:
+            cutoff = None
+        for r in rows:
+            try:
+                r["preliminary"] = datetime.fromisoformat(str(r.get("hour"))) >= cutoff if cutoff else str(r.get("hour")) >= fih
+            except (TypeError, ValueError):
+                r["preliminary"] = str(r.get("hour")) >= fih
+
+
+async def _sa_run(
+    ctx: _SaContext,
+    *,
+    dimensions: Any,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    days: Optional[int] = None,
+    window: Optional[Dict[str, Any]] = None,
+    search_type: Optional[str] = None,
+    filter_groups: Any = None,
+    aggregation_type: Optional[str] = None,
+    data_state: Optional[str] = None,
+    row_limit: int = 1000,
+    start_row: int = 0,
+    fetch_all: bool = False,
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    sort_by: Optional[str] = None,
+    sort_direction: str = "descending",
+    include_totals: bool = False,
+    default_days: int = 28,
+    step: str = "searchanalytics.query",
+) -> Dict[str, Any]:
+    """Run one validated Search Analytics query end to end.
+
+    Returns ``rows`` (shaped dicts, sorted and sliced as requested) plus the
+    facts every caller reports: ``window``, ``truncated``,
+    ``next_start_row``, ``aggregation_type`` (as returned), freshness
+    markers, ``sort_applied`` and, with ``include_totals`` on a
+    query-grouped request, ``totals`` (page_total / query_rows_sum /
+    unattributed_share). Raises _SaValidationError, HttpError,
+    AccountResolverError.
+    """
+    dims = _parse_dimensions(dimensions, allow_empty=True)
+    stype = _norm_enum(search_type, _SA_TYPES, field="type") if search_type else None
+    dstate = _norm_enum(data_state, _SA_DATA_STATES, field="data_state") if data_state else "final"
+    agg = _norm_enum(aggregation_type, _SA_AGGREGATIONS, field="aggregation_type") if aggregation_type else None
+    groups = _normalize_filter_groups(filter_groups)
+    _check_sa_compat(
+        dimensions=dims, filter_groups=groups, search_type=stype or "web",
+        aggregation_type=agg, data_state=dstate,
+    )
+    if sort_by is not None and sort_by not in _SA_SORT_METRICS:
+        raise _SaValidationError(f"Unknown sort_by {sort_by!r}.", f"Valid: {list(_SA_SORT_METRICS)}.")
+    if _norm_key(sort_direction) not in ("asc", "ascending", "desc", "descending"):
+        raise _SaValidationError(f"Unknown sort_direction {sort_direction!r}.", "Use ascending or descending.")
+    row_limit = max(1, min(int(row_limit), _SA_PAGE_SIZE))
+    start_row = int(start_row or 0)
+    if start_row < 0:
+        raise _SaValidationError(f"start_row must be >= 0, got {start_row}.", "")
+    max_rows = max(1, int(max_rows))
+
+    w = window or await _resolve_window(
+        ctx, start_date=start_date, end_date=end_date, days=days,
+        data_state=dstate, search_type=stype, default_days=default_days,
+    )
+    base = _build_sa_body(
+        start_date=w["start_date"], end_date=w["end_date"], dimensions=dims,
+        search_type=stype, filter_groups=groups, aggregation_type=agg,
+        data_state=dstate, row_limit=row_limit,
+    )
+
+    # The API orders by clicks desc (by date asc when grouped by date). Any
+    # other requested order is only correct over the full result set.
+    desc = _norm_key(sort_direction) in ("desc", "descending")
+    api_order_matches = sort_by is None or (sort_by == "clicks" and desc and "date" not in dims)
+    client_sort = sort_by is not None
+    effective_fetch_all = fetch_all or not api_order_matches
+
+    raw: List[Dict[str, Any]] = []
+    responses: List[Dict[str, Any]] = []
+    complete = False
+    full_sort = client_sort and not api_order_matches
+    fetch_origin = 0 if full_sort else start_row  # first row the sums cover
+    if effective_fetch_all:
+        cursor = 0 if full_sort else start_row
+        while True:
+            page_size = min(_SA_PAGE_SIZE, max_rows - len(raw))
+            if page_size <= 0:
+                break
+            body = dict(base, rowLimit=page_size)
+            if cursor:
+                body["startRow"] = cursor
+            resp = await _sa_exec(ctx, body, step=step)
+            responses.append(resp)
+            batch = resp.get("rows") or []
+            raw.extend(batch)
+            cursor += len(batch)
+            if len(batch) < page_size:
+                complete = True
+                break
+    else:
+        body = dict(base)
+        if start_row:
+            body["startRow"] = start_row
+        resp = await _sa_exec(ctx, body, step=step)
+        responses.append(resp)
+        raw = list(resp.get("rows") or [])
+        complete = len(raw) < row_limit
+
+    first = responses[0] if responses else {}
+    fresh = {"first_incomplete_date": None, "first_incomplete_hour": None}
+    for resp in responses:
+        for k, v in _response_metadata(resp).items():
+            fresh[k] = fresh[k] or v
+    all_rows = _sa_shape_rows(raw, dims)
+    _mark_preliminary(all_rows, dims, fresh["first_incomplete_date"], fresh["first_incomplete_hour"])
+
+    warnings: List[str] = []
+    if client_sort:
+        all_rows = _sa_sort(all_rows, dims, sort_by, sort_direction)
+    if full_sort:
+        # Fetched from row 0 so the order is global; now apply the page.
+        window_rows = all_rows[start_row:]
+        rows = window_rows if fetch_all else window_rows[:row_limit]
+        more_in_set = (not fetch_all) and len(window_rows) > row_limit
+        if not complete:
+            warnings.append(
+                f"Sorted by {sort_by} over the first {len(all_rows)} rows only (max_rows cap); "
+                f"raise max_rows for an exact order."
+            )
+        truncated = (not complete) or more_in_set
+        next_start_row = (start_row + row_limit) if more_in_set else None
+    elif effective_fetch_all:
+        rows = all_rows
+        truncated = not complete
+        next_start_row = (start_row + len(all_rows)) if not complete else None
+    else:
+        rows = all_rows
+        truncated = not complete
+        next_start_row = (start_row + row_limit) if not complete else None
+
+    totals = None
+    if include_totals and "query" in dims:
+        totals_body = dict(base, dimensions=[], rowLimit=1)
+        resp_agg = first.get("responseAggregationType")
+        if resp_agg and resp_agg != "auto":
+            totals_body["aggregationType"] = resp_agg
+        t_resp = await _sa_exec(ctx, totals_body, step=f"{step}.totals")
+        t_rows = t_resp.get("rows") or []
+        page_total = {
+            "clicks": (t_rows[0].get("clicks", 0) if t_rows else 0),
+            "impressions": (t_rows[0].get("impressions", 0) if t_rows else 0),
+        }
+        rows_sum = {
+            "clicks": sum(r.get("clicks", 0) or 0 for r in all_rows),
+            "impressions": sum(r.get("impressions", 0) or 0 for r in all_rows),
+        }
+        share = {
+            m: (1 - rows_sum[m] / page_total[m]) if page_total[m] else None
+            for m in ("clicks", "impressions")
+        }
+        for m, v in share.items():
+            if v is not None and not (0.0 <= v <= 1.0):
+                warnings.append(
+                    f"unattributed_share.{m}={v:.4f} is outside [0, 1]; query rows and the "
+                    f"query-less total disagree (aggregation {resp_agg or 'auto'})."
+                )
+        totals = {
+            "page_total": page_total,
+            "query_rows_sum": rows_sum,
+            "query_rows_sum_scope": (
+                "all_rows" if complete and fetch_origin == 0
+                else f"rows {fetch_origin}–{fetch_origin + len(all_rows) - 1} only"
+                     + ("" if complete else "; more exist")
+            ),
+            "unattributed_share": share,
+            "aggregation_type": resp_agg,
+        }
+
+    return {
+        "rows": rows,
+        "all_rows_count": len(all_rows),
+        "complete": complete,
+        "truncated": truncated,
+        "next_start_row": next_start_row,
+        "window": w,
+        "dimensions": dims,
+        "type": stype or "web",
+        "data_state": dstate,
+        "aggregation_type": first.get("responseAggregationType"),
+        "first_incomplete_date": fresh["first_incomplete_date"],
+        "first_incomplete_hour": fresh["first_incomplete_hour"],
+        "sort_applied": "client" if client_sort else "api_order",
+        "totals": totals,
+        "warnings": warnings,
+        "filter_groups": groups,
+    }
+
+
+def _sa_meta(res: Dict[str, Any], **extra: Any) -> Dict[str, Any]:
+    """Standard meta for a `_sa_run` result."""
+    fields: Dict[str, Any] = {
+        "type": res["type"],
+        "aggregation_type": res["aggregation_type"],
+        "first_incomplete_date": res["first_incomplete_date"],
+        "first_incomplete_hour": res["first_incomplete_hour"],
+        "row_count": len(res["rows"]),
+        "truncated": res["truncated"],
+        "sort_applied": res["sort_applied"],
+    }
+    if res["totals"] is not None:
+        fields["page_total"] = res["totals"]["page_total"]
+        fields["query_rows_sum"] = res["totals"]["query_rows_sum"]
+        fields["query_rows_sum_scope"] = res["totals"]["query_rows_sum_scope"]
+        fields["unattributed_share"] = res["totals"]["unattributed_share"]
+    fields.update(extra)
+    fields["warnings"] = list(res["warnings"]) + list(extra.get("warnings") or [])
+    return _standard_meta(res["window"], **fields)
+
+
+def _sa_bad_request(e: "_SaValidationError", *, tool: str, response_format: str = "json") -> Any:
+    return _format_error(
+        _make_error_envelope(error=str(e), hint=e.hint, error_code=ErrorCode.BAD_REQUEST, tool=tool),
+        response_format=response_format,
+    )
+
+
+# --- save_to_file (v1.4.0) ---
+# Ported from hubspot-cms-mcp's _safe_write: absolute path only, no symlink
+# target or symlinked parent, atomic temp file + replace. Saved files hold
+# raw values (no spreadsheet-formula guard) because they are data for
+# programs, and operator strings like "+site." must survive intact.
+_SAVE_PREVIEW_ROWS = 20
+
+
+def _validate_save_path(path: str) -> Optional[str]:
+    p = Path(path)
+    if not p.is_absolute():
+        return f"save_to_file must be an absolute path, got: {path!r}"
+    if p.suffix.lower() not in (".csv", ".json"):
+        return f"save_to_file must end in .csv or .json, got: {path!r}"
+    if p.is_symlink():
+        return "save_to_file cannot be a symlink"
+    if p.parent.exists() and p.parent.is_symlink():
+        return f"save_to_file parent directory is a symlink, which is not allowed: {p.parent}"
+    return None
+
+
+def _save_rows(path: str, rows: List[Dict[str, Any]], columns: List[str], meta: Dict[str, Any]) -> Optional[str]:
+    """Write rows (+ meta) to ``path``; returns an error string or None."""
+    err = _validate_save_path(path)
+    if err:
+        return err
+    p = Path(path)
+    tmp: Optional[Path] = None
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.parent / f".{p.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        if p.suffix.lower() == ".json":
+            text = json.dumps({"meta": meta, "columns": columns, "rows": rows}, default=str, indent=2)
+            tmp.write_text(text, encoding="utf-8")
+        else:
+            with open(tmp, "w", encoding="utf-8", newline="") as fh:
+                writer = csv.writer(fh)
+                writer.writerow(columns)
+                for r in rows:
+                    writer.writerow(["" if r.get(c) is None else r.get(c) for c in columns])
+        tmp.replace(p)
+        return None
+    except Exception as e:  # noqa: BLE001 — surface any write failure as a string
+        if tmp is not None:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+        return f"{type(e).__name__}: {e}"
+
+
+async def _saved_summary(
+    *,
+    tool: str,
+    path: str,
+    rows: List[Dict[str, Any]],
+    columns: List[Dict[str, str]],
+    meta: Dict[str, Any],
+    response_format: str,
+    header_lines: Optional[List[str]] = None,
+    truncated: bool = False,
+) -> Any:
+    """Write every row to ``path`` (in a worker thread) and return only a
+    summary: row count, metric totals and the first 20 rows. Callers fetch
+    the full result first (fetch_all); ``truncated`` means even that hit
+    max_rows."""
+    keys = [c["key"] for c in columns]
+    err = await asyncio.to_thread(_save_rows, path, rows, keys, meta)
+    if err:
+        return _format_error(
+            _make_error_envelope(error=err, hint="Pass an absolute .csv or .json path.",
+                                 error_code=ErrorCode.BAD_REQUEST, tool=tool),
+            response_format=response_format,
+        )
+    totals = {
+        m: sum(r.get(m) or 0 for r in rows)
+        for m in ("clicks", "impressions") if m in keys
+    }
+    summary_meta = dict(meta, saved_to=path, saved_row_count=len(rows), saved_totals=totals,
+                        saved_truncated=truncated)
+    lines = [f"Saved {len(rows)} rows to {path} (showing the first {min(len(rows), _SAVE_PREVIEW_ROWS)})."]
+    if truncated:
+        lines.insert(0, "WARNING: the saved file hit max_rows; raise max_rows for every row.")
+    lines.extend(header_lines or [])
+    return _format_table(
+        rows[:_SAVE_PREVIEW_ROWS], columns, response_format=response_format,
+        header_lines=lines, meta=summary_meta, text_meta=True,
+    )
 
 
 @mcp.tool()
@@ -1843,8 +2918,9 @@ async def gsc_list_properties(
                     })
                     continue
                 try:
-                    site_list = await asyncio.to_thread(
+                    site_list = await _gsc_execute(
                         lambda s=service: s.sites().list().execute(),
+                        step="sites.list",
                     )
                 except HttpError as e:
                     code = _HTTP_STATUS_TO_CODE.get(
@@ -2046,7 +3122,9 @@ async def gsc_add_site(
                 response_format="markdown",
             )
 
-        response = service.sites().add(siteUrl=site_url).execute()
+        response = await _gsc_execute(
+            lambda: service.sites().add(siteUrl=site_url).execute(), step="sites.add",
+        )
 
         # On success, invalidate the chosen alias's property cache so
         # the next read-tool call picks up the newly-added property.
@@ -2097,7 +3175,7 @@ async def gsc_delete_site(
             await _call_with_stale_retry(
                 site_url=site_url,
                 account_alias=account_alias,
-                api_call=_do,
+                api_call=_do, step="sites.delete",
             )
         except AccountResolverError as e:
             return _format_error(
@@ -2124,6 +3202,156 @@ async def gsc_delete_site(
             response_format="markdown",
         )
 
+def _tool_error(e: BaseException, *, tool: str, site_url: Optional[str] = None,
+                response_format: str = "json",
+                generic_hint: str = "Set GSC_MCP_TELEMETRY=1 for structured logs and retry.") -> Any:
+    """Map any exception from a v1.4.0 tool body to a formatted envelope."""
+    if isinstance(e, AccountResolverError):
+        env = e.to_envelope(tool=tool)
+    elif isinstance(e, _SaValidationError):
+        env = _make_error_envelope(error=str(e), hint=e.hint, error_code=ErrorCode.BAD_REQUEST, tool=tool)
+    elif isinstance(e, HttpError):
+        env = _http_error_envelope(e, tool=tool, site_url=site_url)
+    elif isinstance(e, ValueError):
+        env = _make_error_envelope(error=str(e), hint="Check the arguments (dates are YYYY-MM-DD).",
+                                   error_code=ErrorCode.BAD_REQUEST, tool=tool)
+    else:
+        env = _make_error_envelope(
+            error=f"{type(e).__name__}: {e}",
+            hint=generic_hint,
+            tool=tool,
+        )
+    return _format_error(env, response_format=response_format)
+
+
+_METRIC_COLUMNS = [
+    {"key": "clicks", "display": "Clicks", "type": "int"},
+    {"key": "impressions", "display": "Impressions", "type": "int"},
+    {"key": "ctr", "display": "CTR", "type": "pct"},
+    {"key": "position", "display": "Position", "type": "float"},
+]
+
+
+def _sa_columns(dims: List[str], *, preliminary: bool = False) -> List[Dict[str, str]]:
+    cols = [{"key": d, "display": d[0].upper() + d[1:], "type": "str"} for d in dims]
+    cols.extend(_METRIC_COLUMNS)
+    if preliminary:
+        cols.append({"key": "preliminary", "display": "Preliminary", "type": "str"})
+    return cols
+
+
+@mcp.tool()
+async def gsc_query(
+    site_url: str,
+    start_date: str,
+    end_date: str,
+    dimensions: Union[List[str], str] = "query",
+    type: str = "web",
+    filter_groups: Optional[List[Dict[str, Any]]] = None,
+    aggregation_type: Optional[str] = None,
+    data_state: str = "final",
+    row_limit: int = 1000,
+    start_row: int = 0,
+    fetch_all: bool = False,
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    sort_by: Optional[str] = None,
+    sort_direction: str = "descending",
+    save_to_file: Optional[str] = None,
+    response_format: str = "json",
+    *,
+    include_totals: bool = True,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Raw Search Analytics passthrough: every searchanalytics.query
+    parameter, validated, with explicit dates. Pick me when a convenience
+    tool can't express the query (regex/multi filters, searchAppearance,
+    fresh or hourly data, News/Discover).
+
+    API limits, stated plainly: no Generative AI features (AI Overview /
+    AI Mode) data — import a UI export instead; anonymised queries are
+    never returned, so query rows undercount (see meta.unattributed_share);
+    there is no brand dimension — filter with includingRegex/excludingRegex.
+
+    Args:
+        site_url: GSC property (`sc-domain:example.com` for domain properties).
+        start_date / end_date: YYYY-MM-DD (or 'today', 'yesterday',
+            'Ndaysago'), Pacific Time. Required.
+        dimensions: list or comma string of date, hour, query, page,
+            country, device, searchAppearance.
+        type: web | image | video | news | googleNews | discover.
+        filter_groups: [{group_type: 'and', filters: [{dimension, operator,
+            expression}]}] (a flat list of filters is one AND group).
+            Operators: equals, notEquals, contains, notContains,
+            includingRegex, excludingRegex (RE2; e.g. "\\bsage\\b" matches
+            the word, not "message"). Filter dimensions: query, page,
+            country, device, searchAppearance.
+        aggregation_type: auto | byPage | byProperty | byNewsShowcasePanel.
+        data_state: final (default) | all (fresh, preliminary data) |
+            hourly_all (needed for the hour dimension). Rows on or after
+            meta.first_incomplete_date carry preliminary=true.
+        row_limit: rows per page, 1–25000. start_row: offset.
+        fetch_all: page through every row (25k per call) up to max_rows.
+        sort_by: clicks | impressions | ctr | position, applied client-side
+            over the full result (fetches all rows when the API's own order
+            differs). sort_direction: ascending | descending.
+        save_to_file: absolute .csv/.json path; writes every row and returns
+            a summary (row count, totals, first 20 rows).
+        response_format: json (default) | csv | markdown.
+        include_totals: when grouped by query, one extra query-less call gives
+            meta.page_total, query_rows_sum and unattributed_share.
+        account_alias: explicit account; omit to auto-resolve.
+    """
+    tool = "gsc_query"
+    try:
+        async with _instrument(tool, site_url=site_url, account_alias=account_alias):
+            ctx = await _sa_context(site_url, account_alias)
+            res = await _sa_run(
+                ctx, dimensions=dimensions, start_date=start_date, end_date=end_date,
+                search_type=type, filter_groups=filter_groups,
+                aggregation_type=aggregation_type, data_state=data_state,
+                row_limit=row_limit, start_row=start_row, fetch_all=fetch_all or bool(save_to_file),
+                max_rows=max_rows, sort_by=sort_by, sort_direction=sort_direction,
+                include_totals=include_totals, step="gsc_query",
+            )
+            dims = res["dimensions"]
+            columns = _sa_columns(
+                dims, preliminary=bool(res["first_incomplete_date"] or res["first_incomplete_hour"]),
+            )
+            meta = _sa_meta(
+                res,
+                site_url=site_url,
+                dimensions=dims,
+                filter_groups=res["filter_groups"],
+                sort_by=sort_by,
+                sort_direction=sort_direction if sort_by else None,
+                next_start_row=res["next_start_row"],
+                account_alias=ctx.alias,
+            )
+            meta["tool"] = tool
+            header = [f"gsc_query for {site_url}", _window_line(res["window"])]
+            if save_to_file:
+                return await _saved_summary(
+                    tool=tool, path=save_to_file, rows=res["rows"], columns=columns,
+                    meta=meta, response_format=response_format, header_lines=header,
+                    truncated=res["truncated"],
+                )
+            hint = (
+                f"More rows exist. Pass start_row={res['next_start_row']}, fetch_all=true, "
+                f"or save_to_file." if res["next_start_row"] is not None
+                else "Hit max_rows; raise max_rows or narrow the filters."
+            )
+            out = _format_table(
+                res["rows"], columns, response_format=response_format,
+                header_lines=header, truncated=res["truncated"], truncation_hint=hint,
+                meta=meta, text_meta=True,
+            )
+            if isinstance(out, dict):
+                out["tool"] = tool
+            return out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format=response_format)
+
+
 @mcp.tool()
 async def gsc_get_search_analytics(
     site_url: str,
@@ -2132,119 +3360,101 @@ async def gsc_get_search_analytics(
     row_limit: int = 100,
     response_format: str = "markdown",
     *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    data_state: str = "final",
+    save_to_file: Optional[str] = None,
     account_alias: Optional[str] = None,
 ) -> Any:
     """Overview of a GSC property's top rows. Pick me for a single-dimension
-    summary; use `gsc_get_advanced_search_analytics` for sorting/filtering, or
-    `gsc_get_search_by_page_query` to break queries down for one page.
+    summary; use `gsc_get_advanced_search_analytics` for sorting/filtering,
+    `gsc_query` for every API parameter, or `gsc_get_search_by_page_query`
+    to break queries down for one page.
 
     Args:
         site_url: GSC site URL (exact match; for domain properties use `sc-domain:example.com`).
-        days: Look-back window (default 28, clamped to min 1).
-        dimensions: Comma-separated GSC dimensions (default `query`; options: query, page, device, country, date).
+        days: The last N days of final data (default 28, like the GSC UI),
+            ending on meta.latest_final_date (Pacific Time). Ignored when
+            start_date/end_date are given.
+        dimensions: Comma-separated GSC dimensions (default `query`; options: query, page, device, country, date, searchAppearance).
         row_limit: Max rows returned (default 100; clamped to [1, 25000]).
         response_format: `markdown` (default, table) | `csv` (compact
             for downstream parsing) | `json` (dict with typed rows).
+        start_date / end_date: Explicit YYYY-MM-DD window (overrides days).
+        data_state: `final` (default) | `all` (includes preliminary days).
+        save_to_file: Absolute .csv/.json path; writes all rows, returns a summary.
         account_alias: Optional explicit account to route this call to.
             When omitted, auto-resolves from site_url. Pass when
             multiple configured accounts share access (AMBIGUOUS_ACCOUNT).
     """
+    tool = "gsc_get_search_analytics"
     try:
         async with _instrument(
-            "gsc_get_search_analytics",
-            site_url=site_url, days=days, row_limit=row_limit,
+            tool, site_url=site_url, days=days, row_limit=row_limit,
             account_alias=account_alias,
         ):
             days = max(int(days), 1)
             row_limit = max(1, min(int(row_limit), 25000))
-
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=days)
-
             dimension_list = [d.strip() for d in dimensions.split(",")]
 
-            request = {
-                "startDate": start_date.strftime("%Y-%m-%d"),
-                "endDate": end_date.strftime("%Y-%m-%d"),
-                "dimensions": dimension_list,
-                "rowLimit": row_limit,
-            }
+            ctx = await _sa_context(site_url, account_alias)
+            res = await _sa_run(
+                ctx, dimensions=dimension_list, days=days, start_date=start_date,
+                end_date=end_date, data_state=data_state, row_limit=row_limit,
+                fetch_all=bool(save_to_file), include_totals=True, step=tool,
+            )
+            w = res["window"]
+            dims = res["dimensions"]
+            span = (
+                f"in the last {days} days" if w["days_requested"]
+                else f"for {w['start_date']} to {w['end_date']}"
+            )
+            columns = _sa_columns(dims, preliminary=bool(res["first_incomplete_date"]))
 
-            try:
-                def _do(svc):
-                    return svc.searchanalytics().query(siteUrl=site_url, body=request).execute()
-                _resolved, _service, response = await _call_with_stale_retry(
-                    site_url=site_url, account_alias=account_alias, api_call=_do,
-                )
-            except AccountResolverError as e:
-                return _format_error(
-                    e.to_envelope(tool="gsc_get_search_analytics"),
-                    response_format=response_format,
-                )
-
-            raw_rows = response.get("rows") or []
-            if not raw_rows:
-                return f"No search analytics data found for {site_url} in the last {days} days."
-
-            # Shape rows into dicts keyed by column name for the shared helper.
-            rows = []
-            for r in raw_rows:
-                row_dict: Dict[str, Any] = {}
-                for i, dim in enumerate(dimension_list):
-                    keys = r.get("keys", [])
-                    row_dict[dim] = keys[i][:100] if i < len(keys) else ""
-                row_dict["clicks"] = r.get("clicks", 0)
-                row_dict["impressions"] = r.get("impressions", 0)
-                row_dict["ctr"] = r.get("ctr", 0)
-                row_dict["position"] = r.get("position", 0)
-                rows.append(row_dict)
-
-            columns = [
-                {"key": dim, "display": dim.capitalize(), "type": "str"}
-                for dim in dimension_list
-            ]
-            columns.extend([
-                {"key": "clicks", "display": "Clicks", "type": "int"},
-                {"key": "impressions", "display": "Impressions", "type": "int"},
-                {"key": "ctr", "display": "CTR", "type": "pct"},
-                {"key": "position", "display": "Position", "type": "float"},
-            ])
-
-            truncated = len(rows) >= row_limit
             truncation_hint = (
                 f"Showing {row_limit} rows of possibly-more. Pass a larger "
-                f"`row_limit` (max 25000) or use `gsc_get_advanced_search_analytics` "
-                f"with `start_row` to paginate."
+                f"`row_limit` (max 25000), or use `gsc_query` with `fetch_all` "
+                f"or `save_to_file`."
             )
+            meta = _sa_meta(
+                res, site_url=site_url, days=days, dimensions=dims, row_limit=row_limit,
+            )
+            header = [
+                f"Search analytics for {site_url} "
+                + (f"(last {days} days)" if w["days_requested"] else f"({w['start_date']} to {w['end_date']})"),
+                _window_line(w),
+            ]
+            if save_to_file:
+                return await _saved_summary(
+                    tool=tool, path=save_to_file, rows=res["rows"], columns=columns,
+                    meta=meta, response_format=response_format, header_lines=header,
+                    truncated=res["truncated"],
+                )
+            if not res["rows"] and str(response_format).strip().lower() != "json":
+                return (
+                    f"No search analytics data found for {site_url} {span} "
+                    f"({w['start_date']} → {w['end_date']}, Pacific Time)."
+                )
 
+            # Truncate long dimension values for display.
+            rows = []
+            for r in res["rows"]:
+                row_dict = dict(r)
+                for dim in dims:
+                    row_dict[dim] = str(r.get(dim, ""))[:100]
+                rows.append(row_dict)
             return _format_table(
                 rows,
                 columns,
                 response_format=response_format,
-                header_lines=[f"Search analytics for {site_url} (last {days} days)"],
-                truncated=truncated,
+                header_lines=header,
+                truncated=res["truncated"],
                 truncation_hint=truncation_hint,
-                meta={
-                    "site_url": site_url,
-                    "days": days,
-                    "dimensions": dimension_list,
-                    "row_limit": row_limit,
-                },
+                meta=meta,
+                text_meta=True,
             )
-    except HttpError as e:
-        return _format_error(
-            _http_error_envelope(e, tool="gsc_get_search_analytics", site_url=site_url),
-            response_format=response_format,
-        )
-    except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="gsc_get_search_analytics",
-            ),
-            response_format=response_format,
-        )
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format=response_format)
 
 @mcp.tool()
 async def gsc_get_site_details(
@@ -2275,7 +3485,7 @@ async def gsc_get_site_details(
             def _do(svc):
                 return svc.sites().get(siteUrl=site_url).execute()
             _resolved, _service, site_info = await _call_with_stale_retry(
-                site_url=site_url, account_alias=account_alias, api_call=_do,
+                site_url=site_url, account_alias=account_alias, api_call=_do, step="sites.get",
             )
         except AccountResolverError as e:
             return _format_error(
@@ -2365,7 +3575,7 @@ async def gsc_get_sitemaps(
             def _do(svc):
                 return svc.sitemaps().list(siteUrl=site_url).execute()
             _resolved, _service, sitemaps = await _call_with_stale_retry(
-                site_url=site_url, account_alias=account_alias, api_call=_do,
+                site_url=site_url, account_alias=account_alias, api_call=_do, step="sitemaps.list",
             )
         except AccountResolverError as e:
             return _format_error(
@@ -2447,23 +3657,640 @@ async def gsc_get_sitemaps(
             response_format=response_format,
         )
 
+# --- URL inspection core (v1.4.0) ---
+# Shared by gsc_inspect_start / gsc_inspect_status and the three older
+# inspection tools:
+#
+# * a state store at $GSC_STATE_DIR/gsc-state.sqlite (rollback journal, not
+#   WAL; mode 0666 on the shared tree) holding a 6-hour per-URL result
+#   cache and a quota ledger shared by every process and login;
+# * a reservation before EVERY outbound attempt, retries included, against
+#   Google's published per-property limits (2,000/day, 600/minute —
+#   developers.google.com/webmaster-tools/limits, checked 2026-09-28).
+#   Google returns the same "quota exceeded" error for every limit, so the
+#   ledger is the authority on which one was hit; it is an estimate
+#   (UI use and other tools are invisible to it);
+# * bounded concurrency, one service (one httplib2.Http) per worker.
+_INSPECTION_DAILY_LIMIT = int(os.environ.get("GSC_INSPECTION_DAILY_LIMIT", "2000"))
+_INSPECTION_MINUTE_LIMIT = int(os.environ.get("GSC_INSPECTION_MINUTE_LIMIT", "600"))
+_INSPECTION_CACHE_TTL_SEC = 6 * 3600
+_INSPECTION_MAX_ATTEMPTS = 4
+_INSPECT_DEFAULT_CONCURRENCY = 4
+_INSPECT_MAX_CONCURRENCY = 8
+_INSPECT_JOB_TTL_SEC = 24 * 3600
+_STATE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS inspection_cache (
+    site TEXT NOT NULL, url TEXT NOT NULL, fetched_at REAL NOT NULL,
+    result_json TEXT NOT NULL, PRIMARY KEY (site, url));
+CREATE TABLE IF NOT EXISTS inspection_ledger (
+    site TEXT NOT NULL, pt_day TEXT NOT NULL, minute TEXT NOT NULL,
+    count INTEGER NOT NULL, PRIMARY KEY (site, pt_day, minute));
+"""
+
+
+_async_retry_sleep = asyncio.sleep  # test seam: conftest replaces it with a no-op
+
+
+def _state_db_path() -> str:
+    """Test seam (conftest points it at tmp_path)."""
+    return os.path.join(GSC_STATE_DIR, "gsc-state.sqlite")
+
+
+def _state_db() -> sqlite3.Connection:
+    path = _state_db_path()
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    is_new = not os.path.exists(path)
+    conn = sqlite3.connect(path, timeout=5.0, isolation_level=None)
+    if is_new:
+        # Same rule as token files: shared (world-writable) tree → 0666 so
+        # every login can write; otherwise owner-only.
+        try:
+            dir_mode = stat.S_IMODE(os.stat(directory).st_mode)
+            os.chmod(path, 0o666 if dir_mode & stat.S_IWOTH else 0o600)
+        except OSError:
+            pass
+    conn.execute("PRAGMA journal_mode=DELETE")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.executescript(_STATE_SCHEMA)
+    return conn
+
+
+class _LocalQuotaExhausted(HttpError):
+    """The ledger refused a reservation: this property's daily inspection
+    quota is spent. A synthetic 429 whose reason makes every existing
+    ``except HttpError`` branch render ``QUOTA_EXHAUSTED``."""
+
+    def __init__(self, site_url: str, used: int, limit: int) -> None:
+        content = json.dumps({"error": {
+            "message": (
+                f"Daily URL Inspection quota for {site_url} is spent "
+                f"({used}/{limit} used today, Pacific Time; local ledger estimate)."
+            ),
+            "errors": [{"reason": "dailyLimitExceeded"}],
+        }}).encode()
+        super().__init__(httplib2.Response({"status": 429}), content)
+        self.gsc_step = "urlInspection.reserve"
+        self.gsc_attempts = 0
+
+
+def _reserve_inspection(site_url: str) -> Tuple[bool, Optional[str], Dict[str, int]]:
+    """Atomically reserve one inspection for ``site_url``.
+
+    Returns ``(ok, refused_by, counts)``; ``refused_by`` is ``"day"`` or
+    ``"minute"``. ``BEGIN IMMEDIATE`` takes the write lock up front, so two
+    processes racing for the last slot cannot both get it."""
+    now = _now_pt()
+    day = now.date().isoformat()
+    minute = now.strftime("%Y-%m-%dT%H:%M")
+    conn = _state_db()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        day_used = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM inspection_ledger WHERE site=? AND pt_day=?",
+            (site_url, day),
+        ).fetchone()[0]
+        minute_used = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM inspection_ledger WHERE site=? AND minute=?",
+            (site_url, minute),
+        ).fetchone()[0]
+        counts = {"day_used": day_used, "minute_used": minute_used}
+        if day_used >= _INSPECTION_DAILY_LIMIT:
+            conn.execute("ROLLBACK")
+            return False, "day", counts
+        if minute_used >= _INSPECTION_MINUTE_LIMIT:
+            conn.execute("ROLLBACK")
+            return False, "minute", counts
+        conn.execute(
+            "INSERT INTO inspection_ledger (site, pt_day, minute, count) VALUES (?, ?, ?, 1) "
+            "ON CONFLICT(site, pt_day, minute) DO UPDATE SET count = count + 1",
+            (site_url, day, minute),
+        )
+        old = (now.date() - timedelta(days=3)).isoformat()
+        conn.execute("DELETE FROM inspection_ledger WHERE pt_day < ?", (old,))
+        conn.execute("COMMIT")
+        counts["day_used"] += 1
+        counts["minute_used"] += 1
+        return True, None, counts
+    except BaseException:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        raise
+    finally:
+        conn.close()
+
+
+def _inspection_quota(site_url: str) -> Dict[str, Any]:
+    now = _now_pt()
+    conn = _state_db()
+    try:
+        day_used = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM inspection_ledger WHERE site=? AND pt_day=?",
+            (site_url, now.date().isoformat()),
+        ).fetchone()[0]
+        minute_used = conn.execute(
+            "SELECT COALESCE(SUM(count), 0) FROM inspection_ledger WHERE site=? AND minute=?",
+            (site_url, now.strftime("%Y-%m-%dT%H:%M")),
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    return {
+        "day_used": day_used,
+        "day_limit": _INSPECTION_DAILY_LIMIT,
+        "day_remaining": max(0, _INSPECTION_DAILY_LIMIT - day_used),
+        "minute_used": minute_used,
+        "minute_limit": _INSPECTION_MINUTE_LIMIT,
+        "resets_in_seconds": round(_seconds_until_pt_midnight()),
+        "basis": "estimate: inspections made by this server on this machine (all logins); "
+                 "Search Console UI use is not visible to it",
+    }
+
+
+def _cache_get(site_url: str, url: str) -> Optional[Tuple[Dict[str, Any], float]]:
+    conn = _state_db()
+    try:
+        row = conn.execute(
+            "SELECT result_json, fetched_at FROM inspection_cache WHERE site=? AND url=?",
+            (site_url, url),
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row or time.time() - row[1] > _INSPECTION_CACHE_TTL_SEC:
+        return None
+    try:
+        return json.loads(row[0]), row[1]
+    except ValueError:
+        return None
+
+
+def _cache_put(site_url: str, url: str, response: Dict[str, Any]) -> float:
+    fetched_at = time.time()
+    conn = _state_db()
+    try:
+        conn.execute(
+            "INSERT OR REPLACE INTO inspection_cache (site, url, fetched_at, result_json) VALUES (?, ?, ?, ?)",
+            (site_url, url, fetched_at, json.dumps(response)),
+        )
+        conn.execute(
+            "DELETE FROM inspection_cache WHERE fetched_at < ?",
+            (fetched_at - 2 * _INSPECTION_CACHE_TTL_SEC,),
+        )
+    finally:
+        conn.close()
+    return fetched_at
+
+
+def _clone_service(service: Any) -> Any:
+    """A second service over the same (already refreshed) credentials, so a
+    worker thread gets its own httplib2.Http — which is not thread-safe.
+    Test seam: conftest makes this the identity."""
+    creds = getattr(getattr(service, "_http", None), "credentials", None)
+    if creds is None:
+        return service
+    return build("searchconsole", "v1", credentials=creds, cache_discovery=False)
+
+
+async def _inspect_one(
+    service: Any,
+    site_url: str,
+    page_url: str,
+    *,
+    force: bool = False,
+    wait_for_minute: bool = True,
+    on_throttle=None,
+) -> Tuple[Dict[str, Any], Optional[float]]:
+    """Inspect one URL: cache first (unless ``force``), then reserve quota
+    and call Google, retrying rate limits and 5xx with backoff — each
+    attempt reserves again. Returns ``(response, cached_at)``;
+    ``cached_at`` is None for a live result."""
+    if not force:
+        hit = await asyncio.to_thread(_cache_get, site_url, page_url)
+        if hit is not None:
+            return hit[0], hit[1]
+    body = {"inspectionUrl": page_url, "siteUrl": site_url}
+    attempt = 0
+    while True:
+        ok, refused_by, counts = await asyncio.to_thread(_reserve_inspection, site_url)
+        if not ok:
+            if refused_by == "day" or not wait_for_minute:
+                if refused_by == "day":
+                    raise _LocalQuotaExhausted(site_url, counts["day_used"], _INSPECTION_DAILY_LIMIT)
+                raise HttpError(httplib2.Response({"status": 429}), json.dumps({"error": {
+                    "message": f"Per-minute URL Inspection quota for {site_url} is spent (local ledger).",
+                    "errors": [{"reason": "rateLimitExceeded"}],
+                }}).encode())
+            if on_throttle:
+                on_throttle(True)
+            await _async_retry_sleep(60 - _now_pt().second + 0.5)
+            if on_throttle:
+                on_throttle(False)
+            continue
+        attempt += 1
+        try:
+            response = await _gsc_execute(
+                lambda: service.urlInspection().index().inspect(body=body).execute(),
+                step="urlInspection.inspect", max_attempts=1,
+            )
+        except HttpError as e:
+            kind = _http_error_details(e)["kind"]
+            delay = _retry_delay(e, attempt) if kind in ("rate_limit", "server", "timeout") else None
+            if delay is None or attempt >= _INSPECTION_MAX_ATTEMPTS:
+                e.gsc_attempts = attempt
+                raise
+            await _async_retry_sleep(delay)
+            continue
+        except ConnectionError:
+            if attempt >= _INSPECTION_MAX_ATTEMPTS:
+                raise
+            await _async_retry_sleep(_backoff_delay(attempt))
+            continue
+        response = response or {}
+        if "inspectionResult" in response:
+            await asyncio.to_thread(_cache_put, site_url, page_url, response)
+        return response, None
+
+
+def _normalize_inspection(page_url: str, response: Dict[str, Any], cached_at: Optional[float] = None) -> Dict[str, Any]:
+    """Every field §4.1 asks for, flat, from a raw inspect response."""
+    inspection = (response or {}).get("inspectionResult")
+    if not inspection:
+        return {"url": page_url, "error": "No inspection data found", "cached_at": cached_at}
+    idx = inspection.get("indexStatusResult", {}) or {}
+    rich = inspection.get("richResultsResult")
+    google_canonical = idx.get("googleCanonical")
+    user_canonical = idx.get("userCanonical")
+    return {
+        "url": page_url,
+        "verdict": idx.get("verdict"),
+        "coverage_state": idx.get("coverageState"),
+        "indexing_state": idx.get("indexingState"),
+        "robots_txt_state": idx.get("robotsTxtState"),
+        "page_fetch_state": idx.get("pageFetchState"),
+        "last_crawl_time": idx.get("lastCrawlTime"),
+        "crawled_as": idx.get("crawledAs"),
+        "google_canonical": google_canonical,
+        "user_canonical": user_canonical,
+        "canonical_mismatch": bool(google_canonical and user_canonical and google_canonical != user_canonical),
+        "sitemaps": list(idx.get("sitemap", []) or []),
+        "referring_urls": list(idx.get("referringUrls", []) or []),
+        "rich_results": None if rich is None else {
+            "verdict": rich.get("verdict"),
+            "types": [item.get("richResultType") for item in rich.get("detectedItems", []) or []],
+            "items": rich.get("detectedItems", []) or [],
+            "issues": rich.get("richResultsIssues", []) or [],
+        },
+        "inspection_result_link": inspection.get("inspectionResultLink"),
+        "cached_at": (
+            datetime.fromtimestamp(cached_at, timezone.utc).isoformat() if cached_at else None
+        ),
+        "error": None,
+    }
+
+
+async def _inspect_many(
+    service: Any,
+    site_url: str,
+    urls: List[str],
+    *,
+    force: bool = False,
+    concurrency: int = _INSPECT_DEFAULT_CONCURRENCY,
+    wait_for_minute: bool = True,
+    on_result=None,
+    on_throttle=None,
+    stop_on=None,
+) -> Dict[str, Any]:
+    """Inspect ``urls`` with at most ``concurrency`` in flight, each worker
+    on its own service clone. Returns ``{url: (response, cached_at) |
+    exception}``. When ``stop_on(exception)`` is true the queue stops: no
+    new URL starts, in-flight ones finish, the rest are left out."""
+    concurrency = max(1, min(int(concurrency), _INSPECT_MAX_CONCURRENCY, len(urls) or 1))
+    queue: asyncio.Queue = asyncio.Queue()
+    for u in urls:
+        queue.put_nowait(u)
+    results: Dict[str, Any] = {}
+    stopped = {"flag": False}
+
+    async def worker(svc: Any) -> None:
+        while not stopped["flag"]:
+            try:
+                url = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                outcome: Any = await _inspect_one(
+                    svc, site_url, url, force=force,
+                    wait_for_minute=wait_for_minute, on_throttle=on_throttle,
+                )
+            except Exception as e:  # noqa: BLE001 — per-URL errors are data
+                outcome = e
+                if stop_on is not None and stop_on(e):
+                    stopped["flag"] = True
+            results[url] = outcome
+            if on_result:
+                on_result(url, outcome)
+
+    services = [service]
+    for _ in range(concurrency - 1):
+        try:
+            services.append(await asyncio.to_thread(_clone_service, service))
+        except Exception:  # noqa: BLE001 — fall back to fewer workers
+            break
+    await asyncio.gather(*(worker(svc) for svc in services))
+    return results
+
+
+def _parse_url_list(urls: Any) -> List[str]:
+    if isinstance(urls, str):
+        items = urls.split("\n")
+    else:
+        items = list(urls or [])
+    seen: Dict[str, None] = {}
+    for u in items:
+        u = str(u).strip()
+        if u and u not in seen:
+            seen[u] = None
+    return list(seen)
+
+
+# Async inspection jobs: in-memory, one registry per server process. A job
+# outlives any single tool call, so a client's 60 s timeout never kills it;
+# results also land in the on-disk cache, so after a restart re-running
+# gsc_inspect_start returns cached URLs instantly.
+_inspect_jobs: Dict[str, Dict[str, Any]] = {}
+
+
+def _evict_inspect_jobs() -> None:
+    cutoff = time.time() - _INSPECT_JOB_TTL_SEC
+    for job_id in [j for j, job in _inspect_jobs.items() if job["updated_at"] < cutoff]:
+        _inspect_jobs.pop(job_id, None)
+
+
+def _job_error_entry(e: BaseException, site_url: str) -> Dict[str, Any]:
+    if isinstance(e, HttpError):
+        env = _http_error_envelope(e, tool="gsc_inspect_start", site_url=site_url)
+    else:
+        env = _make_error_envelope(error=f"{type(e).__name__}: {e}", tool="gsc_inspect_start")
+    return {k: env.get(k) for k in ("error", "error_code", "retryable", "retry_after", "step", "http_status", "google_reason")}
+
+
+def _is_daily_quota(e: BaseException) -> bool:
+    """Local ledger refusal or Google's own daily-quota error."""
+    return isinstance(e, HttpError) and _http_error_details(e)["kind"] == "daily_quota"
+
+
+async def _run_inspect_job(job: Dict[str, Any], service: Any, concurrency: int) -> None:
+    site_url = job["site_url"]
+    quota_hit = {"flag": False}
+
+    def on_result(url: str, outcome: Any) -> None:
+        job["updated_at"] = time.time()
+        if isinstance(outcome, BaseException):
+            job["errors"][url] = _job_error_entry(outcome, site_url)
+            if _is_daily_quota(outcome):
+                quota_hit["flag"] = True
+        else:
+            response, cached_at = outcome
+            job["results"][url] = _normalize_inspection(url, response, cached_at)
+
+    def on_throttle(active: bool) -> None:
+        if job["state"] in ("running", "throttled"):
+            job["state"] = "throttled" if active else "running"
+
+    job["state"] = "running"
+    pending = [u for u in job["urls"] if u not in job["results"]]
+    try:
+        await _inspect_many(
+            service, site_url, pending, force=job["force"], concurrency=concurrency,
+            on_result=on_result, on_throttle=on_throttle, stop_on=_is_daily_quota,
+        )
+    except Exception as e:  # noqa: BLE001 — a job never dies silently
+        job["state"] = "failed"
+        job["failure"] = f"{type(e).__name__}: {e}"
+    else:
+        # Published only after every worker has drained, so a terminal state
+        # never coexists with in-flight results.
+        if quota_hit["flag"]:
+            job["state"] = "quota_exhausted"
+        else:
+            job["state"] = "failed" if job["urls"] and not job["results"] else "done"
+    job["updated_at"] = time.time()
+    job["finished_at"] = time.time()
+
+
+def _job_rows(job: Dict[str, Any]) -> List[Dict[str, Any]]:
+    rows = []
+    for url in job["urls"]:
+        if url in job["results"]:
+            rows.append(dict(job["results"][url], status="done"))
+        elif url in job["errors"]:
+            rows.append({"url": url, "status": "error", "error": job["errors"][url]})
+        else:
+            status = "skipped_quota" if job["state"] == "quota_exhausted" else "pending"
+            if job["state"] in ("done", "failed"):
+                status = "not_run"
+            rows.append({"url": url, "status": status})
+    return rows
+
+
+@mcp.tool()
+async def gsc_inspect_start(
+    site_url: str,
+    urls: Union[List[str], str],
+    force: bool = False,
+    concurrency: int = _INSPECT_DEFAULT_CONCURRENCY,
+    *,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Start an async URL-inspection job for any number of URLs; returns a
+    job_id in about a second. Poll `gsc_inspect_status(job_id)` for progress
+    and partial results. Pick me over `gsc_batch_url_inspection` for more
+    than a handful of URLs — no client timeout can kill the job.
+
+    Results are cached for 6 hours per URL (cached URLs are answered at
+    once and cost no quota); `force=true` re-inspects. Quota: Google allows
+    2,000 inspections per property per day and 600 per minute; the job
+    waits out a spent minute and stops cleanly with QUOTA_EXHAUSTED (keeping
+    partial results) when the day's quota is gone.
+
+    Args:
+        site_url: GSC property (`sc-domain:example.com` for domain properties).
+        urls: List of URLs (or newline-separated string). Duplicates dropped.
+        force: Bypass the 6-hour cache.
+        concurrency: Parallel inspections (default 4, max 8).
+        account_alias: Optional explicit account; omit to auto-resolve.
+    """
+    tool = "gsc_inspect_start"
+    try:
+        url_list = _parse_url_list(urls)
+        if not url_list:
+            raise _SaValidationError("No URLs provided for inspection.", "Pass urls=[...].")
+        concurrency = max(1, min(int(concurrency), _INSPECT_MAX_CONCURRENCY))
+        resolved_alias, service = await get_gsc_service_for_site(site_url, account_alias)
+        _evict_inspect_jobs()
+        job_id = f"insp-{uuid4().hex[:12]}"
+        now = time.time()
+        job: Dict[str, Any] = {
+            "job_id": job_id,
+            "site_url": site_url,
+            "account_alias": resolved_alias,
+            "urls": url_list,
+            "force": bool(force),
+            "state": "queued",
+            "created_at": now,
+            "updated_at": now,
+            "finished_at": None,
+            "results": {},
+            "errors": {},
+            "cached": 0,
+        }
+        if not force:
+            for url in url_list:
+                hit = await asyncio.to_thread(_cache_get, site_url, url)
+                if hit is not None:
+                    job["results"][url] = _normalize_inspection(url, hit[0], hit[1])
+            job["cached"] = len(job["results"])
+        _inspect_jobs[job_id] = job
+        if len(job["results"]) == len(url_list):
+            job["state"] = "done"
+            job["finished_at"] = time.time()
+        else:
+            job["task"] = asyncio.create_task(_run_inspect_job(job, service, concurrency))
+        quota = await asyncio.to_thread(_inspection_quota, site_url)
+        return {
+            "ok": True,
+            "tool": tool,
+            "job_id": job_id,
+            "state": job["state"],
+            "total": len(url_list),
+            "cached": job["cached"],
+            "queued": len(url_list) - job["cached"],
+            "poll_with": "gsc_inspect_status",
+            "quota": quota,
+            "meta": _standard_meta(None, site_url=site_url, account_alias=resolved_alias, concurrency=concurrency),
+        }
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+@mcp.tool()
+async def gsc_inspect_status(
+    job_id: str,
+    offset: int = 0,
+    limit: int = 50,
+    response_format: str = "json",
+) -> Any:
+    """Progress and (partial) results of a `gsc_inspect_start` job. Safe to
+    call repeatedly. `state`: queued | running | throttled (waiting out a
+    spent minute) | done | quota_exhausted | failed. Each result carries
+    verdict, coverage_state, indexing/robots/fetch states, last_crawl_time,
+    crawled_as, google vs user canonical (+ canonical_mismatch), sitemaps,
+    referring_urls and rich results.
+
+    Args:
+        job_id: From gsc_inspect_start.
+        offset / limit: Page through results in the original URL order.
+        response_format: json (default) | markdown.
+    """
+    tool = "gsc_inspect_status"
+    fmt = str(response_format or "").strip().lower()
+    try:
+        job = _inspect_jobs.get(job_id)
+        if job is None:
+            return _format_error(_make_error_envelope(
+                error=f"Unknown inspection job {job_id!r}.",
+                hint=("Jobs live in server memory and vanish on restart (or after 24h). "
+                      "Re-run gsc_inspect_start: URLs inspected in the last 6 hours come back "
+                      "from the cache instantly and cost no quota."),
+                error_code=ErrorCode.JOB_NOT_FOUND,
+                tool=tool,
+            ), response_format=fmt if fmt in _RESPONSE_FORMATS else "json")
+        offset = max(0, int(offset))
+        limit = max(1, int(limit))
+        # Read the quota first: everything below is one synchronous snapshot
+        # (no await), so state, progress and rows always agree.
+        quota = await asyncio.to_thread(_inspection_quota, job["site_url"])
+        state = job["state"]
+        rows = _job_rows(job)
+        page = rows[offset:offset + limit]
+        pending = sum(1 for r in rows if r["status"] == "pending")
+        progress = {
+            "total": len(rows),
+            "done": len(job["results"]),
+            "cached": job["cached"],
+            "errors": len(job["errors"]),
+            "pending": pending,
+            "canonical_mismatches": sum(1 for r in job["results"].values() if r.get("canonical_mismatch")),
+        }
+        elapsed = (job["finished_at"] or time.time()) - job["created_at"]
+        next_offset = offset + limit if offset + limit < len(rows) else None
+        if fmt == "markdown":
+            lines = [
+                f"Inspection job {job_id} for {job['site_url']}: {state}",
+                f"Progress: {progress['done']}/{progress['total']} done ({progress['cached']} cached), "
+                f"{progress['errors']} errors, {pending} pending; {progress['canonical_mismatches']} canonical mismatches",
+                f"Quota (estimate): {quota['day_used']}/{quota['day_limit']} used today (Pacific Time)",
+                "",
+                "URL | Status | Verdict | Coverage | Last crawl | Canonical mismatch | Error",
+                "--- | --- | --- | --- | --- | --- | ---",
+            ]
+            for r in page:
+                err = r.get("error")
+                err_text = err.get("error") if isinstance(err, dict) else (err or "")
+                lines.append(
+                    f"{r['url']} | {r['status']} | {r.get('verdict') or ''} | {r.get('coverage_state') or ''} | "
+                    f"{r.get('last_crawl_time') or ''} | {'yes' if r.get('canonical_mismatch') else ''} | {err_text}"
+                )
+            if next_offset is not None:
+                lines.append(f"\nMore results: offset={next_offset}")
+            return "\n".join(lines)
+        return {
+            "ok": True,
+            "tool": tool,
+            "job_id": job_id,
+            "site_url": job["site_url"],
+            "state": state,
+            "failure": job.get("failure"),
+            "progress": progress,
+            "results": page,
+            "next_offset": next_offset,
+            "elapsed_seconds": round(elapsed, 1),
+            "quota": quota,
+            "meta": _standard_meta(None, site_url=job["site_url"], account_alias=job["account_alias"],
+                                   row_count=len(page), truncated=next_offset is not None),
+        }
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, response_format=fmt if fmt in _RESPONSE_FORMATS else "json")
+
+
+def _raise_quota_error(outcomes: Dict[str, Any]) -> None:
+    """The fixed-size batch tools surface a quota error for the whole call
+    (it will hit every URL) instead of burying it in one row."""
+    for outcome in outcomes.values():
+        if isinstance(outcome, HttpError) and _http_error_details(outcome)["kind"] in ("daily_quota", "rate_limit"):
+            raise outcome
+
+
 @mcp.tool()
 async def gsc_inspect_url_enhanced(
     site_url: str,
     page_url: str,
     response_format: str = "markdown",
     *,
+    force: bool = False,
     account_alias: Optional[str] = None,
 ) -> Any:
     """Inspect a single URL's indexing status + rich results in Google.
-    Pick me for one URL; use `gsc_batch_url_inspection` for up to 10 URLs
-    or `gsc_check_indexing_issues` to bucket several URLs by problem type.
+    Pick me for one URL; use `gsc_inspect_start` for many URLs, or
+    `gsc_check_indexing_issues` to bucket several URLs by problem type.
 
     Args:
         site_url: GSC site URL (exact match; `sc-domain:example.com`
             for domain properties).
         page_url: The URL to inspect.
         response_format: "markdown" (default) or "json".
+        force: Bypass the 6-hour per-URL result cache.
         account_alias: Optional explicit account; omit to auto-resolve.
     """
     fmt = str(response_format or "").strip().lower()
@@ -2474,8 +4301,6 @@ async def gsc_inspect_url_enhanced(
         )
 
     try:
-        request = {"inspectionUrl": page_url, "siteUrl": site_url}
-
         async with _instrument(
             "gsc_inspect_url_enhanced",
             site_url=site_url,
@@ -2483,11 +4308,27 @@ async def gsc_inspect_url_enhanced(
             account_alias=account_alias,
         ):
             try:
-                def _do(svc):
-                    return svc.urlInspection().index().inspect(body=request).execute()
-                _resolved, _service, response = await _call_with_stale_retry(
-                    site_url=site_url, account_alias=account_alias, api_call=_do,
-                )
+                resolved, service = await get_gsc_service_for_site(site_url, account_alias)
+                try:
+                    response, cached_at = await _inspect_one(
+                        service, site_url, page_url, force=force, wait_for_minute=False,
+                    )
+                except HttpError as e:
+                    # Stale-positive 403 recovery on the auto-resolved path
+                    # (same rule as _call_with_stale_retry).
+                    info = _http_error_details(e)
+                    if account_alias is not None or info["status"] != 403 or info["kind"] != "other":
+                        raise
+                    _invalidate_property_cache(resolved)
+                    try:
+                        new_alias, new_service = await get_gsc_service_for_site(site_url, None)
+                    except AccountResolverError:
+                        raise e
+                    if new_alias == resolved:
+                        raise
+                    response, cached_at = await _inspect_one(
+                        new_service, site_url, page_url, force=force, wait_for_minute=False,
+                    )
             except AccountResolverError as e:
                 return _format_error(
                     e.to_envelope(tool="gsc_inspect_url_enhanced"),
@@ -2551,9 +4392,17 @@ async def gsc_inspect_url_enhanced(
                     "user_canonical": index_status.get("userCanonical"),
                     "crawled_as": index_status.get("crawledAs"),
                     "referring_urls": list(index_status.get("referringUrls", [])),
+                    "sitemaps": list(index_status.get("sitemap", []) or []),
+                    "canonical_mismatch": bool(
+                        index_status.get("googleCanonical") and index_status.get("userCanonical")
+                        and index_status.get("googleCanonical") != index_status.get("userCanonical")
+                    ),
                 },
                 "rich_results": rich_payload,
-                "meta": {"site_url": site_url, "page_url": page_url},
+                "cached_at": (
+                    datetime.fromtimestamp(cached_at, timezone.utc).isoformat() if cached_at else None
+                ),
+                "meta": _standard_meta(None, site_url=site_url, page_url=page_url),
             }
 
         # --- markdown path (byte-equivalent to pre-F2) ---
@@ -2622,6 +4471,16 @@ async def gsc_inspect_url_enhanced(
                     message = issue.get("message", "Unknown issue")
                     result_lines.append(f"- [{severity}] {message}")
 
+        if index_status.get("sitemap"):
+            result_lines.append("\nIn sitemaps:")
+            for sm in index_status["sitemap"][:5]:
+                result_lines.append(f"- {sm}")
+        if cached_at:
+            result_lines.append(
+                f"\n(Cached result from {datetime.fromtimestamp(cached_at, timezone.utc).strftime('%Y-%m-%d %H:%M')} UTC; "
+                f"pass force=true to re-inspect.)"
+            )
+
         return "\n".join(result_lines)
     except HttpError as e:
         return _format_error(
@@ -2648,9 +4507,12 @@ async def gsc_batch_url_inspection(
     limit: int = 10,
     response_format: str = "markdown",
     *,
+    force: bool = False,
     account_alias: Optional[str] = None,
 ) -> Any:
-    """Inspect up to 10 URLs in batch (URL Inspection API quota limit).
+    """Inspect up to 10 URLs in one call (4 at a time, 6-hour cache; pass
+    force=true to bypass it). For more URLs use `gsc_inspect_start`, which
+    runs as a background job no client timeout can kill.
     Pick me when you have several URLs and want the same 4-field
     per-URL output; use `gsc_inspect_url_enhanced` for a single URL with
     full detail, or `gsc_check_indexing_issues` to bucket URLs by problem
@@ -2778,67 +4640,65 @@ async def gsc_batch_url_inspection(
         )
 
         structured: List[Dict[str, Any]] = []
+        outcomes = await _inspect_many(
+            service, site_url, url_list, force=force, wait_for_minute=False,
+        )
+        _raise_quota_error(outcomes)
 
-        for i, page_url in enumerate(url_list):
-            if i > 0 and URL_INSPECTION_PACING_SEC > 0:
-                await asyncio.sleep(URL_INSPECTION_PACING_SEC)
-
-            request = {"inspectionUrl": page_url, "siteUrl": site_url}
-
-            try:
-                response = service.urlInspection().index().inspect(body=request).execute()
-
-                if not response or "inspectionResult" not in response:
-                    structured.append({
-                        "url": page_url,
-                        "verdict": None,
-                        "coverage": None,
-                        "last_crawl": None,
-                        "rich_results": None,
-                        "error": "No inspection data found",
-                    })
-                    continue
-
-                inspection = response["inspectionResult"]
-                index_status = inspection.get("indexStatusResult", {})
-
-                verdict = index_status.get("verdict", "UNKNOWN")
-                coverage = index_status.get("coverageState", "Unknown")
-                last_crawl: Optional[str] = None
-                if "lastCrawlTime" in index_status:
-                    try:
-                        crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
-                        last_crawl = crawl_time.strftime('%Y-%m-%d')
-                    except Exception:
-                        last_crawl = index_status["lastCrawlTime"]
-
-                rich_results: Optional[List[str]] = None
-                if "richResultsResult" in inspection:
-                    rich = inspection["richResultsResult"]
-                    if rich.get("verdict") == "PASS" and rich.get("detectedItems"):
-                        rich_results = [
-                            item.get("richResultType", "Unknown")
-                            for item in rich["detectedItems"]
-                        ]
-
-                structured.append({
-                    "url": page_url,
-                    "verdict": verdict,
-                    "coverage": coverage,
-                    "last_crawl": last_crawl,
-                    "rich_results": rich_results,
-                    "error": None,
-                })
-
-            except Exception as e:
+        for page_url in url_list:
+            outcome = outcomes.get(page_url)
+            if isinstance(outcome, BaseException) or outcome is None:
                 structured.append({
                     "url": page_url,
                     "verdict": None,
                     "coverage": None,
                     "last_crawl": None,
                     "rich_results": None,
-                    "error": str(e),
+                    "error": str(outcome) if outcome is not None else "Not inspected",
                 })
+                continue
+            response = outcome[0]
+            if not response or "inspectionResult" not in response:
+                structured.append({
+                    "url": page_url,
+                    "verdict": None,
+                    "coverage": None,
+                    "last_crawl": None,
+                    "rich_results": None,
+                    "error": "No inspection data found",
+                })
+                continue
+
+            inspection = response["inspectionResult"]
+            index_status = inspection.get("indexStatusResult", {})
+
+            verdict = index_status.get("verdict", "UNKNOWN")
+            coverage = index_status.get("coverageState", "Unknown")
+            last_crawl: Optional[str] = None
+            if "lastCrawlTime" in index_status:
+                try:
+                    crawl_time = datetime.fromisoformat(index_status["lastCrawlTime"].replace('Z', '+00:00'))
+                    last_crawl = crawl_time.strftime('%Y-%m-%d')
+                except Exception:
+                    last_crawl = index_status["lastCrawlTime"]
+
+            rich_results: Optional[List[str]] = None
+            if "richResultsResult" in inspection:
+                rich = inspection["richResultsResult"]
+                if rich.get("verdict") == "PASS" and rich.get("detectedItems"):
+                    rich_results = [
+                        item.get("richResultType", "Unknown")
+                        for item in rich["detectedItems"]
+                    ]
+
+            structured.append({
+                "url": page_url,
+                "verdict": verdict,
+                "coverage": coverage,
+                "last_crawl": last_crawl,
+                "rich_results": rich_results,
+                "error": None,
+            })
 
         _log(
             "tool_exit",
@@ -2918,9 +4778,10 @@ async def gsc_check_indexing_issues(
     urls: str,
     response_format: str = "markdown",
     *,
+    force: bool = False,
     account_alias: Optional[str] = None,
 ) -> Any:
-    """Bucket up to 10 URLs by indexing problem (not-indexed, canonical
+    """Bucket up to 10 URLs (for more, run `gsc_inspect_start`) by indexing problem (not-indexed, canonical
     conflict, robots-blocked, fetch failure, indexed). Pick me when you
     want a triage summary across several URLs; use `gsc_inspect_url_enhanced`
     for one URL in full detail, or `gsc_batch_url_inspection` for uniform
@@ -2984,50 +4845,51 @@ async def gsc_check_indexing_issues(
             "indexed": [],            # list[url]
         }
 
-        for i, page_url in enumerate(url_list):
-            if i > 0 and URL_INSPECTION_PACING_SEC > 0:
-                await asyncio.sleep(URL_INSPECTION_PACING_SEC)
+        outcomes = await _inspect_many(
+            service, site_url, url_list, force=force, wait_for_minute=False,
+        )
+        _raise_quota_error(outcomes)
 
-            request = {"inspectionUrl": page_url, "siteUrl": site_url}
+        for page_url in url_list:
+            outcome = outcomes.get(page_url)
+            if isinstance(outcome, BaseException) or outcome is None:
+                buckets["not_indexed"].append({"url": page_url, "reason": f"Error: {outcome}"})
+                continue
+            response = outcome[0]
+            if not response or "inspectionResult" not in response:
+                buckets["not_indexed"].append(
+                    {"url": page_url, "reason": "No inspection data found"}
+                )
+                continue
 
-            try:
-                response = service.urlInspection().index().inspect(body=request).execute()
+            inspection = response["inspectionResult"]
+            index_status = inspection.get("indexStatusResult", {})
 
-                if not response or "inspectionResult" not in response:
-                    buckets["not_indexed"].append(
-                        {"url": page_url, "reason": "No inspection data found"}
-                    )
-                    continue
+            verdict = index_status.get("verdict", "UNKNOWN")
+            coverage = index_status.get("coverageState", "Unknown")
 
-                inspection = response["inspectionResult"]
-                index_status = inspection.get("indexStatusResult", {})
+            if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
+                buckets["not_indexed"].append({"url": page_url, "reason": coverage})
+            else:
+                buckets["indexed"].append(page_url)
 
-                verdict = index_status.get("verdict", "UNKNOWN")
-                coverage = index_status.get("coverageState", "Unknown")
+            google_canonical = index_status.get("googleCanonical", "")
+            user_canonical = index_status.get("userCanonical", "")
+            if google_canonical and user_canonical and google_canonical != user_canonical:
+                buckets["canonical_conflict"].append({
+                    "url": page_url,
+                    "google_canonical": google_canonical,
+                    "user_canonical": user_canonical,
+                })
 
-                if verdict != "PASS" or "not indexed" in coverage.lower() or "excluded" in coverage.lower():
-                    buckets["not_indexed"].append({"url": page_url, "reason": coverage})
-                else:
-                    buckets["indexed"].append(page_url)
+            # The API's RobotsTxtState enum is ALLOWED | DISALLOWED; "BLOCKED"
+            # is kept for backward compatibility with older responses.
+            if index_status.get("robotsTxtState", "") in ("DISALLOWED", "BLOCKED"):
+                buckets["robots_blocked"].append(page_url)
 
-                google_canonical = index_status.get("googleCanonical", "")
-                user_canonical = index_status.get("userCanonical", "")
-                if google_canonical and user_canonical and google_canonical != user_canonical:
-                    buckets["canonical_conflict"].append({
-                        "url": page_url,
-                        "google_canonical": google_canonical,
-                        "user_canonical": user_canonical,
-                    })
-
-                if index_status.get("robotsTxtState", "") == "BLOCKED":
-                    buckets["robots_blocked"].append(page_url)
-
-                fetch_state = index_status.get("pageFetchState", "")
-                if fetch_state and fetch_state != "SUCCESSFUL":
-                    buckets["fetch_failure"].append({"url": page_url, "state": fetch_state})
-
-            except Exception as e:
-                buckets["not_indexed"].append({"url": page_url, "reason": f"Error: {e}"})
+            fetch_state = index_status.get("pageFetchState", "")
+            if fetch_state and fetch_state != "SUCCESSFUL":
+                buckets["fetch_failure"].append({"url": page_url, "state": fetch_state})
 
         summary = {
             "total": len(url_list),
@@ -3127,6 +4989,9 @@ async def gsc_get_performance_overview(
     days: int = 28,
     response_format: str = "markdown",
     *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    data_state: str = "final",
     account_alias: Optional[str] = None,
 ) -> Any:
     """Totals-plus-daily-trend snapshot for a GSC property. Pick me for a
@@ -3135,57 +5000,35 @@ async def gsc_get_performance_overview(
 
     Args:
         site_url: GSC site URL (exact match).
-        days: Look-back window (default 28, clamped to min 1).
+        days: The last N days of final data (default 28, like the GSC UI),
+            ending on meta.latest_final_date (Pacific Time).
         response_format: `markdown` (default) | `csv` | `json`.
+        start_date / end_date: Explicit YYYY-MM-DD window (overrides days).
+        data_state: `final` (default) | `all` (preliminary days flagged).
         account_alias: Optional explicit account; omit to auto-resolve.
     """
+    tool = "gsc_get_performance_overview"
     try:
         days = max(int(days), 1)
-
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
+        async with _instrument(tool, site_url=site_url, days=days):
+            ctx = await _sa_context(site_url, account_alias)
+            w = await _resolve_window(
+                ctx, start_date=start_date, end_date=end_date, days=days, data_state=data_state,
             )
-        except AccountResolverError as e:
-            return _format_error(
-                e.to_envelope(tool="gsc_get_performance_overview"),
-                response_format=response_format,
+            total_res = await _sa_run(
+                ctx, dimensions=[], window=w, data_state=data_state, row_limit=1,
+                step=f"{tool}.totals",
+            )
+            date_res = await _sa_run(
+                ctx, dimensions=["date"], window=w, data_state=data_state,
+                row_limit=w["window_days"], step=f"{tool}.daily",
             )
 
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=days)
+        span = f"last {days} days" if w["days_requested"] else f"{w['start_date']} to {w['end_date']}"
+        if not total_res["rows"] and str(response_format).strip().lower() != "json":
+            return f"No performance data found for {site_url} in the {span}."
 
-        total_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": [],
-            "rowLimit": 1,
-        }
-
-        date_request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["date"],
-            "rowLimit": days,
-        }
-
-        async with _instrument(
-            "gsc_get_performance_overview",
-            site_url=site_url,
-            days=days,
-        ):
-            total_response = service.searchanalytics().query(
-                siteUrl=site_url, body=total_request
-            ).execute()
-            date_response = service.searchanalytics().query(
-                siteUrl=site_url, body=date_request
-            ).execute()
-
-        totals_rows = total_response.get("rows") or []
-        if not totals_rows:
-            return f"No performance data found for {site_url} in the last {days} days."
-
-        t = totals_rows[0]
+        t = total_res["rows"][0] if total_res["rows"] else {}
         totals = {
             "clicks": t.get("clicks", 0),
             "impressions": t.get("impressions", 0),
@@ -3194,33 +5037,34 @@ async def gsc_get_performance_overview(
         }
 
         # Daily trend rows, sorted by date ascending.
-        trend_raw = date_response.get("rows") or []
         trend_rows: List[Dict[str, Any]] = []
-        for row in sorted(trend_raw, key=lambda x: (x.get("keys") or [""])[0]):
-            date_str = (row.get("keys") or [""])[0]
+        for row in sorted(date_res["rows"], key=lambda x: str(x.get("date", ""))):
+            date_str = str(row.get("date", ""))
             try:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d")
-                date_formatted = date_obj.strftime("%m/%d")
+                date_formatted = datetime.strptime(date_str, "%Y-%m-%d").strftime("%m/%d")
             except ValueError:
                 date_formatted = date_str
-            trend_rows.append({
+            trend_row = {
                 "date": date_formatted,
                 "clicks": row.get("clicks", 0),
                 "impressions": row.get("impressions", 0),
                 "ctr": row.get("ctr", 0),
                 "position": row.get("position", 0),
-            })
+            }
+            if "preliminary" in row:
+                trend_row["preliminary"] = row["preliminary"]
+            trend_rows.append(trend_row)
 
         columns = [
             {"key": "date", "display": "Date", "type": "str"},
-            {"key": "clicks", "display": "Clicks", "type": "int"},
-            {"key": "impressions", "display": "Impressions", "type": "int"},
-            {"key": "ctr", "display": "CTR", "type": "pct"},
-            {"key": "position", "display": "Position", "type": "float"},
+            *_METRIC_COLUMNS,
         ]
+        if date_res["first_incomplete_date"]:
+            columns.append({"key": "preliminary", "display": "Preliminary", "type": "str"})
 
         header_lines = [
-            f"Performance Overview for {site_url} (last {days} days)",
+            f"Performance Overview for {site_url} ({span})",
+            _window_line(w),
             f"Total Clicks: {totals['clicks']:,}",
             f"Total Impressions: {totals['impressions']:,}",
             f"Average CTR: {totals['ctr'] * 100:.2f}%",
@@ -3234,27 +5078,18 @@ async def gsc_get_performance_overview(
             columns,
             response_format=response_format,
             header_lines=header_lines,
-            meta={
-                "site_url": site_url,
-                "days": days,
-                "totals": totals,
-                "daily_count": len(trend_rows),
-            },
-        )
-    except HttpError as e:
-        return _format_error(
-            _http_error_envelope(e, tool="gsc_get_performance_overview", site_url=site_url),
-            response_format=response_format,
-        )
-    except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="gsc_get_performance_overview",
+            meta=_sa_meta(
+                date_res,
+                site_url=site_url,
+                days=days,
+                totals=totals,
+                daily_count=len(trend_rows),
+                row_count=len(trend_rows),
             ),
-            response_format=response_format,
+            text_meta=True,
         )
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format=response_format)
 
 @mcp.tool()
 async def gsc_get_advanced_search_analytics(
@@ -3272,261 +5107,225 @@ async def gsc_get_advanced_search_analytics(
     filter_expression: str = None,
     response_format: str = "markdown",
     *,
+    filter_groups: Optional[List[Dict[str, Any]]] = None,
+    data_state: str = "final",
+    aggregation_type: Optional[str] = None,
+    fetch_all: bool = False,
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    save_to_file: Optional[str] = None,
     account_alias: Optional[str] = None,
 ) -> Any:
     """GSC search analytics with sorting, filtering, and pagination. Pick me
     when you need more than a plain top-N summary; use `gsc_get_search_analytics`
-    for a quick overview or `gsc_get_search_by_page_query` to break one page
-    down by query.
+    for a quick overview, `gsc_query` for every API parameter, or
+    `gsc_get_search_by_page_query` to break one page down by query.
 
     Args:
         site_url: GSC site URL (exact match).
-        start_date: YYYY-MM-DD (defaults to 28 days ago).
-        end_date: YYYY-MM-DD (defaults to today).
+        start_date: YYYY-MM-DD (default: the last 28 days of final data).
+        end_date: YYYY-MM-DD (default: meta.latest_final_date, Pacific Time).
         dimensions: Comma-separated (e.g. "query,page,device").
-        search_type: WEB, IMAGE, VIDEO, NEWS, or DISCOVER.
+        search_type: web, image, video, news, googleNews or discover.
         row_limit: Rows per page (default 100; clamped to [1, 25000]).
-            Pass `row_limit=1000` for large pulls; paginate via
-            `start_row` for more.
+            Paginate via `start_row`, or pass fetch_all / save_to_file.
         start_row: Starting row for pagination.
-        sort_by: clicks | impressions | ctr | position.
+        sort_by: clicks | impressions | ctr | position. Applied client-side;
+            any order other than the API's (clicks desc) fetches every row
+            first so the top-N is exact.
         sort_direction: ascending | descending.
-        filter_dimension: query | page | country | device.
-        filter_operator: contains | equals | notContains | notEquals.
+        filter_dimension: query | page | country | device | searchAppearance.
+        filter_operator: contains | equals | notContains | notEquals |
+            includingRegex | excludingRegex (RE2; "\\bsage\\b" matches the
+            word "sage" but not "message").
         filter_expression: value to filter on.
         response_format: `markdown` (default) | `csv` | `json`.
+        filter_groups: Several AND filters at once (see `gsc_query`); combined
+            with the single filter_* filter when both are given.
+        data_state: final (default) | all.
+        aggregation_type: auto | byPage | byProperty.
+        fetch_all / max_rows: page through every row up to max_rows.
+        save_to_file: Absolute .csv/.json path; writes all rows, returns a summary.
     """
+    tool = "gsc_get_advanced_search_analytics"
     try:
         row_limit = max(1, min(int(row_limit), 25000))
-
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
-            )
-        except AccountResolverError as e:
-            return _format_error(
-                e.to_envelope(tool="gsc_get_advanced_search_analytics"),
-                response_format=response_format,
-            )
-
-        if not end_date:
-            end_date = datetime.now().date().strftime("%Y-%m-%d")
-        if not start_date:
-            start_date = (datetime.now().date() - timedelta(days=28)).strftime("%Y-%m-%d")
-
         dimension_list = [d.strip() for d in dimensions.split(",")]
 
-        request = {
-            "startDate": start_date,
-            "endDate": end_date,
-            "dimensions": dimension_list,
-            "rowLimit": row_limit,
-            "startRow": start_row,
-            "searchType": search_type.upper(),
-        }
-
-        if sort_by:
-            metric_map = {
-                "clicks": "CLICK_COUNT",
-                "impressions": "IMPRESSION_COUNT",
-                "ctr": "CTR",
-                "position": "POSITION",
-            }
-            if sort_by in metric_map:
-                request["orderBy"] = [{
-                    "metric": metric_map[sort_by],
-                    "direction": sort_direction.lower(),
-                }]
-
+        groups: List[Dict[str, Any]] = list(_normalize_filter_groups(filter_groups))
         if filter_dimension and filter_expression:
-            filter_group = {
-                "filters": [{
-                    "dimension": filter_dimension,
-                    "operator": filter_operator,
-                    "expression": filter_expression,
-                }]
-            }
-            request["dimensionFilterGroups"] = [filter_group]
+            single = {"filters": [{
+                "dimension": filter_dimension,
+                "operator": filter_operator,
+                "expression": filter_expression,
+            }]}
+            groups = _normalize_filter_groups([single]) + groups
 
         async with _instrument(
-            "gsc_get_advanced_search_analytics",
-            site_url=site_url,
-            row_limit=row_limit,
-            start_row=start_row,
-            dimensions=dimensions,
+            tool, site_url=site_url, row_limit=row_limit,
+            start_row=start_row, dimensions=dimensions,
         ):
-            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-        raw_rows = response.get("rows") or []
-
-        if not raw_rows:
-            filter_note = (
-                f"- Filter: {filter_dimension} {filter_operator} '{filter_expression}'"
-                if filter_dimension else "- No filter applied"
+            ctx = await _sa_context(site_url, account_alias)
+            res = await _sa_run(
+                ctx, dimensions=dimension_list, start_date=start_date, end_date=end_date,
+                search_type=search_type, filter_groups=groups, data_state=data_state,
+                aggregation_type=aggregation_type, row_limit=row_limit,
+                start_row=start_row, fetch_all=fetch_all or bool(save_to_file), max_rows=max_rows,
+                sort_by=sort_by or None, sort_direction=sort_direction,
+                include_totals=True, step=tool,
             )
-            return (
-                f"No search analytics data found for {site_url} with the specified parameters.\n\n"
-                f"Parameters used:\n"
-                f"- Date range: {start_date} to {end_date}\n"
-                f"- Dimensions: {dimensions}\n"
-                f"- Search type: {search_type}\n"
-                f"{filter_note}"
-            )
-
-        rows_returned = len(raw_rows)
-        truncated = rows_returned >= row_limit
-
-        rows = []
-        for r in raw_rows:
-            row_dict: Dict[str, Any] = {}
-            keys = r.get("keys", [])
-            for i, dim in enumerate(dimension_list):
-                row_dict[dim] = keys[i][:100] if i < len(keys) else ""
-            row_dict["clicks"] = r.get("clicks", 0)
-            row_dict["impressions"] = r.get("impressions", 0)
-            row_dict["ctr"] = r.get("ctr", 0)
-            row_dict["position"] = r.get("position", 0)
-            rows.append(row_dict)
-
-        columns = [
-            {"key": dim, "display": dim.capitalize(), "type": "str"}
-            for dim in dimension_list
-        ]
-        columns.extend([
-            {"key": "clicks", "display": "Clicks", "type": "int"},
-            {"key": "impressions", "display": "Impressions", "type": "int"},
-            {"key": "ctr", "display": "CTR", "type": "pct"},
-            {"key": "position", "display": "Position", "type": "float"},
-        ])
+        w = res["window"]
+        start_date, end_date = w["start_date"], w["end_date"]
+        filter_note_text = (
+            f"{filter_dimension} {filter_operator} '{filter_expression}'"
+            if filter_dimension else None
+        )
+        extra_groups = len(groups) - (1 if filter_note_text else 0)
+        dims = res["dimensions"]
+        rows_returned = len(res["rows"])
+        columns = _sa_columns(dims, preliminary=bool(res["first_incomplete_date"]))
 
         header_lines = [
             f"Search analytics for {site_url}",
             f"Date range: {start_date} to {end_date}",
+            _window_line(w),
             f"Search type: {search_type}",
         ]
-        if filter_dimension:
-            header_lines.append(
-                f"Filter: {filter_dimension} {filter_operator} '{filter_expression}'"
-            )
+        if filter_note_text:
+            header_lines.append(f"Filter: {filter_note_text}")
+        if extra_groups > 0:
+            header_lines.append(f"Additional filter groups: {extra_groups} (see meta.filter_groups)")
         header_lines.append(
             f"Showing rows {start_row + 1} to {start_row + rows_returned} "
             f"(sorted by {sort_by} {sort_direction})"
         )
 
+        next_row = res["next_start_row"]
         truncation_hint = (
             f"returned {rows_returned} rows and hit `row_limit={row_limit}`. "
-            f"There may be more data. Pass a larger `row_limit` (max 25000) "
-            f"or paginate via `start_row={start_row + row_limit}`."
+            f"There may be more data. Pass a larger `row_limit` (max 25000), "
+            f"paginate via `start_row={next_row if next_row is not None else start_row + row_limit}`, "
+            f"or pass fetch_all / save_to_file."
         )
 
+        meta = _sa_meta(
+            res,
+            site_url=site_url,
+            start_date=start_date,
+            end_date=end_date,
+            dimensions=dims,
+            search_type=search_type,
+            row_limit=row_limit,
+            start_row=start_row,
+            sort_by=sort_by,
+            sort_direction=sort_direction,
+            next_start_row=next_row,
+            filter_groups=res["filter_groups"],
+        )
+        if save_to_file:
+            return await _saved_summary(
+                tool=tool, path=save_to_file, rows=res["rows"], columns=columns,
+                meta=meta, response_format=response_format, header_lines=header_lines,
+                truncated=res["truncated"],
+            )
+        if not res["rows"] and str(response_format).strip().lower() != "json":
+            filter_note = f"- Filter: {filter_note_text}" if filter_note_text else "- No filter applied"
+            return (
+                f"No search analytics data found for {site_url} with the specified parameters.\n\n"
+                f"Parameters used:\n"
+                f"- Date range: {start_date} to {end_date} (Pacific Time)\n"
+                f"- Dimensions: {dimensions}\n"
+                f"- Search type: {search_type}\n"
+                f"{filter_note}"
+            )
+        rows = []
+        for r in res["rows"]:
+            row_dict = dict(r)
+            for dim in dims:
+                row_dict[dim] = str(r.get(dim, ""))[:100]
+            rows.append(row_dict)
         return _format_table(
             rows,
             columns,
             response_format=response_format,
             header_lines=header_lines,
-            truncated=truncated,
+            truncated=res["truncated"],
             truncation_hint=truncation_hint,
-            meta={
-                "site_url": site_url,
-                "start_date": start_date,
-                "end_date": end_date,
-                "dimensions": dimension_list,
-                "search_type": search_type,
-                "row_limit": row_limit,
-                "start_row": start_row,
-                "sort_by": sort_by,
-                "sort_direction": sort_direction,
-                "next_start_row": start_row + row_limit if truncated else None,
-            },
+            meta=meta,
+            text_meta=True,
         )
-    except HttpError as e:
-        return _format_error(
-            _http_error_envelope(e, tool="gsc_get_advanced_search_analytics", site_url=site_url),
-            response_format=response_format,
-        )
-    except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="gsc_get_advanced_search_analytics",
-            ),
-            response_format=response_format,
-        )
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format=response_format)
 
 @mcp.tool()
 async def gsc_compare_search_periods(
     site_url: str,
-    period1_start: str,
-    period1_end: str,
-    period2_start: str,
-    period2_end: str,
+    period1_start: Optional[str] = None,
+    period1_end: Optional[str] = None,
+    period2_start: Optional[str] = None,
+    period2_end: Optional[str] = None,
     dimensions: str = "query",
     limit: int = 10,
     *,
+    days: Optional[int] = None,
+    data_state: str = "final",
     upstream_row_limit: int = 500,
     response_format: str = "markdown",
     account_alias: Optional[str] = None,
 ) -> Any:
-    """Compare GSC analytics between two time periods.
+    """Compare GSC analytics between two time periods (period 2 minus period 1).
 
     Args:
         site_url: GSC site URL (exact match).
-        period1_start: Start date for period 1 (YYYY-MM-DD).
-        period1_end: End date for period 1 (YYYY-MM-DD).
-        period2_start: Start date for period 2 (YYYY-MM-DD).
-        period2_end: End date for period 2 (YYYY-MM-DD).
+        period1_start / period1_end: Earlier period (YYYY-MM-DD).
+        period2_start / period2_end: Later period (YYYY-MM-DD).
         dimensions: Dimensions to group by (default: query).
         limit: Number of top-N results to return after the diff (default 10).
+        days: Instead of dates: period 2 = the last N days of final data,
+            period 1 = the N days before it (equal length, both final).
+        data_state: final (default) | all.
         upstream_row_limit: Per-period rows pulled from GSC before the
-            join (default 500; clamped to [1, 25000]). Raise this if
-            long-tail queries aren't matching between periods.
+            join (default 500; clamped to [1, 25000]). A row missing from a
+            period that hit this cap is reported as null (unknown), not 0;
+            raise this if long-tail queries aren't matching between periods.
         response_format: `markdown` (default) | `csv` | `json`.
     """
+    tool = "gsc_compare_search_periods"
     try:
         upstream_row_limit = max(1, min(int(upstream_row_limit), 25000))
-
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
-            )
-        except AccountResolverError as e:
-            return _format_error(
-                e.to_envelope(tool="gsc_compare_search_periods"),
-                response_format=response_format,
-            )
-
         dimension_list = [d.strip() for d in dimensions.split(",")]
-
-        period1_request = {
-            "startDate": period1_start,
-            "endDate": period1_end,
-            "dimensions": dimension_list,
-            "rowLimit": upstream_row_limit,
-        }
-        period2_request = {
-            "startDate": period2_start,
-            "endDate": period2_end,
-            "dimensions": dimension_list,
-            "rowLimit": upstream_row_limit,
-        }
+        explicit = [period1_start, period1_end, period2_start, period2_end]
+        use_days = _comparison_mode(explicit, days)
 
         async with _instrument(
-            "gsc_compare_search_periods",
-            site_url=site_url,
-            upstream_row_limit=upstream_row_limit,
-            dimensions=dimensions,
+            tool, site_url=site_url, upstream_row_limit=upstream_row_limit, dimensions=dimensions,
         ):
-            period1_response = service.searchanalytics().query(siteUrl=site_url, body=period1_request).execute()
-            period2_response = service.searchanalytics().query(siteUrl=site_url, body=period2_request).execute()
+            ctx = await _sa_context(site_url, account_alias)
+            if use_days:
+                w1, w2 = await _resolve_comparison_windows(ctx, days=days, data_state=data_state)
+            else:
+                w1 = await _resolve_window(ctx, start_date=period1_start, end_date=period1_end, data_state=data_state)
+                w2 = await _resolve_window(ctx, start_date=period2_start, end_date=period2_end, data_state=data_state)
+            res1 = await _sa_run(
+                ctx, dimensions=dimension_list, window=w1, data_state=data_state,
+                row_limit=upstream_row_limit, include_totals=True, step=f"{tool}.period1",
+            )
+            res2 = await _sa_run(
+                ctx, dimensions=dimension_list, window=w2, data_state=data_state,
+                row_limit=upstream_row_limit, include_totals=True, step=f"{tool}.period2",
+            )
+        period1_start, period1_end = w1["start_date"], w1["end_date"]
+        period2_start, period2_end = w2["start_date"], w2["end_date"]
+        dims = res1["dimensions"]
 
-        period1_rows = period1_response.get("rows", []) or []
-        period2_rows = period2_response.get("rows", []) or []
-
-        if not period1_rows and not period2_rows:
+        if not res1["rows"] and not res2["rows"] and str(response_format).strip().lower() != "json":
             return f"No data found for either period for {site_url}."
 
-        period1_data = {tuple(row.get("keys", [])): row for row in period1_rows}
-        period2_data = {tuple(row.get("keys", [])): row for row in period2_rows}
+        def _key(r: Dict[str, Any]) -> tuple:
+            return tuple(r.get(d, "") for d in dims)
+
+        period1_data = {_key(row): row for row in res1["rows"]}
+        period2_data = {_key(row): row for row in res2["rows"]}
+        p1_complete, p2_complete = res1["complete"], res2["complete"]
 
         all_keys = set(period1_data.keys()) | set(period2_data.keys())
         comparison_data: List[Dict[str, Any]] = []
@@ -3535,12 +5334,17 @@ async def gsc_compare_search_periods(
             p1 = period1_data.get(key)
             p2 = period2_data.get(key)
 
-            p1_clicks = p1.get("clicks", 0) if p1 is not None else 0
-            p2_clicks = p2.get("clicks", 0) if p2 is not None else 0
-            click_diff = p2_clicks - p1_clicks
+            # A row absent from a period is 0 only if that period's fetch was
+            # complete; absent from a capped sample it is unknown (null).
+            p1_clicks = p1.get("clicks", 0) if p1 is not None else (0 if p1_complete else None)
+            p2_clicks = p2.get("clicks", 0) if p2 is not None else (0 if p2_complete else None)
+            click_diff = (
+                p2_clicks - p1_clicks
+                if p1_clicks is not None and p2_clicks is not None else None
+            )
             # Ratio (e.g. -0.5353 = -53.53%). `_format_table`'s "pct"
-            # column type handles the display formatting for markdown/CSV.
-            clicks_pct = (click_diff / p1_clicks) if p1_clicks > 0 else None
+            # column type handles the display formatting for markdown.
+            clicks_pct = (click_diff / p1_clicks) if (click_diff is not None and p1_clicks) else None
 
             # Position is 1-indexed in GSC — 0 is not a valid rank. When a
             # side is absent we emit null rather than a misleading sentinel.
@@ -3553,7 +5357,7 @@ async def gsc_compare_search_periods(
             )
 
             row: Dict[str, Any] = {}
-            for i, dim in enumerate(dimension_list):
+            for i, dim in enumerate(dims):
                 row[dim] = str(key[i])[:100] if i < len(key) else ""
             row.update({
                 "p1_clicks": p1_clicks,
@@ -3564,10 +5368,15 @@ async def gsc_compare_search_periods(
                 "p2_position": p2_position,
                 "pos_diff": pos_diff,
             })
+            if p1_clicks is None or p2_clicks is None:
+                row["absent_reason"] = "beyond_row_limit"
             comparison_data.append(row)
 
-        # Sort by absolute click difference descending.
-        comparison_data.sort(key=lambda r: abs(r["click_diff"]), reverse=True)
+        # Sort by absolute click difference descending; unknown diffs last.
+        comparison_data.sort(
+            key=lambda r: (r["click_diff"] is None, -abs(r["click_diff"] or 0),
+                           tuple(str(r.get(d, "")) for d in dims)),
+        )
         total_matched = len(comparison_data)
         rows = comparison_data[:limit]
         truncated = total_matched > limit
@@ -3579,7 +5388,7 @@ async def gsc_compare_search_periods(
 
         columns: List[Dict[str, str]] = [
             {"key": dim, "display": dim.capitalize(), "type": "str"}
-            for dim in dimension_list
+            for dim in dims
         ]
         columns.extend([
             {"key": "p1_clicks", "display": "P1 Clicks", "type": "int"},
@@ -3598,7 +5407,34 @@ async def gsc_compare_search_periods(
             f"Dimension(s): {dimensions}",
             f"Top {min(limit, len(comparison_data))} results by change in clicks",
         ]
+        if not (p1_complete and p2_complete):
+            header_lines.append(
+                "Note: a period hit upstream_row_limit; rows missing from it show as blank (unknown), not 0."
+            )
 
+        meta = _standard_meta(
+            None,
+            site_url=site_url,
+            period1={"start": period1_start, "end": period1_end, "window": _window_meta(w1),
+                     "totals": res1["totals"]},
+            period2={"start": period2_start, "end": period2_end, "window": _window_meta(w2),
+                     "totals": res2["totals"]},
+            dimensions=dims,
+            limit=limit,
+            upstream_row_limit=upstream_row_limit,
+            total_matched=total_matched,
+            coverage={
+                "p1": "complete" if p1_complete else "truncated",
+                "p2": "complete" if p2_complete else "truncated",
+            },
+            data_state=data_state,
+            latest_final_date=w2["latest_final_date"],
+            timezone=_PT_LABEL,
+            row_count=len(rows),
+            truncated=truncated,
+            warnings=list(w1["warnings"]) + list(w2["warnings"]) + res1["warnings"] + res2["warnings"]
+            + (["days ignored: explicit period dates were given."] if days is not None and not use_days else []),
+        )
         return _format_table(
             rows,
             columns,
@@ -3606,30 +5442,11 @@ async def gsc_compare_search_periods(
             header_lines=header_lines,
             truncated=truncated,
             truncation_hint=truncation_hint,
-            meta={
-                "site_url": site_url,
-                "period1": {"start": period1_start, "end": period1_end},
-                "period2": {"start": period2_start, "end": period2_end},
-                "dimensions": dimension_list,
-                "limit": limit,
-                "upstream_row_limit": upstream_row_limit,
-                "total_matched": total_matched,
-            },
+            meta=meta,
+            text_meta=True,
         )
-    except HttpError as e:
-        return _format_error(
-            _http_error_envelope(e, tool="gsc_compare_search_periods", site_url=site_url),
-            response_format=response_format,
-        )
-    except Exception as e:
-        return _format_error(
-            _make_error_envelope(
-                error=f"{type(e).__name__}: {e}",
-                hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-                tool="gsc_compare_search_periods",
-            ),
-            response_format=response_format,
-        )
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format=response_format)
 
 @mcp.tool()
 async def gsc_get_search_by_page_query(
@@ -3640,6 +5457,12 @@ async def gsc_get_search_by_page_query(
     response_format: str = "markdown",
     include_summary: Optional[bool] = None,
     *,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    data_state: str = "final",
+    sort_by: Optional[str] = None,
+    sort_direction: str = "descending",
+    fetch_all: bool = False,
     account_alias: Optional[str] = None,
 ):
     """Break down GSC queries for a single page. Pick me when you already
@@ -3651,13 +5474,13 @@ async def gsc_get_search_by_page_query(
         site_url: GSC site URL (exact match).
         page_url: Full page URL (scheme + host + path) matching the GSC
             `page` dimension exactly.
-        days: Look-back window (default 28; clamped to min 1).
+        days: The last N days of final data (default 28, like the GSC UI),
+            ending on meta.latest_final_date (Pacific Time).
         row_limit: Max query rows (default 20; clamped to [1, 25000]).
-            Raise to 500–1000 on pages ranking for many queries to
-            avoid silent impression undercounts. Summary aggregates
-            in json mode are only accurate across returned rows —
-            if total_rows_returned == row_limit, retry with a larger
-            row_limit.
+            Raise to 500–1000 on pages ranking for many queries. The page
+            total (a query-less call) and the unattributed share — traffic
+            no returned query row accounts for, mostly anonymised queries —
+            are always reported.
         response_format: "markdown" (default, compact) or "json"
             (structured; parseable for downstream code).
         include_summary: json-only. When None (default), the
@@ -3665,20 +5488,28 @@ async def gsc_get_search_by_page_query(
             omitted below (the summary is misleading when many rows
             are capped). Pass True to force-include or False to
             force-omit.
+        start_date / end_date: Explicit YYYY-MM-DD window (overrides days).
+        data_state: final (default) | all.
+        sort_by: clicks | impressions | ctr | position, sorted over the
+            page's full query set (default: the API's clicks order).
+        sort_direction: ascending | descending.
+        fetch_all: return every query row for the page, not just row_limit.
 
     Returns:
-        markdown mode (default): str, pre-0.5 byte-compatible.
-        json mode: dict with keys `ok, site_url, page_url, days,
-        row_limit, total_rows_returned, possibly_truncated, queries`.
+        markdown mode (default): str table with a window line, a TOTAL row
+        over returned queries, then the page total and unattributed share.
+        json mode: dict with keys `ok, tool, site_url, page_url, days,
+        row_limit, total_rows_returned, possibly_truncated, queries, meta`.
         `summary` key is included per the `include_summary` rule above;
         when present it holds
         `{total_clicks, total_impressions, average_position
         (impression-weighted), average_ctr}`.
-        On error: `{ok: False, error, tool}` in json mode, or a
-        string prefixed `"Error retrieving page query data: ..."` in
-        markdown mode. Invalid response_format always returns a string
-        error (conservative default).
+        On error: an error envelope in json mode, or a string prefixed
+        `"Error retrieving page query data: ..."` in markdown mode.
+        Invalid response_format always returns a string error
+        (conservative default).
     """
+    tool = "gsc_get_search_by_page_query"
     fmt = str(response_format).strip().lower()
     if fmt not in ("markdown", "json"):
         return (
@@ -3686,85 +5517,87 @@ async def gsc_get_search_by_page_query(
             f"response_format must be 'markdown' or 'json', got {response_format!r}"
         )
 
-    if fmt == "markdown":
-        # Near-verbatim copy of the pre-0.5 body. The ONLY intentional
-        # differences vs pre-0.5 are:
-        #   1. rowLimit: 20 (hardcoded) → effective_row_limit (the bug fix)
-        #   2. days clamped via max(1, int(days)) so negative/zero inputs
-        #      don't break date math (strict improvement for pathological
-        #      input only; normal positive int values render identically).
-        try:
-            effective_days = max(1, int(days))
-            effective_row_limit = max(1, min(int(row_limit), 25000))
+    async def _run() -> Tuple[Dict[str, Any], int, int, str]:
+        effective_days = max(1, int(days))
+        effective_row_limit = max(1, min(int(row_limit), 25000))
+        ctx = await _sa_context(site_url, account_alias)
+        async with _instrument(
+            tool, site_url=site_url, page_url=page_url, mode=fmt,
+            row_limit=effective_row_limit, account_alias=account_alias,
+        ):
+            res = await _sa_run(
+                ctx, dimensions=["query"], days=effective_days, start_date=start_date,
+                end_date=end_date, data_state=data_state,
+                filter_groups=[{"filters": [{"dimension": "page", "operator": "equals", "expression": page_url}]}],
+                row_limit=effective_row_limit, fetch_all=fetch_all, sort_by=sort_by,
+                sort_direction=sort_direction, include_totals=True, step=tool,
+            )
+        w = res["window"]
+        span = f"last {effective_days} days" if w["days_requested"] else f"{w['start_date']} to {w['end_date']}"
+        return res, effective_days, effective_row_limit, span
 
+    if fmt == "markdown":
+        try:
             try:
-                _resolved_alias, service = await get_gsc_service_for_site(
-                    site_url, account_alias,
-                )
+                res, effective_days, effective_row_limit, span = await _run()
             except AccountResolverError as e:
                 # Markdown branch — caller expects a plain string starting "Error:".
-                env = e.to_envelope(tool="gsc_get_search_by_page_query")
+                env = e.to_envelope(tool=tool)
                 return f"Error retrieving page query data: {env['error']}"
 
-            # Calculate date range
-            end_date = datetime.now().date()
-            start_date = end_date - timedelta(days=effective_days)
+            rows = res["rows"]
+            if not rows:
+                msg = f"No search data found for page {page_url} in the {span}.\n{_window_line(res['window'])}"
+                pt = (res["totals"] or {}).get("page_total") or {}
+                if pt.get("clicks") or pt.get("impressions"):
+                    # Traffic with no attributable query rows: all anonymised.
+                    msg += (
+                        f"\nPAGE TOTAL (query-less, incl. anonymised) | {pt['clicks']} | "
+                        f"{pt['impressions']} | - | -\nUnattributed share: 100% "
+                        f"(no query rows; every query is anonymised or below the row threshold)"
+                    )
+                for warning in res["window"]["warnings"] + res["warnings"]:
+                    msg += f"\nWarning: {warning}"
+                return msg
 
-            # Build request with page filter
-            request = {
-                "startDate": start_date.strftime("%Y-%m-%d"),
-                "endDate": end_date.strftime("%Y-%m-%d"),
-                "dimensions": ["query"],
-                "dimensionFilterGroups": [{
-                    "filters": [{
-                        "dimension": "page",
-                        "operator": "equals",
-                        "expression": page_url
-                    }]
-                }],
-                "rowLimit": effective_row_limit,
-                "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
-            }
-
-            async with _instrument(
-                "gsc_get_search_by_page_query",
-                site_url=site_url,
-                page_url=page_url,
-                mode="markdown",
-                row_limit=effective_row_limit,
-                account_alias=account_alias,
-            ):
-                response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
-
-            if not response.get("rows"):
-                return f"No search data found for page {page_url} in the last {effective_days} days."
-
-            # Format results
-            result_lines = [f"Search queries for page {page_url} (last {effective_days} days):"]
+            result_lines = [f"Search queries for page {page_url} ({span}):"]
+            result_lines.append(_window_line(res["window"]))
             result_lines.append("\n" + "-" * 80 + "\n")
-
-            # Create header
             result_lines.append("Query | Clicks | Impressions | CTR | Position")
             result_lines.append("-" * 80)
 
-            # Add data rows (byte-for-byte pre-0.5: raw row values, no
-            # int/float coercion, "Unknown" fallback for missing keys).
-            for row in response.get("rows", []):
-                query = row.get("keys", ["Unknown"])[0]
+            # Raw row values, no int/float coercion, "Unknown" for missing keys.
+            for row in rows:
+                query = row.get("query") or "Unknown"
                 clicks = row.get("clicks", 0)
                 impressions = row.get("impressions", 0)
                 ctr = row.get("ctr", 0) * 100
                 position = row.get("position", 0)
-
                 result_lines.append(f"{query[:100]} | {clicks} | {impressions} | {ctr:.2f}% | {position:.1f}")
 
-            # Add total metrics
-            total_clicks = sum(row.get("clicks", 0) for row in response.get("rows", []))
-            total_impressions = sum(row.get("impressions", 0) for row in response.get("rows", []))
+            total_clicks = sum(row.get("clicks", 0) for row in rows)
+            total_impressions = sum(row.get("impressions", 0) for row in rows)
             avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
 
             result_lines.append("-" * 80)
             result_lines.append(f"TOTAL | {total_clicks} | {total_impressions} | {avg_ctr:.2f}% | -")
+
+            t = res["totals"]
+            if t is not None:
+                pt, share = t["page_total"], t["unattributed_share"]
+
+                def _pct(v: Optional[float]) -> str:
+                    return "n/a" if v is None else f"{v * 100:.2f}%"
+                result_lines.append(
+                    f"PAGE TOTAL (query-less, incl. anonymised) | {pt['clicks']} | {pt['impressions']} | - | -"
+                )
+                result_lines.append(
+                    f"Unattributed share: clicks {_pct(share['clicks'])}, "
+                    f"impressions {_pct(share['impressions'])} "
+                    f"(query rows: {t['query_rows_sum_scope']})"
+                )
+            for warning in res["window"]["warnings"] + res["warnings"]:
+                result_lines.append(f"Warning: {warning}")
 
             return "\n".join(result_lines)
         except Exception as e:
@@ -3772,58 +5605,25 @@ async def gsc_get_search_by_page_query(
 
     # response_format == "json" — structured output with summary aggregates
     try:
-        effective_days = max(1, int(days))
-        effective_row_limit = max(1, min(int(row_limit), 25000))
-
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
-            )
-        except AccountResolverError as e:
-            return e.to_envelope(tool="gsc_get_search_by_page_query")
-
-        end_date = datetime.now().date()
-        start_date = end_date - timedelta(days=effective_days)
-
-        request = {
-            "startDate": start_date.strftime("%Y-%m-%d"),
-            "endDate": end_date.strftime("%Y-%m-%d"),
-            "dimensions": ["query"],
-            "dimensionFilterGroups": [{
-                "filters": [{
-                    "dimension": "page",
-                    "operator": "equals",
-                    "expression": page_url
-                }]
-            }],
-            "rowLimit": effective_row_limit,
-            "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}]
-        }
-
-        async with _instrument(
-            "gsc_get_search_by_page_query",
-            site_url=site_url,
-            page_url=page_url,
-            mode="json",
-            row_limit=effective_row_limit,
-        ):
-            response = service.searchanalytics().query(siteUrl=site_url, body=request).execute()
+        res, effective_days, effective_row_limit, span = await _run()
 
         queries: List[Dict[str, Any]] = []
-        for row in response.get("rows", []) or []:
-            keys = row.get("keys", [])
-            query = keys[0] if keys else ""
-            queries.append({
-                "query": query,
+        for row in res["rows"]:
+            q: Dict[str, Any] = {
+                "query": row.get("query", ""),
                 "clicks": int(row.get("clicks", 0)),
                 "impressions": int(row.get("impressions", 0)),
                 "ctr": float(row.get("ctr", 0.0)),
                 "position": float(row.get("position", 0.0)),
-            })
+            }
+            if "preliminary" in row:
+                q["preliminary"] = row["preliminary"]
+            queries.append(q)
 
-        possibly_truncated = len(queries) >= effective_row_limit
+        possibly_truncated = res["truncated"]
         result: Dict[str, Any] = {
             "ok": True,
+            "tool": tool,
             "site_url": site_url,
             "page_url": page_url,
             "days": effective_days,
@@ -3832,10 +5632,11 @@ async def gsc_get_search_by_page_query(
             "possibly_truncated": possibly_truncated,
             "truncation_hint": (
                 f"Returned {len(queries)} rows at row_limit={effective_row_limit}. "
-                f"Raise row_limit (up to 25000) to surface long-tail queries "
-                f"for this page."
+                f"Raise row_limit (up to 25000) or pass fetch_all=true to surface "
+                f"long-tail queries for this page."
             ) if possibly_truncated else "",
             "queries": queries,
+            "meta": _sa_meta(res, site_url=site_url, page_url=page_url),
         }
 
         # B.5: summary is suppressed by default when row_limit is low
@@ -3864,16 +5665,8 @@ async def gsc_get_search_by_page_query(
             }
 
         return result
-    except HttpError as e:
-        return _http_error_envelope(
-            e, tool="gsc_get_search_by_page_query", site_url=site_url
-        )
-    except Exception as e:
-        return _make_error_envelope(
-            error=f"{type(e).__name__}: {e}",
-            hint="Set GSC_MCP_TELEMETRY=1 for structured logs and retry.",
-            tool="gsc_get_search_by_page_query",
-        )
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url, response_format="json")
 
 
 # --- Aggregated landing-page tools (Adds 2 + 3) ---
@@ -3881,8 +5674,8 @@ async def gsc_get_search_by_page_query(
 @mcp.tool()
 async def gsc_get_landing_page_summary(
     site_url: str,
-    start_date: str = "90daysAgo",
-    end_date: str = "yesterday",
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     top_n: int = 25,
     striking_distance_range: Tuple[float, float] = (11.0, 20.0),
     high_impression_min: int = 500,
@@ -3890,6 +5683,8 @@ async def gsc_get_landing_page_summary(
     country: Optional[str] = None,
     device: Optional[str] = None,
     *,
+    days: int = 90,
+    data_state: str = "final",
     account_alias: Optional[str] = None,
 ) -> Any:
     """Compact top-N landing pages for a GSC property with striking-distance
@@ -3901,8 +5696,9 @@ async def gsc_get_landing_page_summary(
         site_url: GSC site URL (exact match; `sc-domain:example.com` for
             domain properties).
         start_date: Window start. Accepts 'today', 'yesterday',
-            'Ndaysago', or YYYY-MM-DD.
-        end_date: Window end, same format as start_date.
+            'Ndaysago', or YYYY-MM-DD (Pacific Time). Default: the last
+            `days` days of final data.
+        end_date: Window end, same format (default: latest final date).
         top_n: Number of landing pages (default 25).
         striking_distance_range: [min, max] position band for the
             striking-distance flag (default (11.0, 20.0)). Must be
@@ -3913,7 +5709,10 @@ async def gsc_get_landing_page_summary(
             page (default 0.5).
         country: Optional ISO-3166 country filter (e.g. 'gbr').
         device: Optional 'DESKTOP' | 'MOBILE' | 'TABLET' filter.
+        days: Window length when no dates are given (default 90).
+        data_state: final (default) | all.
     """
+    tool = "gsc_get_landing_page_summary"
     try:
         # Validate striking_distance_range up front so the error surfaces
         # before any API call. Accept tuple or list (JSON clients send arrays).
@@ -3925,55 +5724,40 @@ async def gsc_get_landing_page_summary(
             return {
                 "ok": False,
                 "error": "striking_distance_range must be a two-item array/tuple [min, max]",
-                "tool": "gsc_get_landing_page_summary",
+                "tool": tool,
             }
         if not math.isfinite(sd_lo) or not math.isfinite(sd_hi) or sd_lo > sd_hi:
             return {
                 "ok": False,
                 "error": "striking_distance_range must contain finite numbers with min <= max",
-                "tool": "gsc_get_landing_page_summary",
+                "tool": tool,
             }
 
         try:
-            resolved_start = _parse_gsc_date(start_date)
-            resolved_end = _parse_gsc_date(end_date)
+            if start_date:
+                _parse_gsc_date(start_date)
+            if end_date:
+                _parse_gsc_date(end_date)
         except ValueError as e:
-            return {"ok": False, "error": str(e), "tool": "gsc_get_landing_page_summary"}
+            return {"ok": False, "error": str(e), "tool": tool}
 
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
-            )
-        except AccountResolverError as e:
-            return e.to_envelope(tool="gsc_get_landing_page_summary")
+        filters: List[Dict[str, Any]] = []
+        if country:
+            filters.append({"dimension": "country", "operator": "equals", "expression": country})
+        if device:
+            filters.append({"dimension": "device", "operator": "equals", "expression": device.upper()})
+        groups = [{"filters": filters}] if filters else None
 
-        # Build common filter group (country + device) if needed.
-        filter_group: Optional[Dict[str, Any]] = None
-        if country or device:
-            filters: List[Dict[str, Any]] = []
-            if country:
-                filters.append({"dimension": "country", "operator": "equals", "expression": country})
-            if device:
-                filters.append({"dimension": "device", "operator": "equals", "expression": device.upper()})
-            filter_group = {"filters": filters}
-
-        # Call 1: site totals
-        totals_request: Dict[str, Any] = {
-            "startDate": resolved_start,
-            "endDate": resolved_end,
-            "dimensions": [],
-            "rowLimit": 1,
-        }
-        if filter_group:
-            totals_request["dimensionFilterGroups"] = [filter_group]
-
-        totals_response = service.searchanalytics().query(
-            siteUrl=site_url, body=totals_request
-        ).execute()
-
-        totals_rows = totals_response.get("rows", [])
-        if totals_rows:
-            t = totals_rows[0]
+        ctx = await _sa_context(site_url, account_alias)
+        w = await _resolve_window(
+            ctx, start_date=start_date, end_date=end_date, days=days, data_state=data_state,
+        )
+        totals_res = await _sa_run(
+            ctx, dimensions=[], window=w, filter_groups=groups, data_state=data_state,
+            row_limit=1, step=f"{tool}.totals",
+        )
+        if totals_res["rows"]:
+            t = totals_res["rows"][0]
             site_totals = {
                 "clicks": int(t.get("clicks", 0)),
                 "impressions": int(t.get("impressions", 0)),
@@ -3985,32 +5769,21 @@ async def gsc_get_landing_page_summary(
 
         site_avg_ctr = site_totals["ctr"]
 
-        # Call 2: top-N landing pages by clicks
-        pages_request: Dict[str, Any] = {
-            "startDate": resolved_start,
-            "endDate": resolved_end,
-            "dimensions": ["page"],
-            "rowLimit": max(1, min(top_n, 25000)),
-            "orderBy": [{"metric": "CLICK_COUNT", "direction": "descending"}],
-        }
-        if filter_group:
-            pages_request["dimensionFilterGroups"] = [filter_group]
-
-        pages_response = service.searchanalytics().query(
-            siteUrl=site_url, body=pages_request
-        ).execute()
+        # Top-N landing pages by clicks (the API's own order).
+        pages_res = await _sa_run(
+            ctx, dimensions=["page"], window=w, filter_groups=groups, data_state=data_state,
+            row_limit=max(1, min(top_n, 25000)), step=f"{tool}.pages",
+        )
 
         top_pages: List[Dict[str, Any]] = []
-        for row in pages_response.get("rows", []):
-            keys = row.get("keys", [])
-            page = keys[0] if keys else ""
+        for row in pages_res["rows"]:
             clicks = int(row.get("clicks", 0))
             impressions = int(row.get("impressions", 0))
             ctr = float(row.get("ctr", 0.0))
             position = float(row.get("position", 0.0))
             low_ctr_threshold = site_avg_ctr * low_ctr_ratio if site_avg_ctr > 0 else 0.0
             top_pages.append({
-                "page": page,
+                "page": row.get("page", ""),
                 "clicks": clicks,
                 "impressions": impressions,
                 "ctr": ctr,
@@ -4025,10 +5798,10 @@ async def gsc_get_landing_page_summary(
 
         return {
             "ok": True,
-            "tool": "gsc_get_landing_page_summary",
+            "tool": tool,
             "site_url": site_url,
-            "start_date": resolved_start,
-            "end_date": resolved_end,
+            "start_date": w["start_date"],
+            "end_date": w["end_date"],
             "site_totals": site_totals,
             "top_pages": top_pages,
             "thresholds": {
@@ -4038,40 +5811,38 @@ async def gsc_get_landing_page_summary(
                 "site_avg_ctr": site_avg_ctr,
             },
             "filters": {"country": country, "device": device},
-            "meta": {"site_url": site_url},
+            "meta": _sa_meta(pages_res, site_url=site_url),
         }
-    except HttpError as e:
-        return _http_error_envelope(
-            e, tool="gsc_get_landing_page_summary", site_url=site_url
-        )
-    except Exception as e:
-        return _make_error_envelope(
-            error=f"{type(e).__name__}: {e}",
-            hint="Check the date range and filter args; "
-                 "set GSC_MCP_TELEMETRY=1 for structured logs.",
-            tool="gsc_get_landing_page_summary",
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(
+            e, tool=tool, site_url=site_url,
+            generic_hint="Check the date range and filter args; set GSC_MCP_TELEMETRY=1 for structured logs.",
         )
 
 
 @mcp.tool()
 async def gsc_compare_periods_landing_pages(
     site_url: str,
-    period_a_start: str,
-    period_a_end: str,
-    period_b_start: str,
-    period_b_end: str,
+    period_a_start: Optional[str] = None,
+    period_a_end: Optional[str] = None,
+    period_b_start: Optional[str] = None,
+    period_b_end: Optional[str] = None,
     min_impressions: int = 100,
     limit: int = 50,
     decay_threshold_pct: float = -0.20,
     sort_by: str = "clicks_delta",
     sort_direction: str = "asc",
     *,
+    days: Optional[int] = None,
+    data_state: str = "final",
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
     account_alias: Optional[str] = None,
 ) -> Any:
     """Landing-page period-vs-period diff with decay_flag for content-rot
-    detection. 2 API calls (one per period), join on page URL, sort
-    by a chosen delta column. Use `sort_by='clicks_delta'` +
-    `sort_direction='asc'` for decayers (default); `desc` for risers.
+    detection. Fetches every page row for each period (one call per 25k
+    rows), joins on page URL, sorts by a chosen delta column (B − A). Use
+    `sort_by='clicks_delta'` + `sort_direction='asc'` for decayers
+    (default); `desc` for risers.
 
     Args:
         site_url: GSC site URL.
@@ -4087,22 +5858,28 @@ async def gsc_compare_periods_landing_pages(
         sort_by: `clicks_delta`, `clicks_pct`, `impressions_delta`,
             `impressions_pct`, `position_delta`, or `ctr_delta`.
         sort_direction: 'asc' or 'desc' (case-insensitive).
+        days: Instead of dates: B = the last N days of final data, A = the
+            N days before it (equal length, both final).
+        data_state: final (default) | all.
+        max_rows: Per-period page-row cap (default 100000). A page missing
+            from a capped period is reported with null metrics, not 0.
     """
+    tool = "gsc_compare_periods_landing_pages"
     try:
         if limit < 1:
-            return {
-                "ok": False,
-                "error": "limit must be >= 1",
-                "tool": "gsc_compare_periods_landing_pages",
-            }
+            return {"ok": False, "error": "limit must be >= 1", "tool": tool}
 
+        explicit = [period_a_start, period_a_end, period_b_start, period_b_end]
         try:
-            a_start = _parse_gsc_date(period_a_start)
-            a_end = _parse_gsc_date(period_a_end)
-            b_start = _parse_gsc_date(period_b_start)
-            b_end = _parse_gsc_date(period_b_end)
-        except ValueError as e:
-            return {"ok": False, "error": str(e), "tool": "gsc_compare_periods_landing_pages"}
+            use_days = _comparison_mode(explicit, days)
+        except _SaValidationError as e:
+            return {"ok": False, "error": str(e), "tool": tool}
+        if not use_days:
+            try:
+                for d in explicit:
+                    _parse_gsc_date(d)
+            except ValueError as e:
+                return {"ok": False, "error": str(e), "tool": tool}
 
         valid_sort_keys = {
             "clicks_delta", "clicks_pct",
@@ -4113,7 +5890,7 @@ async def gsc_compare_periods_landing_pages(
             return {
                 "ok": False,
                 "error": f"invalid sort_by: {sort_by!r}. Valid: {sorted(valid_sort_keys)}",
-                "tool": "gsc_compare_periods_landing_pages",
+                "tool": tool,
             }
 
         direction_normalized = str(sort_direction).strip().lower()
@@ -4121,45 +5898,40 @@ async def gsc_compare_periods_landing_pages(
             return {
                 "ok": False,
                 "error": "sort_direction must be 'asc' or 'desc'",
-                "tool": "gsc_compare_periods_landing_pages",
+                "tool": tool,
             }
 
-        try:
-            _resolved_alias, service = await get_gsc_service_for_site(
-                site_url, account_alias,
-            )
-        except AccountResolverError as e:
-            return e.to_envelope(tool="gsc_compare_periods_landing_pages")
-
-        def _query(start: str, end: str) -> List[Dict[str, Any]]:
-            req = {
-                "startDate": start,
-                "endDate": end,
-                "dimensions": ["page"],
-                "rowLimit": 25000,
-            }
-            resp = service.searchanalytics().query(siteUrl=site_url, body=req).execute()
-            return resp.get("rows", [])
+        ctx = await _sa_context(site_url, account_alias)
+        if use_days:
+            wa, wb = await _resolve_comparison_windows(ctx, days=days, data_state=data_state)
+        else:
+            wa = await _resolve_window(ctx, start_date=period_a_start, end_date=period_a_end, data_state=data_state)
+            wb = await _resolve_window(ctx, start_date=period_b_start, end_date=period_b_end, data_state=data_state)
+        a_start, a_end, b_start, b_end = wa["start_date"], wa["end_date"], wb["start_date"], wb["end_date"]
 
         async with _instrument(
-            "gsc_compare_periods_landing_pages",
-            site_url=site_url,
-            period_a=f"{a_start}..{a_end}",
-            period_b=f"{b_start}..{b_end}",
+            tool, site_url=site_url, period_a=f"{a_start}..{a_end}", period_b=f"{b_start}..{b_end}",
         ):
-            a_rows = _query(a_start, a_end)
-            b_rows = _query(b_start, b_end)
+            a_res = await _sa_run(
+                ctx, dimensions=["page"], window=wa, data_state=data_state, fetch_all=True,
+                max_rows=max_rows, step=f"{tool}.period_a",
+            )
+            b_res = await _sa_run(
+                ctx, dimensions=["page"], window=wb, data_state=data_state, fetch_all=True,
+                max_rows=max_rows, step=f"{tool}.period_b",
+            )
+        a_rows, b_rows = a_res["rows"], b_res["rows"]
+        a_complete, b_complete = a_res["complete"], b_res["complete"]
 
-        # Index by page URL (single-dim 'keys' tuple). Reuses the pattern from
-        # gsc_compare_search_periods at gsc_server.py:1155-1156.
-        a_by_page = {tuple(r.get("keys", [])): r for r in a_rows}
-        b_by_page = {tuple(r.get("keys", [])): r for r in b_rows}
+        a_by_page = {r.get("page", ""): r for r in a_rows}
+        b_by_page = {r.get("page", ""): r for r in b_rows}
         all_pages = set(a_by_page.keys()) | set(b_by_page.keys())
 
-        def _metric(row: Optional[Dict[str, Any]], key: str, default: float = 0.0) -> float:
+        def _metric(row: Optional[Dict[str, Any]], key: str, complete: bool) -> Optional[float]:
+            # Absent from a complete fetch = 0; absent from a capped one = unknown.
             if row is None:
-                return default
-            return float(row.get(key, default))
+                return 0.0 if complete else None
+            return float(row.get(key, 0.0))
 
         # NOTE: This duplicates the inline aggregation in gsc_get_search_by_page_query.
         # If extracted to a module-level helper, add regression coverage for both call sites.
@@ -4177,40 +5949,48 @@ async def gsc_compare_periods_landing_pages(
                 position = 0.0
             return {"clicks": clicks, "impressions": impressions, "ctr": ctr, "position": position}
 
+        def _sub(b: Optional[float], a: Optional[float]) -> Optional[float]:
+            return None if a is None or b is None else b - a
+
         diffs: List[Dict[str, Any]] = []
-        for page_key in all_pages:
-            a_row = a_by_page.get(page_key)
-            b_row = b_by_page.get(page_key)
-            a_impr = int(_metric(a_row, "impressions"))
-            b_impr = int(_metric(b_row, "impressions"))
+        for page in all_pages:
+            a_row = a_by_page.get(page)
+            b_row = b_by_page.get(page)
+            a_impr_f = _metric(a_row, "impressions", a_complete)
+            b_impr_f = _metric(b_row, "impressions", b_complete)
 
             # OR semantics on min_impressions: keep rows where either period clears the bar.
-            if a_impr < min_impressions and b_impr < min_impressions:
+            if (a_impr_f or 0) < min_impressions and (b_impr_f or 0) < min_impressions:
                 continue
 
-            a_clicks = int(_metric(a_row, "clicks"))
-            b_clicks = int(_metric(b_row, "clicks"))
-            a_ctr = _metric(a_row, "ctr")
-            b_ctr = _metric(b_row, "ctr")
-            a_pos = _metric(a_row, "position")
-            b_pos = _metric(b_row, "position")
+            a_impr = int(a_impr_f) if a_impr_f is not None else None
+            b_impr = int(b_impr_f) if b_impr_f is not None else None
+            a_clicks_f = _metric(a_row, "clicks", a_complete)
+            b_clicks_f = _metric(b_row, "clicks", b_complete)
+            a_clicks = int(a_clicks_f) if a_clicks_f is not None else None
+            b_clicks = int(b_clicks_f) if b_clicks_f is not None else None
+            a_ctr = _metric(a_row, "ctr", a_complete)
+            b_ctr = _metric(b_row, "ctr", b_complete)
+            a_pos = _metric(a_row, "position", a_complete)
+            b_pos = _metric(b_row, "position", b_complete)
 
-            clicks_delta = b_clicks - a_clicks
-            impressions_delta = b_impr - a_impr
-            ctr_delta = b_ctr - a_ctr
-            position_delta = b_pos - a_pos  # positive = worse (further down)
+            clicks_delta = _sub(b_clicks, a_clicks)
+            impressions_delta = _sub(b_impr, a_impr)
+            ctr_delta = _sub(b_ctr, a_ctr)
+            position_delta = _sub(b_pos, a_pos)  # positive = worse (further down)
 
-            clicks_pct = (clicks_delta / a_clicks) if a_clicks > 0 else None
-            impressions_pct = (impressions_delta / a_impr) if a_impr > 0 else None
+            clicks_pct = (clicks_delta / a_clicks) if (clicks_delta is not None and a_clicks) else None
+            impressions_pct = (impressions_delta / a_impr) if (impressions_delta is not None and a_impr) else None
 
             decay_flag = (
                 clicks_pct is not None
                 and clicks_pct < decay_threshold_pct
+                and position_delta is not None
                 and position_delta > 0
             )
 
-            diffs.append({
-                "page": page_key[0] if page_key else "",
+            diff = {
+                "page": page,
                 "a_clicks": a_clicks,
                 "b_clicks": b_clicks,
                 "clicks_delta": clicks_delta,
@@ -4226,17 +6006,21 @@ async def gsc_compare_periods_landing_pages(
                 "b_position": b_pos,
                 "position_delta": position_delta,
                 "decay_flag": decay_flag,
-            })
+            }
+            if a_clicks is None or b_clicks is None:
+                diff["absent_reason"] = "beyond_row_limit"
+            diffs.append(diff)
 
         # Sort with None-safe helper: None values for the sort column always
         # appear LAST regardless of direction (the naive (group, value) key
         # gets flipped by reverse=True and puts None rows at the front).
+        diffs.sort(key=lambda r: r["page"])
         diffs = _sort_landing_page_diffs(diffs, sort_by, direction_normalized)
         sliced = diffs[:limit]
 
         return {
             "ok": True,
-            "tool": "gsc_compare_periods_landing_pages",
+            "tool": tool,
             "site_url": site_url,
             "period_a": {"start": a_start, "end": a_end, "totals": _period_totals(a_rows)},
             "period_b": {"start": b_start, "end": b_end, "totals": _period_totals(b_rows)},
@@ -4248,18 +6032,29 @@ async def gsc_compare_periods_landing_pages(
             "sort": {"by": sort_by, "direction": direction_normalized},
             "total_matched": len(diffs),
             "truncated": len(diffs) > limit,
-            "meta": {"site_url": site_url},
+            "meta": _standard_meta(
+                None,
+                site_url=site_url,
+                period_a=_window_meta(wa),
+                period_b=_window_meta(wb),
+                coverage={
+                    "a": "complete" if a_complete else "truncated",
+                    "b": "complete" if b_complete else "truncated",
+                },
+                data_state=data_state,
+                latest_final_date=wb["latest_final_date"],
+                timezone=_PT_LABEL,
+                row_count=len(sliced),
+                truncated=len(diffs) > limit,
+                warnings=list(wa["warnings"]) + list(wb["warnings"])
+                + (["days ignored: explicit period dates were given."] if days is not None and not use_days else []),
+            ),
         }
-    except HttpError as e:
-        return _http_error_envelope(
-            e, tool="gsc_compare_periods_landing_pages", site_url=site_url
-        )
-    except Exception as e:
-        return _make_error_envelope(
-            error=f"{type(e).__name__}: {e}",
-            hint="Check date args and sort_by / sort_direction values; "
-                 "set GSC_MCP_TELEMETRY=1 for structured logs.",
-            tool="gsc_compare_periods_landing_pages",
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(
+            e, tool=tool, site_url=site_url,
+            generic_hint="Check date args and sort_by / sort_direction values; "
+                         "set GSC_MCP_TELEMETRY=1 for structured logs.",
         )
 
 
@@ -4294,12 +6089,18 @@ async def gsc_list_sitemaps_enhanced(
             )
 
         if sitemap_index:
-            sitemaps = service.sitemaps().list(
-                siteUrl=site_url, sitemapIndex=sitemap_index
-            ).execute()
+            sitemaps = await _gsc_execute(
+                lambda: service.sitemaps().list(
+                    siteUrl=site_url, sitemapIndex=sitemap_index
+                ).execute(),
+                step="sitemaps.list",
+            )
             source = f"child sitemaps from index: {sitemap_index}"
         else:
-            sitemaps = service.sitemaps().list(siteUrl=site_url).execute()
+            sitemaps = await _gsc_execute(
+                lambda: service.sitemaps().list(siteUrl=site_url).execute(),
+                step="sitemaps.list",
+            )
             source = "all submitted sitemaps"
 
         raw = sitemaps.get("sitemap") or []
@@ -4425,7 +6226,7 @@ async def gsc_get_sitemap_details(
             def _do(svc):
                 return svc.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
             _resolved, _service, details = await _call_with_stale_retry(
-                site_url=site_url, account_alias=account_alias, api_call=_do,
+                site_url=site_url, account_alias=account_alias, api_call=_do, step="sitemaps.get",
             )
         except AccountResolverError as e:
             return _format_error(
@@ -4521,11 +6322,17 @@ async def gsc_submit_sitemap(
             )
 
         # Submit the sitemap
-        service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute()
+        await _gsc_execute(
+            lambda: service.sitemaps().submit(siteUrl=site_url, feedpath=sitemap_url).execute(),
+            step="sitemaps.submit",
+        )
         
         # Verify submission by getting details
         try:
-            details = service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+            details = await _gsc_execute(
+                lambda: service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute(),
+                step="sitemaps.get",
+            )
             
             # Format response
             result_lines = [f"Successfully submitted sitemap: {sitemap_url}"]
@@ -4599,7 +6406,10 @@ async def gsc_delete_sitemap(
         # error envelope (matches gsc_delete_site's 404 semantics from the
         # site-CRUD B.4 rollout).
         try:
-            service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute()
+            await _gsc_execute(
+                lambda: service.sitemaps().get(siteUrl=site_url, feedpath=sitemap_url).execute(),
+                step="sitemaps.get",
+            )
         except HttpError as e:
             if getattr(e.resp, "status", None) == 404:
                 return f"Sitemap not found: {sitemap_url}. It may have already been deleted or was never submitted."
@@ -4611,7 +6421,10 @@ async def gsc_delete_sitemap(
                 return f"Sitemap not found: {sitemap_url}. It may have already been deleted or was never submitted."
             raise
 
-        service.sitemaps().delete(siteUrl=site_url, feedpath=sitemap_url).execute()
+        await _gsc_execute(
+            lambda: service.sitemaps().delete(siteUrl=site_url, feedpath=sitemap_url).execute(),
+            step="sitemaps.delete",
+        )
         return (
             f"Successfully deleted sitemap: {sitemap_url}\n\n"
             "Note: This only removes the sitemap from Search Console. Any URLs "
@@ -5007,8 +6820,7 @@ async def gsc_add_account(alias: str) -> str:
             )
 
         # Save token
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
+        _write_token_file(token_path, creds.to_json())
 
         # Detect email. _detect_email does a sync urllib GET against
         # tokeninfo (10s timeout); offload to a thread so we don't
@@ -5170,6 +6982,64 @@ async def gsc_remove_account(alias: str) -> str:
 
 # --- Health check (Add 4) ---
 
+# §0 of the 2026-09-28 change request: things the API cannot do, stated
+# plainly so nobody builds for them.
+_API_LIMITS = {
+    "generative_ai_features": "UI only (AI Overview / AI Mode). Not an API type, not a searchAppearance "
+                              "value, not in bulk export. Import a UI export instead; unknown_values "
+                              "flags new API values when support appears.",
+    "request_indexing": "Not possible for normal pages (the Indexing API covers only JobPosting and "
+                        "BroadcastEvent). Submit in the Search Console UI; resubmit sitemaps.",
+    "branded_filter": "UI only; there is no brand dimension. Use includingRegex/excludingRegex on query.",
+    "all_queries": "The API returns top rows only and excludes anonymised queries; see "
+                   "meta.unattributed_share on query-grouped responses.",
+}
+
+# Search appearance API values, from Search Console Help 17011259
+# ("Performance report (Search results): Dimensions and data groupings"),
+# read 2026-09-28. A value outside this set is reported in unknown_values.
+_KNOWN_SEARCH_APPEARANCES = frozenset({
+    "AMP_TOP_STORIES", "AMP_BLUE_LINK", "AMP_IMAGE_RESULT", "FORUMS", "EDU_Q_AND_A",
+    "JOB_DETAILS", "JOB_LISTING", "MATH_SOLVERS", "ACTION", "MERCHANT_LISTINGS",
+    "PRACTICE_PROBLEMS", "PRODUCT_SNIPPETS", "TPF_QA", "RECIPE_FEATURE",
+    "RECIPE_RICH_SNIPPET", "REVIEW_SNIPPET", "SUBSCRIBED_CONTENT", "TRANSLATED_RESULT",
+    "VIDEO", "AMP_STORY",
+})
+
+# Enums of searchanalytics.query as this server knows them (live reference,
+# last updated 2026-08-11). The live discovery doc is diffed against these.
+_KNOWN_DISCOVERY_ENUMS: Dict[str, set] = {
+    "type": {"WEB", "IMAGE", "VIDEO", "NEWS", "DISCOVER", "GOOGLE_NEWS"},
+    "dataState": {"DATA_STATE_UNSPECIFIED", "FINAL", "ALL", "HOURLY_ALL"},
+    "aggregationType": {"AUTO", "BY_PROPERTY", "BY_PAGE", "BY_NEWS_SHOWCASE_PANEL"},
+    "filterDimension": {"QUERY", "PAGE", "COUNTRY", "DEVICE", "SEARCH_APPEARANCE"},
+}
+_DISCOVERY_URL = "https://searchconsole.googleapis.com/$discovery/rest?version=v1"
+_DISCOVERY_TTL_SEC = 24 * 3600
+_discovery_cache: Dict[str, Any] = {}
+
+
+def _live_discovery_enums() -> Dict[str, List[str]]:
+    """Fetch (daily) the live discovery doc and pull the enums above."""
+    hit = _discovery_cache.get("enums")
+    if hit and time.time() - hit[0] < _DISCOVERY_TTL_SEC:
+        return hit[1]
+    import urllib.request
+    with urllib.request.urlopen(_DISCOVERY_URL, timeout=10) as resp:
+        doc = json.loads(resp.read().decode("utf-8"))
+    schemas = doc.get("schemas", {})
+    req = schemas.get("SearchAnalyticsQueryRequest", {}).get("properties", {})
+    filt = schemas.get("ApiDimensionFilter", {}).get("properties", {})
+    enums = {
+        "type": req.get("type", {}).get("enum", []),
+        "dataState": req.get("dataState", {}).get("enum", []),
+        "aggregationType": req.get("aggregationType", {}).get("enum", []),
+        "filterDimension": filt.get("dimension", {}).get("enum", []),
+    }
+    _discovery_cache["enums"] = (time.time(), enums)
+    return enums
+
+
 @mcp.tool()
 async def gsc_health_check(
     site_url: str,
@@ -5179,7 +7049,13 @@ async def gsc_health_check(
     """
     One-shot diagnostic for a GSC property. Used at the start of every audit.
 
-    Makes up to three API calls, each wrapped independently so one failure
+    Reports permission/verification, recent data, sitemaps, and (v1.4.0)
+    server_version, latest_final_date, per-account auth status, the
+    inspection quota estimate, `unknown_values` (search appearances or API
+    enum values this server doesn't know — the early warning for
+    AI-features API support) and `api_limits` (what the API cannot do).
+
+    Each probe is wrapped independently so one failure
     doesn't poison the rest. Manual actions and security issues are NOT
     exposed by the Search Console API v1 (confirmed — the discovery doc
     only surfaces sites/sitemaps/searchanalytics/urlInspection), so those
@@ -5234,7 +7110,9 @@ async def gsc_health_check(
 
     # Step 1: sites().get() for permission + verification
     try:
-        site_info = service.sites().get(siteUrl=site_url).execute()
+        site_info = await _gsc_execute(
+            lambda: service.sites().get(siteUrl=site_url).execute(), step="sites.get",
+        )
         result["permission_level"] = site_info.get("permissionLevel")
         verify = site_info.get("siteVerificationInfo", {})
         result["verification_state"] = verify.get("verificationState")
@@ -5253,7 +7131,7 @@ async def gsc_health_check(
     # Step 2: searchanalytics().query() — find the latest date with data via a
     # 7-day window. Default (ascending) order is fine; we pick the max date.
     try:
-        today = datetime.now().date()
+        today = _today_pt()
         week_ago = today - timedelta(days=7)
         data_request = {
             "startDate": week_ago.strftime("%Y-%m-%d"),
@@ -5261,9 +7139,10 @@ async def gsc_health_check(
             "dimensions": ["date"],
             "rowLimit": 7,
         }
-        data_response = service.searchanalytics().query(
-            siteUrl=site_url, body=data_request
-        ).execute()
+        data_response = await _gsc_execute(
+            lambda: service.searchanalytics().query(siteUrl=site_url, body=data_request).execute(),
+            step="searchanalytics.query",
+        )
         rows = data_response.get("rows", [])
         # Filter out rows with missing/empty keys so the max() below can't
         # silently pick an empty string if the API ever returns junk.
@@ -5292,7 +7171,9 @@ async def gsc_health_check(
 
     # Step 3: sitemaps().list() — count + error/warning totals
     try:
-        sitemaps_response = service.sitemaps().list(siteUrl=site_url).execute()
+        sitemaps_response = await _gsc_execute(
+            lambda: service.sitemaps().list(siteUrl=site_url).execute(), step="sitemaps.list",
+        )
         sitemaps = sitemaps_response.get("sitemap", [])
         with_errors = sum(1 for s in sitemaps if int(s.get("errors", 0)) > 0)
         with_warnings = sum(1 for s in sitemaps if int(s.get("warnings", 0)) > 0)
@@ -5312,6 +7193,71 @@ async def gsc_health_check(
             "step": "sitemaps.list",
             "error": f"{type(e).__name__}: {e}",
         })
+
+    # v1.4.0 additions. Each is independent and never fails the check.
+    result["server_version"] = _SERVER_VERSION
+    result["api_limits"] = _API_LIMITS
+
+    # Data freshness (dataState=all probe; cached for an hour).
+    ctx = _SaContext(site_url, account_alias, _resolved_alias, service)
+    try:
+        freshness = await _latest_final_date(ctx)
+        result["latest_final_date"] = freshness["date"]
+        result["latest_final_date_source"] = freshness["source"]
+        result["timezone"] = _PT_LABEL
+    except Exception as e:  # noqa: BLE001
+        result["partial_failures"].append({"step": "freshness_probe", "error": f"{type(e).__name__}: {e}"})
+
+    # Per-account auth status (non-interactive; never opens a browser).
+    accounts: List[Dict[str, Any]] = []
+    for alias in _list_configured_aliases():
+        svc, err = await asyncio.to_thread(_build_service_noninteractive, alias)
+        accounts.append({"alias": alias, "auth_ok": svc is not None, "error_code": err})
+    result["accounts"] = accounts
+
+    try:
+        result["inspection_quota"] = await asyncio.to_thread(_inspection_quota, site_url)
+    except Exception as e:  # noqa: BLE001
+        result["partial_failures"].append({"step": "inspection_quota", "error": f"{type(e).__name__}: {e}"})
+
+    # Early warning for new API values (e.g. AI-features support): search
+    # appearances seen in the last 28 days, and the live discovery doc's
+    # enums, each diffed against what this server knows.
+    unknown: Dict[str, Any] = {}
+    try:
+        today = _today_pt()
+        appearance = await _gsc_execute(
+            lambda: service.searchanalytics().query(siteUrl=site_url, body={
+                "startDate": (today - timedelta(days=28)).isoformat(),
+                "endDate": today.isoformat(),
+                "dimensions": ["searchAppearance"],
+                "rowLimit": 100,
+            }).execute(),
+            step="searchappearance_probe",
+        )
+        seen = sorted({(r.get("keys") or [""])[0] for r in appearance.get("rows", []) or []} - {""})
+        result["search_appearances_seen"] = seen
+        unknown["searchAppearance"] = [v for v in seen if v not in _KNOWN_SEARCH_APPEARANCES]
+    except Exception as e:  # noqa: BLE001
+        result["partial_failures"].append({"step": "searchappearance_probe", "error": f"{type(e).__name__}: {e}"})
+    try:
+        enums = await asyncio.to_thread(_live_discovery_enums)
+        for field, values in enums.items():
+            extra = sorted(set(values) - _KNOWN_DISCOVERY_ENUMS.get(field, set()))
+            if extra:
+                unknown[field] = extra
+    except Exception as e:  # noqa: BLE001
+        result["partial_failures"].append({"step": "discovery_doc", "error": f"{type(e).__name__}: {e}"})
+    result["unknown_values"] = {k: v for k, v in unknown.items() if v}
+    ai_like = [
+        v for vals in result["unknown_values"].values() for v in vals
+        if re.search(r"AI|OVERVIEW|GENERATIVE|GEMINI", v, re.IGNORECASE)
+    ]
+    if ai_like:
+        result["ai_features_signal"] = (
+            f"New API values that look AI-related: {ai_like}. The Generative AI features "
+            f"report may now be reachable through the API."
+        )
 
     if not any_probe_succeeded:
         result["ok"] = False

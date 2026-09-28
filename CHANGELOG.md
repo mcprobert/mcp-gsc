@@ -5,6 +5,135 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.4.0] — 2026-09-28 — full Search Analytics coverage, honest windows, inspection that finishes
+
+### Added
+
+- **`gsc_query`** — raw `searchanalytics.query` passthrough with every API
+  parameter, validated: all seven dimensions (incl. `hour`,
+  `searchAppearance`), `type` (incl. `googleNews`), several AND filters with
+  all six operators (incl. `includingRegex` / `excludingRegex`, RE2 — so
+  `\bsage\b` no longer matches "message"), `aggregation_type`,
+  `data_state` (`final` / `all` / `hourly_all`), `fetch_all` pagination (25k
+  per call, `max_rows` cap, default 100k), client-side `sort_by`, and
+  `save_to_file`. Explicit dates are required. Documented invalid
+  combinations (byProperty with page, byProperty for Discover/Google News,
+  byNewsShowcasePanel rules, `hour` without `hourly_all`, RE2 lookarounds)
+  are rejected up front as `BAD_REQUEST`.
+- **Freshness in every analytics response.** `meta` now carries
+  `start_date`, `end_date`, `window_days`, `data_state`,
+  `latest_final_date` (+ `latest_final_date_source`), `non_final_days`,
+  `timezone` (Pacific Time, the API convention), `aggregation_type` as
+  returned, `row_count`, `truncated`, `warnings` and `server_version`. The
+  latest final date comes from a `dataState=all` probe
+  (`first_incomplete_date − 1`), cached for an hour. With `data_state=all`,
+  rows on or after `first_incomplete_date` carry `preliminary: true`.
+- **Totals honesty.** Any response grouped by `query` makes one extra
+  query-less call (same window, filters and aggregation) and reports
+  `meta.page_total`, `meta.query_rows_sum` and `meta.unattributed_share`
+  (raw ratios; `null` on a zero denominator; a warning, not a clamp, when
+  outside [0, 1]). The page-query markdown shows it under the TOTAL row.
+- **`gsc_inspect_start` / `gsc_inspect_status`** — async URL-inspection jobs
+  with no URL cap: `start` returns a `job_id` at once, `status` returns
+  progress and partial results, so a client timeout never kills a batch.
+  Bounded concurrency (default 4, max 8), one HTTP client per worker. Every
+  result carries verdict, coverage, indexing/robots/fetch states,
+  `last_crawl_time`, `crawled_as`, Google vs user canonical with
+  `canonical_mismatch`, `sitemaps`, `referring_urls` and rich results.
+- **Inspection cache and quota ledger** in `$GSC_STATE_DIR/gsc-state.sqlite`
+  (rollback journal; 0666 when the state dir is world-writable). Results are
+  cached per URL for 6 hours (`force=true` bypasses; all inspection tools
+  share it). Every outbound attempt, retries included, first reserves a unit
+  against Google's published per-property limits (2,000/day, 600/minute;
+  overridable with `GSC_INSPECTION_DAILY_LIMIT` / `GSC_INSPECTION_MINUTE_LIMIT`)
+  in one `BEGIN IMMEDIATE` transaction, so racing processes cannot overspend.
+  A spent minute is waited out; a spent day stops cleanly with
+  `QUOTA_EXHAUSTED`, keeping partial results.
+- **Health check** now also reports `server_version`, `latest_final_date`,
+  per-account auth status, the inspection quota estimate, `api_limits` (what
+  the API cannot do: AI-features data, request indexing, brand filter, all
+  queries) and `unknown_values` — search appearances seen in the last 28 days
+  and live discovery-doc enums this server doesn't know, with an
+  `ai_features_signal` when a new value looks AI-related.
+- **Retries.** Every Google call now goes through one executor that runs off
+  the event loop and retries 429, 5xx, timeouts and connection resets with
+  jittered exponential backoff (4 attempts). It honours `Retry-After` up to
+  10 s and hands longer waits back in `retry_after` rather than sleeping
+  through a client's timeout. A spent daily quota and caller errors are never
+  retried.
+- **Error envelopes** name the failing `step` and `attempts`, plus Google's
+  `http_status` and `google_reason`. New codes: `QUOTA_EXHAUSTED` (daily
+  quota; `retry_after` = seconds to PT midnight; not retryable), `TIMEOUT`
+  (retryable), `JOB_NOT_FOUND`. 502/504 map to `SERVICE_UNAVAILABLE`.
+- `save_to_file` (absolute `.csv` / `.json`, symlink-safe, atomic) on
+  `gsc_query`, `gsc_get_search_analytics` and
+  `gsc_get_advanced_search_analytics`: writes every row, returns row count,
+  totals and the first 20 rows.
+- New keyword-only parameters: `start_date` / `end_date` / `data_state` on
+  every `days=` tool; `days` on both comparison tools; `filter_groups`,
+  `aggregation_type`, `fetch_all`, `max_rows` on the advanced tool;
+  `sort_by` / `fetch_all` on the page-query tool; `force` on the three
+  inspection tools. Positional signatures are unchanged.
+
+### Changed — behaviour (read before relying on `days=`)
+
+- **`days=N` means the last N days of final data**, inclusive, ending on
+  `latest_final_date` in Pacific Time — the window the GSC UI shows. It used
+  to be N+1 days ending on the server's local "today", so the last 2–3 days
+  were always empty. With `data_state=all` the window ends today PT and
+  `meta.non_final_days` lists the preliminary days. Ad-hoc `days=N` figures
+  shift slightly; explicit-date calls are unaffected. `'today'`,
+  `'yesterday'` and `'Ndaysago'` resolve in Pacific Time too.
+- **Comparison tools with `days=N`** compare the last N final days with the
+  N days before them (equal length, both final); the earlier window keeps its
+  existing role (`period1` / `period_a`), so delta signs are unchanged. A row
+  missing from a period whose fetch hit its row cap is `null` with
+  `absent_reason: "beyond_row_limit"`, not 0; `meta.coverage` says which side
+  was truncated. `gsc_compare_periods_landing_pages` now pages through every
+  page row (up to `max_rows`) instead of one 25k call.
+- The landing-page summary defaults to the last 90 days of final data
+  (was `90daysAgo` → `yesterday`).
+- **CSV cells are raw values** (ratios as ratios, floats unrounded), and the
+  formula-injection guard applies to string cells only, so `-0.53` is a
+  number again. Markdown keeps its formatting. CSV gains a `# meta: {json}`
+  line and markdown a footer with the unattributed share and any warnings.
+- `gsc_get_search_by_page_query` markdown gains a `Window:` line and the
+  page-total / unattributed-share lines (also when no query rows come back,
+  i.e. every query is anonymised); JSON gains `tool` and `meta`.
+- An empty result in `json` mode is now an empty table with `meta` (it was
+  a plain "No data" string). Markdown and CSV keep the message.
+- Comparison tools report `page_total` / `unattributed_share` per period
+  (`meta.period1.totals`, `meta.period2.totals`). When all four explicit
+  dates are given they win over `days` (with a warning); a partial set of
+  dates is rejected as ambiguous.
+- `save_to_file` fetches and writes the full result (every page up to
+  `max_rows`), not just the displayed rows; `meta.saved_truncated` says
+  whether even that hit the cap.
+- The fixed-size inspection tools inspect concurrently and share the cache;
+  a quota error now fails the call instead of being buried in one row.
+  `gsc_check_indexing_issues` recognises the API's `DISALLOWED` robots state
+  (it only matched a non-existent `BLOCKED`).
+- `type` replaces the deprecated `searchType` request field.
+- OAuth token writes are atomic and keep the file's existing mode (a new
+  file is 0666 in a world-writable state dir, else 0600).
+
+### Fixed
+
+- **`sort_by` was ignored.** It was sent as `orderBy`, a field the API does
+  not have, so rows came back in clicks order (ties at 0 clicks looked
+  alphabetical) while the header claimed otherwise. Sorting is now
+  client-side over the full result.
+- Six of the seven analytics tools, the fixed-size inspection tools, the
+  sitemap tools and the health check made blocking calls on the event loop.
+  None do now.
+
+### Tests
+
+- 509 passing (84 new: engine, windows, freshness, totals, sorting,
+  pagination, retries, envelopes, token writes, ledger races, cache,
+  async jobs, health check). The eval-harness tests still need the
+  `anthropic` package.
+
 ## [1.3.1] — 2026-09-03 — project-scope config no longer shadows user scope
 
 ### Fixed
