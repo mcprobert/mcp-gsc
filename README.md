@@ -2,6 +2,8 @@
 
 A tool that connects [Google Search Console](https://search.google.com/search-console/about) (GSC) with Claude AI, allowing you to analyze your SEO data through natural language conversations. This integration gives you access to property information, search analytics, URL inspection, and sitemap management—all through simple chat with Claude.
 
+**Current version: 1.6.1** (42 tools). What changed and why is in [CHANGELOG.md](CHANGELOG.md); agents should read ["Read this first"](#read-this-first-notes-for-agents) below before quoting any number.
+
 ---
 
 ## What Can This Tool Do For SEO Professionals?
@@ -17,12 +19,25 @@ A tool that connects [Google Search Console](https://search.google.com/search-co
    - Track impressions, clicks, and click-through rates
    - Analyze performance trends over time
    - Compare different time periods to spot changes
+   - Every Search Analytics option via `gsc_query`: regex and multiple
+     filters, search appearance, fresh and hourly data, News/Discover,
+     paging through every row, save to file
+   - Honest numbers: exact date windows, freshness, and the share of
+     traffic no query row accounts for (anonymised queries)
    - **Visualize your data** with charts and graphs created by Claude
+
+   **Analysis tools** (v1.5.0): page query profiles, branded vs
+   non-branded split, striking-distance pages, biggest movers,
+   cannibalisation, and SQL over Search Console UI exports (e.g. the
+   Generative AI features report, which the API does not have).
 
 3. **URL Inspection & Indexing**  
    - Check if specific pages have indexing problems
    - See when Google last crawled your pages
-   - Inspect multiple URLs at once to identify patterns
+   - Inspect any number of URLs as a background job (`gsc_inspect_start`)
+     with a 6-hour cache and a quota ledger — no client timeouts
+   - A ready-to-paste Request Indexing worklist for changed URLs
+     (`gsc_recrawl_worklist`)
    - Get actionable insights on how to improve indexing
 
 4. **Sitemap Management**
@@ -30,6 +45,9 @@ A tool that connects [Google Search Console](https://search.google.com/search-co
    - Submit new sitemaps directly through Claude
    - Check for errors or warnings in your sitemaps
    - Monitor sitemap processing status
+   - Diff a sitemap against the live site (`gsc_sitemap_diff`): missing
+     pages, and sitemap URLs that redirect (classified equivalent / hub /
+     chain) or 404
 
 5. **Multi-Account Management (v1.2.0 — agent-first routing)**
    - Manage multiple Google accounts for agency workflows
@@ -59,7 +77,9 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_delete_site`                   | Removes a site from your GSC properties                     | Your website URL                                                |
 | `gsc_get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
 | `gsc_query`                         | Raw Search Analytics: every API parameter (regex/multi filters, searchAppearance, fresh/hourly data, News/Discover), pagination, client-side sort, `save_to_file` | Your website URL and explicit dates |
-| `gsc_get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
+| `gsc_get_advanced_search_analytics` | Search analytics with sorting, filters (incl. regex), pagination and save-to-file | Your website URL, dates and filters |
+| `gsc_compare_search_periods`        | Query or page changes between two periods (or `days=N` vs the N days before) | Your website URL and two periods |
+| `gsc_get_search_by_page_query`      | Per-page query breakdown with the page total and the unattributed (anonymised) share; `row_limit` up to 25000, `response_format="json"` | Your website URL and a page URL                                 |
 | `gsc_page_query_profile`            | One page's queries: totals, unattributed share, language, brand/login share, machine-query flags, position mix | Your website URL and a page URL |
 | `gsc_brand_split`                   | Branded / non-branded / login split by month, week or day   | Your website URL (brand terms from site config)                 |
 | `gsc_striking_distance`             | Pages at positions 4–20 with CTR below expected, click upside and top queries | Your website URL                                   |
@@ -74,11 +94,15 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_health_check`              | One-shot audit diagnostic (verification, sitemaps, last data)| Your website URL                                               |
 | `gsc_check_indexing_issues`         | Checks if pages have indexing problems                      | Your website URL and list of pages to check                     |
 | `gsc_inspect_url_enhanced`          | Detailed inspection of a specific URL                       | Your website URL and the page to inspect                        |
-| `gsc_batch_url_inspection`          | Inspect up to 10 URLs (now accepts URLs from an SF session) | Your website URL and URL list (or an SF session id)             |
+| `gsc_batch_url_inspection`          | Inspect up to 10 URLs in one call (accepts URLs from an SF session); for more, use `gsc_inspect_start` | Your website URL and URL list (or an SF session id)             |
 | `gsc_inspect_start`                 | Start a background inspection job for any number of URLs (cached, quota-aware) | Your website URL and URL list |
 | `gsc_inspect_status`                | Progress and partial results of an inspection job           | The job id                                                      |
 | `gsc_get_sitemaps`                  | Lists all sitemaps for your site                            | Your website URL                                                |
+| `gsc_list_sitemaps_enhanced`        | Sitemaps with processing detail (optionally the children of an index) | Your website URL                                        |
+| `gsc_get_sitemap_details`           | One sitemap's status, errors, warnings and indexed counts   | Your website URL and sitemap URL                                |
 | `gsc_submit_sitemap`                | Submits a new sitemap to Google                             | Your website URL and sitemap URL                                |
+| `gsc_delete_sitemap`                | Removes a submitted sitemap from Search Console             | Your website URL and sitemap URL                                |
+| `gsc_manage_sitemaps`               | One entry point for list / details / submit / delete        | Your website URL and an action                                  |
 | `gsc_load_from_sf_export`       | Ingests a Screaming Frog export folder for offline querying | Path to the SF export folder and the site URL                   |
 | `gsc_query_sf_export`           | Query a loaded SF export with filter/sort/pagination        | Session id and dataset name                                     |
 | `gsc_list_accounts`                 | Lists configured Google accounts; pass `include_properties=True` for per-account coverage | Nothing — optional flag |
@@ -87,6 +111,7 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_switch_account`                | **DEPRECATED in v1.2.0.** Returns `ok:false, error_code:DEPRECATED_TOOL`; pass `account_alias` on each call instead. | — |
 | `gsc_get_active_account`            | **DEPRECATED in v1.2.0.** No more "active account" — use `gsc_whoami(site_url=...)`. | — |
 | `gsc_remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
+| `gsc_get_creator_info`              | Who built and maintains this server                         | Nothing                                                         |
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
 
@@ -587,6 +612,16 @@ Here are some powerful prompts you can use with each tool:
 | `gsc_get_search_by_page_query`      | "What search terms are driving traffic to my blog post at mywebsite.com/blog/post-title? Identify opportunities to optimize for related keywords." |
 | `gsc_compare_search_periods`        | "Compare my site's performance between January and February. What queries improved the most, which declined, and what might explain these changes?" |
 | `gsc_get_advanced_search_analytics` | "Analyze my mobile search performance for queries with high impressions but positions below 10, and suggest content improvements to help them rank better." |
+| `gsc_query`                         | "Pull every query containing the word 'invoice' (regex `\binvoice\b`) for September, with fresh data, and save it to a CSV." |
+| `gsc_page_query_profile`            | "Profile the queries behind mywebsite.com/blog/post-title: how much is branded, non-English, or machine-generated, and what share is anonymised?" |
+| `gsc_brand_split`                   | "Show branded vs non-branded clicks by month since January." |
+| `gsc_striking_distance`             | "Which pages rank 4–20 with a CTR below what their position should earn, and what are their top queries?" |
+| `gsc_movers`                        | "What were the biggest gainers and losers over the last 28 days versus the 28 before?" |
+| `gsc_cannibalisation`               | "Which queries are split across two or more of my pages?" |
+| `gsc_inspect_start` / `gsc_inspect_status` | "Inspect these 40 URLs and tell me which have a canonical mismatch." |
+| `gsc_recrawl_worklist`              | "These pages changed on 14 September — which still need Request Indexing?" |
+| `gsc_sitemap_diff`                  | "Which sitemap URLs redirect, and which are hub redirects?" (checks 100 URLs per call; page with `check_offset`) |
+| `gsc_load_ui_export` / `gsc_query_ui_export` | "Load my Generative AI features export and list the pages that lost the most impressions from August to September." |
 
 You can also ask Claude to combine multiple tools and analyze the results. For example:
 

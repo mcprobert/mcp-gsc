@@ -5,6 +5,35 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.6.1] — 2026-09-29 — packaging and documentation
+
+No behaviour change: the server code is identical to 1.6.0.
+
+### Fixed
+
+- **`uv.lock` was stale.** It still recorded this package as 0.1.0 and
+  predated `httpx` / `openpyxl`, so a frozen rebuild (`uv sync --frozen`)
+  would have silently dropped `openpyxl` and broken XLSX UI-export import.
+  Regenerated, keeping every pin production runs (`mcp` 1.3.0,
+  `google-api-python-client` 2.163.0, `httpx` 0.28.1, `openpyxl` 3.1.5, …);
+  a frozen sync now reproduces the production package set exactly, minus
+  the unused `mcp[cli]` extras (`rich`, `typer`, `shellingham`,
+  `markdown-it-py`, `mdurl`, `pygments`) the old lock carried.
+- **The `mcp` floor was wrong.** `pyproject.toml` / `requirements.txt` said
+  `mcp>=1.6.0` (since 1.3.0, with no recorded reason) while the server has
+  always been deployed and tested on `mcp` 1.3.0 and relies on 1.3.0's
+  FastMCP internals (the handshake-version fix). The floor is now
+  `mcp>=1.3.0`, matching what runs.
+
+### Documentation
+
+- README: current version up front; the "Available Tools" table now lists
+  all 42 tools (seven were missing: `gsc_get_advanced_search_analytics`,
+  `gsc_compare_search_periods`, `gsc_list_sitemaps_enhanced`,
+  `gsc_get_sitemap_details`, `gsc_delete_sitemap`, `gsc_manage_sitemaps`,
+  `gsc_get_creator_info`); the feature list and example prompts cover the
+  1.4–1.6 tools.
+
 ## [1.6.0] — 2026-09-29 — coverage everywhere, sitemap redirect classification
 
 ### Added

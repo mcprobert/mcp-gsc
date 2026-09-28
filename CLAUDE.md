@@ -215,6 +215,14 @@ a centrally managed config — find out why before re-enabling anything.
 
 Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth`, `google-auth-oauthlib` (`oauth2client` was dropped in v1.3.0). Everything added in v1.4.0 is stdlib (`sqlite3`, `zoneinfo`); v1.5.0 adds `httpx` (live fetches) and `openpyxl` (XLSX exports).
 
+`uv.lock` is the source of truth for a rebuild and pins what production runs
+(`mcp` 1.3.0 — the code relies on 1.3.0's FastMCP internals, see the
+handshake-version note in `gsc_server.py`). After changing dependencies, run
+`uv lock` and check that `uv sync --frozen --no-dev` into a scratch venv
+reproduces the deployed package set before promoting. Moving `mcp` past 1.3.0
+is a separate, tested change (FastMCP's structured-output wrapping changed
+in later releases; `tests/test_envelope_annotations.py` guards one part of it).
+
 ## Response envelope convention
 
 Every tool's JSON output follows a flat top-level envelope — no `result:`
