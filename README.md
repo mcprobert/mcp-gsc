@@ -60,6 +60,14 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_get_search_analytics`          | Shows top queries and pages with metrics                    | Your website URL and time period                                |
 | `gsc_query`                         | Raw Search Analytics: every API parameter (regex/multi filters, searchAppearance, fresh/hourly data, News/Discover), pagination, client-side sort, `save_to_file` | Your website URL and explicit dates |
 | `gsc_get_search_by_page_query`      | Per-page query breakdown (now accepts `row_limit` up to 25000 and opt-in `response_format="json"` for structured summary) | Your website URL and a page URL                                 |
+| `gsc_page_query_profile`            | One page's queries: totals, unattributed share, language, brand/login share, machine-query flags, position mix | Your website URL and a page URL |
+| `gsc_brand_split`                   | Branded / non-branded / login split by month, week or day   | Your website URL (brand terms from site config)                 |
+| `gsc_striking_distance`             | Pages at positions 4–20 with CTR below expected, click upside and top queries | Your website URL                                   |
+| `gsc_movers`                        | Biggest gainers and losers between two periods              | Your website URL and two periods (or `days`)                    |
+| `gsc_cannibalisation`               | Queries where several of your URLs compete                  | Your website URL (optional query/page regex)                    |
+| `gsc_recrawl_worklist`              | Changed URLs that need Request Indexing, with reasons and a paste-ready list | Your website URL and URLs with change dates         |
+| `gsc_sitemap_diff`                  | Live pages missing from a sitemap; sitemap URLs that redirect or 404 | Your website URL, sitemap URL, URL list or SF session  |
+| `gsc_load_ui_export` / `gsc_query_ui_export` | Load a Search Console UI export (e.g. Generative AI features) and query it with SQL | Path to the export; a SELECT |
 | `gsc_get_landing_page_summary`  | Aggregated top-N landing pages with a configurable striking-distance band | Your website URL and time period                                |
 | `gsc_compare_periods_landing_pages` | Period-vs-period deltas keyed by page, with decay_flag  | Your website URL and two date windows                           |
 | `gsc_get_performance_overview`      | Gives a summary of site performance                         | Your website URL and time period                                |
@@ -81,6 +89,19 @@ Here's what you can ask Claude to do once you've set up this integration:
 | `gsc_remove_account`                | Removes a Google account and its credentials                | The alias of the account to remove                              |
 
 *For a complete list of all available tools and their detailed descriptions, ask Claude to "list tools" after setup.*
+
+### v1.5.0 — analysis tools
+
+- **Per-site config** in `$GSC_STATE_DIR/site-config.json`:
+  `{"sc-domain:example.com": {"brand_terms": ["example"], "login_terms": ["^(example login)$"]}}`
+  (RE2 regexes; optional `ctr_curve` and `exclude_urls`).
+- **Page briefs**: `gsc_page_query_profile` returns everything about one page's
+  queries, including non-English share and machine-query flags.
+- **Recrawl**: `gsc_recrawl_worklist` turns URLs + change dates into the list
+  to paste into Request Indexing (the API cannot request indexing itself).
+- **UI-only data** (Generative AI features): download the export, then
+  `gsc_load_ui_export` + `gsc_query_ui_export` with SQLite SQL, e.g.
+  `select top_pages, impr_aug, impr_sep from pages order by impr_aug - impr_sep desc limit 20`.
 
 ### v1.4.0 — full API coverage, honest windows, inspection that finishes
 

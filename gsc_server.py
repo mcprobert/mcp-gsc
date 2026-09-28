@@ -6,6 +6,7 @@ import re
 import shutil
 import csv
 import heapq
+import io
 import math
 import random
 import socket
@@ -2814,6 +2815,43 @@ async def _saved_summary(
     )
 
 
+async def _save_and_trim(result: Dict[str, Any], path: str, list_keys: Tuple[str, ...]) -> Dict[str, Any]:
+    """save_to_file for dict-shaped results: write the whole result as JSON
+    (in a worker thread) and return it with each list in ``list_keys``
+    trimmed to the first 20 items."""
+    err = _validate_save_path(path)
+    if err is None and not path.lower().endswith(".json"):
+        err = f"save_to_file for this tool must be a .json path, got: {path!r}"
+    if err:
+        raise _SaValidationError(err, "Pass an absolute .json path.")
+
+    def _write() -> Optional[str]:
+        p = Path(path)
+        tmp = p.parent / f".{p.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(json.dumps(result, default=str, indent=2), encoding="utf-8")
+            tmp.replace(p)
+            return None
+        except Exception as e:  # noqa: BLE001
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return f"{type(e).__name__}: {e}"
+    werr = await asyncio.to_thread(_write)
+    if werr:
+        raise _SaValidationError(werr, "Check the directory exists and is writable.")
+    trimmed = dict(result)
+    counts = {}
+    for k in list_keys:
+        if isinstance(result.get(k), list):
+            counts[k] = len(result[k])
+            trimmed[k] = result[k][:_SAVE_PREVIEW_ROWS]
+    trimmed["meta"] = dict(result.get("meta") or {}, saved_to=path, saved_counts=counts)
+    return trimmed
+
+
 @mcp.tool()
 async def gsc_list_properties(
     name_contains: Optional[str] = None,
@@ -4053,6 +4091,7 @@ async def _run_inspect_job(job: Dict[str, Any], service: Any, concurrency: int) 
         else:
             response, cached_at = outcome
             job["results"][url] = _normalize_inspection(url, response, cached_at)
+            job.setdefault("result_ts", {})[url] = cached_at or time.time()
 
     def on_throttle(active: bool) -> None:
         if job["state"] in ("running", "throttled"):
@@ -4128,35 +4167,9 @@ async def gsc_inspect_start(
             raise _SaValidationError("No URLs provided for inspection.", "Pass urls=[...].")
         concurrency = max(1, min(int(concurrency), _INSPECT_MAX_CONCURRENCY))
         resolved_alias, service = await get_gsc_service_for_site(site_url, account_alias)
-        _evict_inspect_jobs()
-        job_id = f"insp-{uuid4().hex[:12]}"
-        now = time.time()
-        job: Dict[str, Any] = {
-            "job_id": job_id,
-            "site_url": site_url,
-            "account_alias": resolved_alias,
-            "urls": url_list,
-            "force": bool(force),
-            "state": "queued",
-            "created_at": now,
-            "updated_at": now,
-            "finished_at": None,
-            "results": {},
-            "errors": {},
-            "cached": 0,
-        }
-        if not force:
-            for url in url_list:
-                hit = await asyncio.to_thread(_cache_get, site_url, url)
-                if hit is not None:
-                    job["results"][url] = _normalize_inspection(url, hit[0], hit[1])
-            job["cached"] = len(job["results"])
-        _inspect_jobs[job_id] = job
-        if len(job["results"]) == len(url_list):
-            job["state"] = "done"
-            job["finished_at"] = time.time()
-        else:
-            job["task"] = asyncio.create_task(_run_inspect_job(job, service, concurrency))
+        job = await _start_inspect_job(site_url, service, resolved_alias, url_list,
+                                       force=force, concurrency=concurrency)
+        job_id = job["job_id"]
         quota = await asyncio.to_thread(_inspection_quota, site_url)
         return {
             "ok": True,
@@ -6980,6 +6993,1791 @@ async def gsc_remove_account(alias: str) -> str:
         )
 
 
+# --- Per-site config (v1.5.0) ---
+# $GSC_STATE_DIR/site-config.json, keyed by site_url. Untracked on purpose:
+# brand terms and URL lists are client data, and origin is a public fork.
+#
+#   {"sc-domain:example.com": {
+#       "brand_terms": ["example"],            # RE2 regexes, OR-ed together
+#       "login_terms": ["^(example login)$"],
+#       "ctr_curve": {"1": 0.28, "2": 0.15},    # optional; else the site's own
+#       "exclude_urls": ["https://example.com/refreshed"]}}
+_SITE_CONFIG_FILE = "site-config.json"
+
+
+def _site_config_path() -> str:
+    return os.path.join(GSC_STATE_DIR, _SITE_CONFIG_FILE)
+
+
+def _load_site_config(site_url: str) -> Dict[str, Any]:
+    try:
+        with open(_site_config_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, ValueError):
+        return {}
+    entry = data.get(site_url) if isinstance(data, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def _terms_regex(terms: Any, *, field: str) -> Optional[str]:
+    """OR a list of RE2 regexes into one expression (validated)."""
+    if not terms:
+        return None
+    if isinstance(terms, str):
+        terms = [terms]
+    parts = []
+    for t in terms:
+        t = str(t)
+        if _SA_LOOKAROUND_RE.search(t):
+            raise _SaValidationError(f"{field} term {t!r} uses lookaround, which RE2 does not support.", "")
+        try:
+            re.compile(t)
+        except re.error as e:
+            raise _SaValidationError(f"Invalid {field} regex {t!r}: {e}.", "")
+        parts.append(t)
+    return parts[0] if len(parts) == 1 else "|".join(f"(?:{p})" for p in parts)
+
+
+# --- Pure analysis helpers (v1.5.0) ---
+
+_LANG_STOPWORDS: Dict[str, frozenset] = {
+    "es": frozenset("el la los las del que por para con una unos como qué cómo cuentas incobrables cobrar "
+                    "deudor deudores acreedor acreedores factura facturas pago pagos cobro cobranza es son".split()),
+    "fr": frozenset("le les des du et pour avec une est sont comment facture factures paiement "
+                    "créance créances recouvrement".split()),
+    "de": frozenset("der die das und für mit ein eine ist wie rechnung rechnungen zahlung forderung "
+                    "forderungen mahnung".split()),
+    "pt": frozenset("do da os as com uma não como fatura faturas pagamento cobrança contas receber".split()),
+    "it": frozenset("il lo gli di per con una che come fattura fatture pagamento crediti recupero".split()),
+    "nl": frozenset("het een van voor met en hoe factuur facturen betaling debiteuren incasso".split()),
+}
+_EN_STOPWORDS = frozenset(
+    "the of and to for with how what is in a an vs best free template software tool tools accounts "
+    "receivable payable invoice invoices payment payments credit control debt collection".split()
+)
+_DIACRITIC_LANG = [
+    ("es", re.compile(r"[ñ¿¡]")),
+    ("pt", re.compile(r"[ãõ]")),
+    ("de", re.compile(r"[äöüß]")),
+    ("fr", re.compile(r"[àèùâêîôûëïœç]")),
+]
+_NON_LATIN_RE = re.compile(r"[Ͱ-ϿЀ-ӿ֐-ۿऀ-ॿ぀-ヿ一-鿿가-힯]")
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _guess_language(query: str) -> Tuple[str, str]:
+    """A lightweight language guess for one query: ``(lang, confidence)``.
+    ``lang`` is ``en``, ``es``/``fr``/``de``/``pt``/``it``/``nl``,
+    ``other`` (non-Latin script) or ``unknown``; confidence is ``low`` or
+    ``medium``. A flag for a human to check, never an assertion."""
+    q = (query or "").lower()
+    if _NON_LATIN_RE.search(q):
+        return "other", "medium"
+    # URL / operator tokens ("site:example.com") are not words in any language.
+    q = " ".join(t for t in q.split() if not re.search(r"[.:/@]", t))
+    words = _WORD_RE.findall(q)
+    scores = {lang: sum(w in stops for w in words) for lang, stops in _LANG_STOPWORDS.items()}
+    for lang, rx in _DIACRITIC_LANG:
+        if rx.search(q):
+            scores[lang] += 2
+    en = sum(w in _EN_STOPWORDS for w in words)
+    best, score = max(scores.items(), key=lambda kv: kv[1])
+    if score > en and score >= 1:
+        return best, "medium" if score >= 2 else "low"
+    if en or words:
+        return "en", "low" if not en else "medium"
+    return "unknown", "low"
+
+
+_OPERATOR_RE = re.compile(r"(site:|inurl:|intitle:|filetype:|[+%]site\.)", re.IGNORECASE)
+_QUESTION_START_RE = re.compile(r"^(how|what|why|which|when|where|who|can|should|is|are|do|does|explain|write|give|list)\b")
+
+
+def _machine_query_flags(
+    rows: List[Dict[str, Any]],
+    page_impressions: Optional[float] = None,
+    daily: Optional[Dict[str, List[float]]] = None,
+) -> Dict[str, List[str]]:
+    """Flag queries that look machine-made or anomalous (§3.5). Returns
+    ``{query: [flag, ...]}`` for flagged queries only. Flags:
+    ``dominant_zero_click`` (>50% of the page's impressions at 0 clicks),
+    ``operator_string`` (site:, +site., %site., inurl:, …),
+    ``assistant_style`` (long prompt-like query — an AEO signal, not noise),
+    ``spike`` (one day > 10× the query's typical day; needs ``daily``)."""
+    total = page_impressions or sum(r.get("impressions", 0) or 0 for r in rows) or 0
+    flags: Dict[str, List[str]] = {}
+    for r in rows:
+        q = str(r.get("query", ""))
+        f: List[str] = []
+        if total and (r.get("impressions") or 0) > 0.5 * total and not r.get("clicks"):
+            f.append("dominant_zero_click")
+        if _OPERATOR_RE.search(q):
+            f.append("operator_string")
+        words = q.split()
+        if len(words) >= 10 or len(q) >= 80 or (len(words) >= 7 and _QUESTION_START_RE.match(q.lower())):
+            f.append("assistant_style")
+        series = [v for v in (daily or {}).get(q) or [] if v > 0]
+        if len(series) >= 2:
+            peak = max(series)
+            rest = sorted(series)
+            rest.remove(peak)
+            typical = rest[len(rest) // 2]  # median of the other non-zero days
+            if peak >= 50 and peak > 10 * typical:
+                f.append("spike")
+        if f:
+            flags[q] = f
+    return flags
+
+
+_POSITION_BUCKETS = (("1-3", 1, 3.5), ("4-10", 3.5, 10.5), ("11-20", 10.5, 20.5), ("21+", 20.5, float("inf")))
+
+
+def _position_buckets(rows: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    """Share of impressions by average position band."""
+    total = sum(r.get("impressions", 0) or 0 for r in rows)
+    out: Dict[str, Optional[float]] = {}
+    for name, lo, hi in _POSITION_BUCKETS:
+        imp = sum(r.get("impressions", 0) or 0 for r in rows if lo <= (r.get("position") or 0) < hi)
+        out[name] = (imp / total) if total else None
+    return out
+
+
+def _site_ctr_curve(rows: List[Dict[str, Any]], *, min_impressions: int = 10) -> Dict[int, float]:
+    """The site's own expected CTR by rounded position: the median CTR of
+    rows at that position (rows under ``min_impressions`` ignored)."""
+    by_pos: Dict[int, List[float]] = {}
+    for r in rows:
+        if (r.get("impressions") or 0) < min_impressions:
+            continue
+        pos = max(1, int(round(r.get("position") or 0)))
+        by_pos.setdefault(min(pos, 50), []).append(float(r.get("ctr") or 0))
+    curve = {}
+    for pos, ctrs in by_pos.items():
+        ctrs.sort()
+        mid = len(ctrs) // 2
+        curve[pos] = ctrs[mid] if len(ctrs) % 2 else (ctrs[mid - 1] + ctrs[mid]) / 2
+    return curve
+
+
+def _expected_ctr(position: float, curve: Dict[int, float]) -> Optional[float]:
+    """Expected CTR at ``position`` from ``curve`` (nearest known position)."""
+    if not curve:
+        return None
+    pos = max(1, int(round(position or 0)))
+    if pos in curve:
+        return curve[pos]
+    nearest = min(curve, key=lambda p: (abs(p - pos), p))
+    return curve[nearest]
+
+
+def _date_bucket(day: str, granularity: str) -> str:
+    d = datetime.strptime(day, "%Y-%m-%d").date()
+    if granularity == "day":
+        return day
+    if granularity == "week":
+        iso = d.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
+    return day[:7]
+
+
+def _url_regex(urls: List[str]) -> str:
+    return "^(" + "|".join(re.escape(u) for u in urls) + ")$"
+
+
+def _chunks(items: List[Any], size: int) -> List[List[Any]]:
+    return [items[i:i + size] for i in range(0, len(items), size)]
+
+
+# --- Analysis tools (v1.5.0) ---
+
+
+@mcp.tool()
+async def gsc_page_query_profile(
+    site_url: str,
+    page_url: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    *,
+    days: int = 28,
+    data_state: str = "final",
+    brand_terms: Optional[List[str]] = None,
+    login_terms: Optional[List[str]] = None,
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    save_to_file: Optional[str] = None,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Everything a page brief needs about one page's queries, in one call:
+    page total, every query sorted by impressions, the unattributed
+    (anonymised) share, non-English share (a per-query language guess —
+    a flag, not an assertion), brand and login share, machine-query flags
+    (dominant zero-click query, operator strings like site:/+site., long
+    assistant-style prompts, 10× spikes) and the position distribution.
+
+    Args:
+        site_url: GSC property. page_url: the exact page URL.
+        start_date / end_date: YYYY-MM-DD (default: the last `days` final days).
+        days: window length when no dates are given (default 28).
+        data_state: final (default) | all.
+        brand_terms / login_terms: RE2 regexes; default from site config.
+        max_rows: cap on query rows fetched.
+        save_to_file: absolute .csv/.json path for the query rows.
+    """
+    tool = "gsc_page_query_profile"
+    try:
+        cfg = _load_site_config(site_url)
+        # An explicit [] disables a classification; None means "use config".
+        brand_re = _terms_regex(cfg.get("brand_terms") if brand_terms is None else brand_terms, field="brand")
+        login_re = _terms_regex(cfg.get("login_terms") if login_terms is None else login_terms, field="login")
+        page_filter = [{"filters": [{"dimension": "page", "operator": "equals", "expression": page_url}]}]
+        async with _instrument(tool, site_url=site_url, page_url=page_url):
+            ctx = await _sa_context(site_url, account_alias)
+            res = await _sa_run(
+                ctx, dimensions=["query"], start_date=start_date, end_date=end_date, days=days,
+                data_state=data_state, filter_groups=page_filter, fetch_all=True, max_rows=max_rows,
+                sort_by="impressions", include_totals=True, step=tool,
+            )
+            daily_res = await _sa_run(
+                ctx, dimensions=["query", "date"], window=res["window"], data_state=data_state,
+                filter_groups=page_filter, fetch_all=True, max_rows=max_rows, step=f"{tool}.daily",
+            )
+        daily: Dict[str, List[float]] = {}
+        for r in daily_res["rows"]:
+            daily.setdefault(r["query"], []).append(float(r.get("impressions") or 0))
+
+        rows = res["rows"]
+        page_total = (res["totals"] or {}).get("page_total") or {"clicks": 0, "impressions": 0}
+        flags = _machine_query_flags(rows, page_total.get("impressions"), daily)
+        brand_rx = re.compile(brand_re) if brand_re else None
+        login_rx = re.compile(login_re) if login_re else None
+        queries = []
+        for r in rows:
+            lang, conf = _guess_language(r["query"])
+            queries.append(dict(
+                r, lang_guess=lang, lang_confidence=conf,
+                brand=bool(brand_rx and brand_rx.search(r["query"])),
+                login=bool(login_rx and login_rx.search(r["query"])),
+                flags=flags.get(r["query"], []),
+            ))
+
+        def _share(pred) -> Dict[str, Optional[float]]:
+            out = {}
+            for m in ("clicks", "impressions"):
+                part = sum(q.get(m) or 0 for q in queries if pred(q))
+                out[f"of_query_rows_{m}"] = part / (res["totals"]["query_rows_sum"][m] or 0) if res["totals"]["query_rows_sum"][m] else None
+                out[f"of_page_total_{m}"] = part / page_total[m] if page_total.get(m) else None
+            return out
+
+        summary = {
+            "page_total": page_total,
+            "query_rows_sum": res["totals"]["query_rows_sum"],
+            "unattributed_share": res["totals"]["unattributed_share"],
+            "non_english_share": _share(lambda q: q["lang_guess"] not in ("en", "unknown")),
+            "non_english_languages": sorted({q["lang_guess"] for q in queries if q["lang_guess"] not in ("en", "unknown")}),
+            "brand_share": _share(lambda q: q["brand"]) if brand_rx else None,
+            "login_share": _share(lambda q: q["login"]) if login_rx else None,
+            "position_distribution": _position_buckets(rows),
+            "flag_counts": {
+                name: sum(1 for q in queries if name in q["flags"])
+                for name in ("dominant_zero_click", "operator_string", "assistant_style", "spike")
+            },
+        }
+        meta = _sa_meta(res, site_url=site_url, page_url=page_url,
+                        spike_evidence="complete" if daily_res["complete"] else "partial (max_rows cap)",
+                        warnings=list(daily_res["warnings"]) + ([] if daily_res["complete"] else [
+                            "Daily query evidence hit max_rows; spike flags may be missing."]),
+                        brand_regex=brand_re, login_regex=login_re,
+                        language_note="lang_guess is a stopword/diacritic heuristic: flag, don't assert")
+        if not brand_rx:
+            meta["warnings"].append("No brand_terms given or configured; brand_share not computed.")
+        if save_to_file:
+            columns = _sa_columns(["query"]) + [
+                {"key": k, "display": k, "type": "str"}
+                for k in ("lang_guess", "lang_confidence", "brand", "login", "flags")
+            ]
+            err = await asyncio.to_thread(_save_rows, save_to_file, queries, [c["key"] for c in columns], meta)
+            if err:
+                raise _SaValidationError(err, "Pass an absolute .csv or .json path.")
+            meta["saved_to"] = save_to_file
+            meta["saved_row_count"] = len(queries)
+        return {
+            "ok": True, "tool": tool, "site_url": site_url, "page_url": page_url,
+            "summary": summary,
+            # After saving, return only the first 20 rows (the file has all).
+            "queries": queries[:_SAVE_PREVIEW_ROWS] if save_to_file else queries,
+            "meta": meta,
+        }
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+@mcp.tool()
+async def gsc_brand_split(
+    site_url: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    granularity: str = "month",
+    *,
+    days: int = 28,
+    data_state: str = "final",
+    brand_terms: Optional[List[str]] = None,
+    login_terms: Optional[List[str]] = None,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Branded vs non-branded (and login) clicks and impressions by month,
+    week or day. The split runs in the API (includingRegex / excludingRegex
+    on query), not by guessing client-side. Shares are of the property
+    total, which also counts anonymised queries; `anonymised` is what
+    neither the branded nor the non-branded pull can see.
+
+    Args:
+        site_url: GSC property.
+        start_date / end_date: YYYY-MM-DD (default: the last `days` final days).
+        granularity: month (default) | week (ISO, Monday start) | day.
+        brand_terms / login_terms: RE2 regexes (OR-ed); default from site config.
+    """
+    tool = "gsc_brand_split"
+    try:
+        gran = str(granularity).strip().lower()
+        if gran not in ("month", "week", "day"):
+            raise _SaValidationError(f"Unknown granularity {granularity!r}.", "Use month, week or day.")
+        cfg = _load_site_config(site_url)
+        brand_re = _terms_regex(cfg.get("brand_terms") if brand_terms is None else brand_terms, field="brand")
+        login_re = _terms_regex(cfg.get("login_terms") if login_terms is None else login_terms, field="login")
+        if not brand_re:
+            raise _SaValidationError(
+                "No brand terms: pass brand_terms or add them to the site config.",
+                f"Site config lives at $GSC_STATE_DIR/{_SITE_CONFIG_FILE}, keyed by site_url.",
+            )
+        ctx = await _sa_context(site_url, account_alias)
+        w = await _resolve_window(ctx, start_date=start_date, end_date=end_date, days=days, data_state=data_state)
+        n = w["window_days"] + 1
+
+        async def _daily(expr: Optional[str], op: str, step: str) -> Dict[str, Dict[str, float]]:
+            groups = [{"filters": [{"dimension": "query", "operator": op, "expression": expr}]}] if expr else None
+            r = await _sa_run(ctx, dimensions=["date"], window=w, data_state=data_state,
+                              filter_groups=groups, row_limit=n, step=step)
+            return {row["date"]: row for row in r["rows"]}
+
+        total = await _daily(None, "", f"{tool}.total")
+        branded = await _daily(brand_re, "includingRegex", f"{tool}.branded")
+        non_branded = await _daily(brand_re, "excludingRegex", f"{tool}.non_branded")
+        login = await _daily(login_re, "includingRegex", f"{tool}.login") if login_re else {}
+
+        buckets: Dict[str, Dict[str, Any]] = {}
+        for day in sorted(set(total) | set(branded) | set(non_branded) | set(login)):
+            b = buckets.setdefault(_date_bucket(day, gran), {
+                "period": _date_bucket(day, gran), "days_of_data": 0,
+                **{f"{k}_{m}": 0 for k in ("total", "branded", "non_branded", "login") for m in ("clicks", "impressions")},
+            })
+            if day in total:
+                b["days_of_data"] += 1
+            for key, src in (("total", total), ("branded", branded), ("non_branded", non_branded), ("login", login)):
+                row = src.get(day)
+                if row:
+                    b[f"{key}_clicks"] += row.get("clicks") or 0
+                    b[f"{key}_impressions"] += row.get("impressions") or 0
+        rows = []
+        for b in buckets.values():
+            for m in ("clicks", "impressions"):
+                t = b[f"total_{m}"]
+                b[f"anonymised_{m}"] = t - b[f"branded_{m}"] - b[f"non_branded_{m}"]
+                b[f"brand_share_{m}"] = b[f"branded_{m}"] / t if t else None
+                b[f"login_share_{m}"] = b[f"login_{m}"] / t if (t and login_re) else None
+            rows.append(b)
+        columns = [{"key": "period", "display": "Period", "type": "str"},
+                   {"key": "days_of_data", "display": "Days", "type": "int"}]
+        for k in ("total", "branded", "non_branded", "login", "anonymised"):
+            columns += [{"key": f"{k}_clicks", "display": f"{k} clicks", "type": "int"},
+                        {"key": f"{k}_impressions", "display": f"{k} impr", "type": "int"}]
+        columns += [{"key": "brand_share_clicks", "display": "brand share (clicks)", "type": "pct"},
+                    {"key": "login_share_clicks", "display": "login share (clicks)", "type": "pct"}]
+        out = _format_table(
+            rows, columns, response_format="json",
+            meta=_standard_meta(w, site_url=site_url, granularity=gran, brand_regex=brand_re,
+                                login_regex=login_re, row_count=len(rows), truncated=False,
+                                brand_terms_source="site_config" if brand_terms is None else "argument"),
+        )
+        out["tool"] = tool
+        return out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+@mcp.tool()
+async def gsc_striking_distance(
+    site_url: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    min_impressions: int = 100,
+    pos_from: float = 4,
+    pos_to: float = 20,
+    ctr_below_expected: bool = True,
+    *,
+    days: int = 28,
+    exclude_urls: Optional[List[str]] = None,
+    top_queries: int = 5,
+    limit: int = 50,
+    data_state: str = "final",
+    save_to_file: Optional[str] = None,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Pages ranking within reach of the top (average position pos_from–
+    pos_to) with enough impressions, optionally only those whose CTR is
+    below what their position should earn. Each candidate carries position,
+    impressions, clicks, CTR, expected CTR, the gap, the click upside and
+    its top queries (with machine-query flags). Ordered by click upside.
+
+    Expected CTR comes from `ctr_curve` in the site config when present,
+    else from the site's own median CTR at each position (meta says which).
+
+    Args:
+        exclude_urls: pages to skip (e.g. just refreshed); merged with the
+            site config's exclude_urls.
+        top_queries: queries shown per page (default 5).
+        limit: max candidates (default 50).
+        save_to_file: absolute .json path; writes the full result, returns 20 candidates.
+    """
+    tool = "gsc_striking_distance"
+    try:
+        cfg = _load_site_config(site_url)
+        excluded = set(exclude_urls or []) | set(cfg.get("exclude_urls") or [])
+        ctx = await _sa_context(site_url, account_alias)
+        res = await _sa_run(ctx, dimensions=["page"], start_date=start_date, end_date=end_date,
+                            days=days, data_state=data_state, fetch_all=True, step=tool)
+        if cfg.get("ctr_curve"):
+            curve = {int(k): float(v) for k, v in cfg["ctr_curve"].items()}
+            curve_source = "site_config"
+        else:
+            curve = _site_ctr_curve(res["rows"])
+            curve_source = "site_median_by_position"
+        candidates = []
+        for r in res["rows"]:
+            if r["page"] in excluded or (r.get("impressions") or 0) < min_impressions:
+                continue
+            if not (pos_from <= (r.get("position") or 0) <= pos_to):
+                continue
+            expected = _expected_ctr(r["position"], curve)
+            gap = (expected - r["ctr"]) if expected is not None else None
+            if ctr_below_expected and (gap is None or gap <= 0):
+                continue
+            candidates.append(dict(
+                r, expected_ctr=expected, ctr_gap=gap,
+                click_upside=(gap * r["impressions"]) if gap is not None else None,
+            ))
+        candidates.sort(key=lambda c: (-(c["click_upside"] or 0), c["page"]))
+        candidates = candidates[:max(1, int(limit))]
+
+        by_page: Dict[str, List[Dict[str, Any]]] = {c["page"]: [] for c in candidates}
+        daily: Dict[str, Dict[str, List[float]]] = {}
+        daily_complete = True
+        for chunk in _chunks(list(by_page), 20):
+            page_filter = [{"filters": [{"dimension": "page", "operator": "includingRegex",
+                                         "expression": _url_regex(chunk)}]}]
+            q = await _sa_run(
+                ctx, dimensions=["page", "query"], window=res["window"], data_state=data_state,
+                filter_groups=page_filter, fetch_all=True, sort_by="impressions", step=f"{tool}.queries",
+            )
+            for row in q["rows"]:
+                by_page.setdefault(row["page"], []).append(row)
+            dq = await _sa_run(
+                ctx, dimensions=["page", "query", "date"], window=res["window"], data_state=data_state,
+                filter_groups=page_filter, fetch_all=True, step=f"{tool}.daily",
+            )
+            daily_complete = daily_complete and dq["complete"]
+            for row in dq["rows"]:
+                daily.setdefault(row["page"], {}).setdefault(row["query"], []).append(float(row.get("impressions") or 0))
+        for c in candidates:
+            qrows = by_page.get(c["page"], [])
+            flags = _machine_query_flags(qrows, c["impressions"], daily.get(c["page"]))
+            c["top_queries"] = [
+                {"query": q["query"], "clicks": q["clicks"], "impressions": q["impressions"],
+                 "position": q["position"], "flags": flags.get(q["query"], [])}
+                for q in qrows[:max(0, int(top_queries))]
+            ]
+            c["query_flags"] = sorted({f for fl in flags.values() for f in fl})
+        out = {
+            "ok": True, "tool": tool, "site_url": site_url,
+            "candidates": candidates,
+            "ctr_curve": {str(k): v for k, v in sorted(curve.items())},
+            "meta": _sa_meta(res, site_url=site_url, ctr_curve_source=curve_source,
+                             thresholds={"min_impressions": min_impressions, "pos_from": pos_from,
+                                         "pos_to": pos_to, "ctr_below_expected": ctr_below_expected},
+                             excluded_urls=sorted(excluded), row_count=len(candidates),
+                             spike_evidence="complete" if daily_complete else "partial (max_rows cap)"),
+        }
+        return await _save_and_trim(out, save_to_file, ("candidates",)) if save_to_file else out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+@mcp.tool()
+async def gsc_movers(
+    site_url: str,
+    period_a_start: Optional[str] = None,
+    period_a_end: Optional[str] = None,
+    period_b_start: Optional[str] = None,
+    period_b_end: Optional[str] = None,
+    dimension: str = "page",
+    min_impressions: int = 0,
+    top_n: int = 20,
+    rank_by: str = "clicks",
+    *,
+    days: Optional[int] = None,
+    data_state: str = "final",
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    save_to_file: Optional[str] = None,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Biggest gainers and losers between an earlier period A and a later
+    period B (B − A), by page or query: clicks, impressions and position
+    deltas, and each row's share of the total change. Both periods are
+    fetched in full; a row missing from a capped period is null, not 0.
+
+    Args:
+        period_a_* / period_b_*: YYYY-MM-DD, or pass days=N instead (B = the
+            last N final days, A = the N days before).
+        dimension: page (default) | query.
+        min_impressions: keep rows where either period reaches this.
+        top_n: gainers and losers returned each (default 20).
+        rank_by: clicks (default) | impressions | position (position ranks
+            improvement, i.e. a falling average position, as a gain).
+        save_to_file: absolute .json path; writes every compared row too.
+    """
+    tool = "gsc_movers"
+    try:
+        dim = _norm_enum(dimension, {"page": "page", "query": "query"}, field="dimension")
+        metric = _norm_enum(rank_by, {"clicks": "clicks", "impressions": "impressions", "position": "position"},
+                            field="rank_by")
+        use_days = _comparison_mode([period_a_start, period_a_end, period_b_start, period_b_end], days)
+        ctx = await _sa_context(site_url, account_alias)
+        if use_days:
+            wa, wb = await _resolve_comparison_windows(ctx, days=days, data_state=data_state)
+        else:
+            wa = await _resolve_window(ctx, start_date=period_a_start, end_date=period_a_end, data_state=data_state)
+            wb = await _resolve_window(ctx, start_date=period_b_start, end_date=period_b_end, data_state=data_state)
+        a = await _sa_run(ctx, dimensions=[dim], window=wa, data_state=data_state, fetch_all=True,
+                          max_rows=max_rows, step=f"{tool}.a")
+        b = await _sa_run(ctx, dimensions=[dim], window=wb, data_state=data_state, fetch_all=True,
+                          max_rows=max_rows, step=f"{tool}.b")
+        a_by = {r[dim]: r for r in a["rows"]}
+        b_by = {r[dim]: r for r in b["rows"]}
+
+        def _val(row, key, complete):
+            if row is None:
+                return 0 if (complete and key != "position") else None
+            return row.get(key)
+
+        rows = []
+        for key in set(a_by) | set(b_by):
+            ra, rb = a_by.get(key), b_by.get(key)
+            if max((ra or {}).get("impressions", 0) or 0, (rb or {}).get("impressions", 0) or 0) < min_impressions:
+                continue
+            row: Dict[str, Any] = {dim: key}
+            for m in ("clicks", "impressions", "position"):
+                va, vb = _val(ra, m, a["complete"]), _val(rb, m, b["complete"])
+                row[f"a_{m}"], row[f"b_{m}"] = va, vb
+                row[f"{m}_delta"] = (vb - va) if (va is not None and vb is not None) else None
+            rows.append(row)
+        totals = {
+            "a": {m: sum(r.get(m) or 0 for r in a["rows"]) for m in ("clicks", "impressions")},
+            "b": {m: sum(r.get(m) or 0 for r in b["rows"]) for m in ("clicks", "impressions")},
+        }
+        # Net change over every fetched row (not just those passing
+        # min_impressions); exact only when both periods were fetched in full.
+        net = {m: totals["b"][m] - totals["a"][m] for m in ("clicks", "impressions")}
+        net_complete = a["complete"] and b["complete"]
+        for r in rows:
+            for m in ("clicks", "impressions"):
+                r[f"share_of_{m}_change"] = (r[f"{m}_delta"] / net[m]) if (net[m] and r[f"{m}_delta"] is not None) else None
+
+        sign = -1 if metric == "position" else 1  # a falling position is a gain
+        scored = [r for r in rows if r[f"{metric}_delta"] is not None]
+        scored.sort(key=lambda r: (-(sign * r[f"{metric}_delta"]), str(r[dim])))
+        gainers = [r for r in scored if sign * r[f"{metric}_delta"] > 0][:top_n]
+        losers = [r for r in reversed(scored) if sign * r[f"{metric}_delta"] < 0][:top_n]
+        out = {
+            "ok": True, "tool": tool, "site_url": site_url, "dimension": dim, "rank_by": metric,
+            "gainers": gainers, "losers": losers,
+            "net_change": net,
+            "net_change_complete": net_complete,
+            "totals": totals,
+            "unknown_rows": sum(1 for r in rows if r["clicks_delta"] is None),
+            "meta": _standard_meta(
+                None, site_url=site_url, period_a=_window_meta(wa), period_b=_window_meta(wb),
+                coverage={"a": "complete" if a["complete"] else "truncated",
+                          "b": "complete" if b["complete"] else "truncated"},
+                data_state=data_state, latest_final_date=wb["latest_final_date"], timezone=_PT_LABEL,
+                row_count=len(gainers) + len(losers), truncated=False,
+                warnings=list(wa["warnings"]) + list(wb["warnings"]),
+            ),
+        }
+        if save_to_file:
+            out["all_rows"] = rows  # the file gets every compared row
+            return await _save_and_trim(out, save_to_file, ("gainers", "losers", "all_rows"))
+        return out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+@mcp.tool()
+async def gsc_cannibalisation(
+    site_url: str,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    query_regex: Optional[str] = None,
+    page_regex: Optional[str] = None,
+    min_pages: int = 2,
+    *,
+    days: int = 28,
+    min_impressions: int = 10,
+    limit: int = 50,
+    collapse_fragments: bool = True,
+    data_state: str = "final",
+    max_rows: int = _SA_DEFAULT_MAX_ROWS,
+    save_to_file: Optional[str] = None,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Queries where two or more of the site's URLs earned impressions, with
+    each URL's position, impressions, clicks and share of the query's
+    impressions. Ordered by the query's total impressions.
+
+    Args:
+        query_regex / page_regex: optional RE2 filters (e.g. "\\\\bsage\\\\b").
+        min_pages: URLs a query must reach to count (default 2).
+        min_impressions: per-URL impressions to count as competing (default 10).
+        limit: max queries returned (default 50).
+        collapse_fragments: merge jump-link URLs (page#section) into their
+            page first (default true) — they are one page, not competitors.
+        save_to_file: absolute .json path; writes every cannibalised query.
+    """
+    tool = "gsc_cannibalisation"
+    try:
+        filters = []
+        if query_regex:
+            filters.append({"dimension": "query", "operator": "includingRegex", "expression": query_regex})
+        if page_regex:
+            filters.append({"dimension": "page", "operator": "includingRegex", "expression": page_regex})
+        ctx = await _sa_context(site_url, account_alias)
+        res = await _sa_run(ctx, dimensions=["query", "page"], start_date=start_date, end_date=end_date,
+                            days=days, data_state=data_state,
+                            filter_groups=[{"filters": filters}] if filters else None,
+                            fetch_all=True, max_rows=max_rows, step=tool)
+        merged: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for r in res["rows"]:
+            page = r["page"].split("#", 1)[0] if collapse_fragments else r["page"]
+            m = merged.setdefault((r["query"], page), {"query": r["query"], "page": page, "clicks": 0,
+                                                        "impressions": 0, "_posw": 0.0})
+            m["clicks"] += r.get("clicks") or 0
+            m["impressions"] += r.get("impressions") or 0
+            m["_posw"] += (r.get("position") or 0) * (r.get("impressions") or 0)
+        by_query: Dict[str, List[Dict[str, Any]]] = {}
+        for m in merged.values():
+            m["position"] = m.pop("_posw") / m["impressions"] if m["impressions"] else None
+            if m["impressions"] >= min_impressions:
+                by_query.setdefault(m["query"], []).append(m)
+        groups = []
+        for q, pages in by_query.items():
+            if len(pages) < max(2, int(min_pages)):
+                continue
+            total_imp = sum(p["impressions"] for p in pages)
+            pages.sort(key=lambda p: (-p["impressions"], p["page"]))
+            groups.append({
+                "query": q,
+                "pages": [{"page": p["page"], "position": p["position"], "impressions": p["impressions"],
+                           "clicks": p["clicks"], "impression_share": p["impressions"] / total_imp if total_imp else None}
+                          for p in pages],
+                "page_count": len(pages),
+                "total_impressions": total_imp,
+                "total_clicks": sum(p["clicks"] for p in pages),
+            })
+        groups.sort(key=lambda g: (-g["total_impressions"], g["query"]))
+        out = {
+            "ok": True, "tool": tool, "site_url": site_url,
+            "queries": groups if save_to_file else groups[:max(1, int(limit))],
+            "total_cannibalised_queries": len(groups),
+            "meta": _sa_meta(res, site_url=site_url, query_regex=query_regex, page_regex=page_regex,
+                             min_pages=min_pages, min_impressions=min_impressions,
+                             row_count=min(len(groups), max(1, int(limit)))),
+        }
+        return await _save_and_trim(out, save_to_file, ("queries",)) if save_to_file else out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+# --- Safe live fetcher (v1.5.0) ---
+# Used by gsc_sitemap_diff and gsc_recrawl_worklist to check what a URL
+# really returns. Guards: http(s) only; the host must belong to the GSC
+# property (or be the sitemap's host); every resolved address and the
+# connected peer must be public (no loopback / private / link-local — the
+# peer check closes the DNS-rebinding gap); redirects are never followed,
+# only reported; bodies are capped. A browser user agent and
+# Accept: text/html get past bot-shy CDNs (e.g. Cloudflare), and callers
+# make a control request first so a blocked crawler reads as
+# "inconclusive", not as a dead site.
+_FETCH_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0 Safari/537.36"
+)
+_FETCH_HEADERS = {
+    "User-Agent": _FETCH_UA,
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-GB,en;q=0.9",
+}
+_FETCH_MAX_BYTES = 10 * 1024 * 1024
+_FETCH_TIMEOUT_SEC = 15.0
+_SITEMAP_MAX_DEPTH = 3
+_SITEMAP_MAX_URLS = 50_000
+_SITEMAP_MAX_FETCHES = 2_000
+
+
+class _FetchRefused(Exception):
+    """A URL the safe fetcher will not request (scope or address rules)."""
+
+
+def _property_hosts(site_url: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(exact_host, domain)``: a URL-prefix property allows its own host;
+    an ``sc-domain:`` property allows the domain and its subdomains."""
+    if site_url.startswith("sc-domain:"):
+        return None, site_url[len("sc-domain:"):].lower()
+    from urllib.parse import urlsplit
+    return (urlsplit(site_url).hostname or "").lower(), None
+
+
+def _host_allowed(host: str, site_url: str, extra_hosts: Tuple[str, ...] = ()) -> bool:
+    host = (host or "").lower()
+    exact, domain = _property_hosts(site_url)
+    if host in extra_hosts:
+        return True
+    if exact is not None:
+        return host == exact
+    return host == domain or host.endswith("." + domain)
+
+
+def _is_public_ip(addr: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address(addr.split("%")[0]).is_global
+    except ValueError:
+        return False
+
+
+async def _safe_fetch(client: Any, url: str, site_url: str, *, extra_hosts: Tuple[str, ...] = (),
+                      want_body: bool = False, max_bytes: int = _FETCH_MAX_BYTES) -> Dict[str, Any]:
+    """GET ``url`` without following redirects. Returns ``{url, status,
+    location, body?}``; raises _FetchRefused for an out-of-scope or
+    non-public destination, before any request is sent."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    if parts.scheme not in ("http", "https") or not parts.hostname:
+        raise _FetchRefused(f"not an http(s) URL: {url!r}")
+    if not _host_allowed(parts.hostname, site_url, extra_hosts):
+        raise _FetchRefused(f"host {parts.hostname!r} is outside property {site_url!r}")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
+    infos = await asyncio.to_thread(socket.getaddrinfo, parts.hostname, port, 0, socket.SOCK_STREAM)
+    addrs = sorted({i[4][0] for i in infos})
+    if not addrs or not all(_is_public_ip(a) for a in addrs):
+        raise _FetchRefused(f"{parts.hostname!r} resolves to a non-public address")
+    # Pin the connection to the address just validated (no second DNS
+    # lookup to rebind), keeping the hostname for Host, SNI and TLS
+    # certificate verification.
+    pinned = addrs[0]
+    ip_host = f"[{pinned}]" if ":" in pinned else pinned
+    netloc = ip_host + (f":{parts.port}" if parts.port else "")
+    pinned_url = parts._replace(netloc=netloc).geturl()
+    host_header = parts.hostname + (f":{parts.port}" if parts.port else "")
+    headers = dict(_FETCH_HEADERS, Host=host_header)
+    async with client.stream("GET", pinned_url, headers=headers,
+                             extensions={"sni_hostname": parts.hostname}) as resp:
+        stream = resp.extensions.get("network_stream")
+        peer = stream.get_extra_info("server_addr") if stream is not None else None
+        if peer and not _is_public_ip(str(peer[0])):
+            raise _FetchRefused(f"connected to non-public address {peer[0]!r}")
+        out: Dict[str, Any] = {"url": url, "status": resp.status_code, "location": resp.headers.get("location")}
+        if want_body:
+            chunks, size = [], 0
+            async for chunk in resp.aiter_bytes():
+                size += len(chunk)
+                if size > max_bytes:
+                    raise _FetchRefused(f"response over {max_bytes} bytes: {url!r}")
+                chunks.append(chunk)
+            out["body"] = b"".join(chunks)
+        return out
+
+
+def _new_fetch_client() -> Any:
+    import httpx
+    return httpx.AsyncClient(follow_redirects=False, timeout=_FETCH_TIMEOUT_SEC)
+
+
+async def _fetch_statuses(client: Any, urls: List[str], site_url: str, *, extra_hosts: Tuple[str, ...] = (),
+                          concurrency: int = 8) -> Dict[str, Dict[str, Any]]:
+    sem = asyncio.Semaphore(max(1, concurrency))
+    out: Dict[str, Dict[str, Any]] = {}
+
+    async def one(u: str) -> None:
+        async with sem:
+            try:
+                out[u] = await _safe_fetch(client, u, site_url, extra_hosts=extra_hosts)
+            except _FetchRefused as e:
+                out[u] = {"url": u, "status": None, "refused": str(e)}
+            except Exception as e:  # noqa: BLE001 — network failure is data
+                out[u] = {"url": u, "status": None, "error": f"{type(e).__name__}: {e}"}
+    await asyncio.gather(*(one(u) for u in urls))
+    return out
+
+
+def _site_home(site_url: str, sample_url: Optional[str] = None) -> str:
+    if not site_url.startswith("sc-domain:"):
+        return site_url
+    from urllib.parse import urlsplit
+    if sample_url:
+        p = urlsplit(sample_url)
+        return f"{p.scheme}://{p.hostname}/"
+    return f"https://{site_url[len('sc-domain:'):]}/"
+
+
+async def _control_ok(client: Any, site_url: str, sample_url: Optional[str]) -> Dict[str, Any]:
+    """Control request: the site's home page must answer 200 (or a redirect
+    within the property) or every live check is inconclusive."""
+    home = _site_home(site_url, sample_url)
+    try:
+        r = await _safe_fetch(client, home, site_url)
+    except Exception as e:  # noqa: BLE001
+        return {"url": home, "ok": False, "error": f"{type(e).__name__}: {e}"}
+    if r["status"] in (301, 302, 303, 307, 308):
+        from urllib.parse import urljoin, urlsplit
+        dest = urljoin(home, r.get("location") or "")
+        p = urlsplit(dest)
+        ok = p.scheme in ("http", "https") and _host_allowed(p.hostname or "", site_url)
+        return {"url": home, "ok": ok, "status": r["status"], "location": dest}
+    return {"url": home, "ok": r["status"] == 200, "status": r["status"]}
+
+
+def _normalize_url(u: str) -> str:
+    from urllib.parse import urlsplit, urlunsplit
+    p = urlsplit(u.strip())
+    return urlunsplit((p.scheme.lower(), (p.netloc or "").lower(), p.path or "/", p.query, ""))
+
+
+def _parse_sitemap_body(body: bytes) -> Tuple[str, List[str]]:
+    """``(root_tag, locs)`` from one sitemap document. Gzip is decompressed
+    with a bounded budget; only the <loc> directly under each <url> /
+    <sitemap> counts (image:loc, video:loc and xhtml:link are not pages)."""
+    import xml.etree.ElementTree as ET
+    import zlib
+    if body[:2] == b"\x1f\x8b":
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = d.decompress(body, _FETCH_MAX_BYTES + 1)
+        if len(out) > _FETCH_MAX_BYTES or d.unconsumed_tail:
+            raise _FetchRefused(f"gzipped sitemap expands past {_FETCH_MAX_BYTES} bytes")
+        body = out
+    root = ET.fromstring(body)
+    ns = root.tag[: root.tag.index("}") + 1] if root.tag.startswith("{") else ""
+    tag = root.tag[len(ns):]
+    if tag not in ("urlset", "sitemapindex"):
+        raise ValueError(f"not a sitemap (root element {tag!r})")
+    locs = [
+        child.text.strip()
+        for entry in root for child in entry
+        if child.tag == ns + "loc" and child.text and child.text.strip()
+    ]
+    return tag, locs
+
+
+async def _read_sitemap_urls(client: Any, sitemap_url: str, site_url: str) -> Dict[str, Any]:
+    """Every <loc> in a sitemap, following sitemap indexes (depth ≤ 3,
+    cycle-safe, ≤ 50k URLs, ≤ 2,000 fetches)."""
+    from urllib.parse import urlsplit
+    sm_host = (urlsplit(sitemap_url).hostname or "").lower()
+    seen_maps: set = set()
+    urls: List[str] = []
+    errors: List[Dict[str, Any]] = []
+    fetches = 0
+    queue = [(sitemap_url, 0)]
+    while queue:
+        sm, depth = queue.pop(0)
+        if sm in seen_maps:
+            continue
+        if depth > _SITEMAP_MAX_DEPTH:
+            errors.append({"sitemap": sm, "error": f"nested deeper than {_SITEMAP_MAX_DEPTH} levels; not read"})
+            continue
+        seen_maps.add(sm)
+        fetches += 1
+        if fetches > _SITEMAP_MAX_FETCHES:
+            errors.append({"sitemap": sm, "error": "fetch budget exhausted"})
+            break
+        try:
+            r = await _safe_fetch(client, sm, site_url, extra_hosts=(sm_host,), want_body=True)
+        except Exception as e:  # noqa: BLE001
+            errors.append({"sitemap": sm, "error": f"{type(e).__name__}: {e}"})
+            continue
+        if r["status"] != 200:
+            errors.append({"sitemap": sm, "error": f"HTTP {r['status']}", "location": r.get("location")})
+            continue
+        try:
+            tag, locs = await asyncio.to_thread(_parse_sitemap_body, r["body"])
+        except Exception as e:  # noqa: BLE001 — a bad child sitemap is reported, not fatal
+            errors.append({"sitemap": sm, "error": f"{type(e).__name__}: {e}"})
+            continue
+        if tag == "sitemapindex":
+            queue.extend((loc, depth + 1) for loc in locs)
+        else:
+            urls.extend(locs)
+        if len(urls) >= _SITEMAP_MAX_URLS:
+            errors.append({"sitemap": sm, "error": f"URL cap {_SITEMAP_MAX_URLS} reached"})
+            urls = urls[:_SITEMAP_MAX_URLS]
+            break
+    return {"urls": urls, "sitemaps_read": sorted(seen_maps), "errors": errors,
+            "complete": not errors and not queue}
+
+
+@mcp.tool()
+async def gsc_sitemap_diff(
+    site_url: str,
+    sitemap_url: str,
+    urls_from: str = "list",
+    urls: Optional[List[str]] = None,
+    session_id: Optional[str] = None,
+    *,
+    dataset: str = "internal_all",
+    check_limit: int = 500,
+    concurrency: int = 8,
+    save_to_file: Optional[str] = None,
+) -> Any:
+    """Compare a sitemap with the site's live pages: live 200 URLs missing
+    from the sitemap, and sitemap URLs that redirect or 404. Fetches with a
+    browser user agent after a control request to the home page; if the
+    control fails, live results are marked inconclusive. Redirects are
+    reported, never followed. Only URLs inside the property are fetched.
+
+    Args:
+        site_url: GSC property. sitemap_url: sitemap or sitemap index URL.
+        urls_from: `list` (pass `urls`) | `sf_session` (a Screaming Frog
+            session from gsc_load_from_sf_export; rows of `dataset` with
+            status 200 and an HTML content type count as live).
+        check_limit: max sitemap URLs whose live status is checked (default 500).
+        save_to_file: absolute .json path for the full result.
+    """
+    tool = "gsc_sitemap_diff"
+    try:
+        source = _norm_enum(urls_from, {"list": "list", "sfsession": "sf_session", "crawl": "sf_session"},
+                            field="urls_from")
+        live_candidates: List[str] = []
+        live_known: Dict[str, int] = {}
+        if source == "list":
+            live_candidates = _parse_url_list(urls or [])
+        else:
+            if session_id not in _sf_sessions:
+                raise _SaValidationError(f"Unknown SF session_id: {session_id!r}.", "Load one with gsc_load_from_sf_export.")
+            ds = _sf_sessions[session_id]["datasets"].get(dataset)
+            if not ds:
+                raise _SaValidationError(f"Dataset {dataset!r} not in session.", "")
+            for row in _stream_sf_csv(ds):
+                addr = (row.get("address") or "").strip()
+                status = str(row.get("status_code") or "").strip()
+                ctype = str(row.get("content_type") or "html").lower()
+                if addr and status == "200" and "html" in ctype:
+                    live_known[addr] = 200
+            live_candidates = list(live_known)
+        async with _new_fetch_client() as client:
+            control = await _control_ok(client, site_url, sitemap_url)
+            sm = await _read_sitemap_urls(client, sitemap_url, site_url)
+            in_sitemap = {_normalize_url(u) for u in sm["urls"]}
+            # Live 200 pages missing from the sitemap.
+            to_check = [u for u in live_candidates if u not in live_known]
+            fetched = await _fetch_statuses(client, to_check[:check_limit], site_url, concurrency=concurrency) if to_check else {}
+            live_200 = [u for u in live_candidates if live_known.get(u) == 200 or (fetched.get(u) or {}).get("status") == 200]
+            absent = sorted(u for u in live_200 if _normalize_url(u) not in in_sitemap)
+            # Sitemap URLs that do not answer 200.
+            sample = sm["urls"][:check_limit]
+            statuses = await _fetch_statuses(client, sample, site_url, concurrency=concurrency)
+        out_of_scope = sorted(u for u, s in statuses.items() if s.get("refused"))
+        bad = [
+            {"url": u, "status": s.get("status"), "location": s.get("location"), "error": s.get("error")}
+            for u, s in statuses.items() if s.get("status") != 200 and not s.get("refused")
+        ]
+        bad.sort(key=lambda r: (str(r["status"]), r["url"]))
+        out = {
+            "ok": True, "tool": tool, "site_url": site_url, "sitemap_url": sitemap_url,
+            "inconclusive": not control["ok"],
+            "control": control,
+            "sitemap_url_count": len(sm["urls"]),
+            "sitemaps_read": sm["sitemaps_read"],
+            "sitemap_errors": sm["errors"],
+            "sitemap_complete": sm["complete"],
+            # An incomplete sitemap read cannot prove absence: those URLs are
+            # only "possibly" missing.
+            "missing_from_sitemap": absent if sm["complete"] else [],
+            "possibly_missing_from_sitemap": [] if sm["complete"] else absent,
+            "sitemap_urls_not_200": {
+                "redirect": [b for b in bad if b["status"] in (301, 302, 303, 307, 308)],
+                "not_found": [b for b in bad if b["status"] in (404, 410)],
+                "other": [b for b in bad if b["status"] not in (301, 302, 303, 307, 308, 404, 410)],
+            },
+            "sitemap_urls_out_of_scope": out_of_scope,
+            "checked": {
+                "sitemap_urls": len(sample),
+                "sitemap_urls_unchecked": max(0, len(sm["urls"]) - len(sample)),
+                "live_candidates_supplied": len(live_candidates),
+                "live_known_from_crawl": len(live_known),
+                "live_fetched": len(fetched),
+                "live_unchecked": max(0, len(to_check) - check_limit),
+            },
+            "meta": _standard_meta(None, site_url=site_url, urls_from=source,
+                                   warnings=([] if control["ok"] else [
+                                       "Control request to the home page failed; live statuses may reflect "
+                                       "bot blocking, not the site."])
+                                   + ([] if sm["complete"] else [
+                                       "The sitemap was not read completely (see sitemap_errors); absence "
+                                       "from it is reported as 'possibly' only."])),
+        }
+        if save_to_file:
+            return await _save_and_trim(out, save_to_file, (
+                "missing_from_sitemap", "possibly_missing_from_sitemap", "sitemap_urls_out_of_scope"))
+        return out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+# --- Recrawl worklist (v1.5.0) ---
+_MANUAL_REQUEST_DAILY_CAP = 10  # Search Console's manual Request Indexing allowance is small and undocumented
+
+
+_worklist_lock = asyncio.Lock()
+
+
+_ACTIVE_JOB_STATES = ("queued", "running", "throttled")
+
+
+def _job_view(site_url: str, url: str) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """For one URL across this site's jobs (newest first): a fresh result
+    (inspected within the cache TTL, by its own timestamp), the newest
+    active job still working on it, and the newest terminal error."""
+    cutoff = time.time() - _INSPECTION_CACHE_TTL_SEC
+    fresh = active = error = None
+    for job in sorted(_inspect_jobs.values(), key=lambda j: -j["created_at"]):
+        if job["site_url"] != site_url or url not in job["urls"]:
+            continue
+        ts = (job.get("result_ts") or {}).get(url)
+        if fresh is None and url in job["results"] and ts and ts >= cutoff:
+            fresh = job["results"][url]
+        elif active is None and job["state"] in _ACTIVE_JOB_STATES and url not in job["errors"]:
+            active = job
+        elif error is None and url in job["errors"] and job["created_at"] >= cutoff:
+            error = dict(job["errors"][url], job_id=job["job_id"])
+    return fresh, active, error
+
+
+async def _start_inspect_job(site_url: str, service: Any, alias: str, urls: List[str], *,
+                             force: bool, concurrency: int) -> Dict[str, Any]:
+    _evict_inspect_jobs()
+    job_id = f"insp-{uuid4().hex[:12]}"
+    now = time.time()
+    job: Dict[str, Any] = {
+        "job_id": job_id, "site_url": site_url, "account_alias": alias, "urls": urls,
+        "force": bool(force), "state": "queued", "created_at": now, "updated_at": now,
+        "finished_at": None, "results": {}, "errors": {}, "cached": 0,
+    }
+    if not force:
+        for url in urls:
+            hit = await asyncio.to_thread(_cache_get, site_url, url)
+            if hit is not None:
+                job["results"][url] = _normalize_inspection(url, hit[0], hit[1])
+                job.setdefault("result_ts", {})[url] = hit[1]
+        job["cached"] = len(job["results"])
+    _inspect_jobs[job_id] = job
+    if len(job["results"]) == len(urls):
+        job["state"] = "done"
+        job["finished_at"] = time.time()
+    else:
+        job["task"] = asyncio.create_task(_run_inspect_job(job, service, concurrency))
+    return job
+
+
+def _parse_changed(value: Any) -> Optional[str]:
+    if not value:
+        return None
+    return _parse_gsc_date(str(value)[:10])
+
+
+@mcp.tool()
+async def gsc_recrawl_worklist(
+    site_url: str,
+    items: List[Any],
+    changed_on: Optional[str] = None,
+    daily_cap: int = _MANUAL_REQUEST_DAILY_CAP,
+    *,
+    retry: bool = False,
+    check_live: bool = True,
+    account_alias: Optional[str] = None,
+) -> Any:
+    """Which changed URLs Google hasn't picked up yet — the list for a human
+    to paste into Search Console's Request Indexing (the API cannot request
+    indexing for normal pages; the Indexing API only covers JobPosting and
+    BroadcastEvent). Resubmitting the sitemap also helps.
+
+    Pass `items` as [{url, changed_on}] (or plain URLs plus one `changed_on`).
+    URLs not inspected in the last 6 hours are inspected in a background job:
+    the first call then returns status "pending" with a job_id — poll
+    gsc_inspect_status, then call this again. A URL that failed stays in
+    `unresolved` (never a silent pending); pass retry=true to re-inspect it.
+
+    Reasons a URL needs a request: crawled before it changed; not indexed;
+    Google sees "Page with redirect" while the live URL answers 200.
+    Canonical mismatches are listed separately — Request Indexing does not
+    change Google's canonical choice; the fix is on the page. The list is
+    ordered by the last 28 days' clicks and capped at `daily_cap`.
+    """
+    tool = "gsc_recrawl_worklist"
+    try:
+        plan: Dict[str, Optional[str]] = {}
+        for it in items or []:
+            if isinstance(it, dict):
+                url = str(it.get("url") or "").strip()
+                when = it.get("changed_on") or it.get("last_change_date") or changed_on
+            else:
+                url, when = str(it).strip(), changed_on
+            if url:
+                plan[url] = _parse_changed(when)
+        if not plan:
+            raise _SaValidationError("No URLs given.", "Pass items=[{url, changed_on}].")
+        missing_dates = [u for u, d in plan.items() if not d]
+        if missing_dates:
+            raise _SaValidationError(f"{len(missing_dates)} URL(s) have no changed_on date.",
+                                     "Give each item a changed_on (YYYY-MM-DD) or pass changed_on for all.")
+        urls = list(plan)
+        resolved_alias, service = await get_gsc_service_for_site(site_url, account_alias)
+
+        results: Dict[str, Dict[str, Any]] = {}
+        unresolved: Dict[str, Any] = {}
+        job: Optional[Dict[str, Any]] = None
+        # One worklist at a time decides and starts inspections, so two
+        # concurrent calls cannot launch duplicate jobs for the same URLs.
+        async with _worklist_lock:
+            waiting: Dict[str, str] = {}  # url -> active job id
+            to_start: List[str] = []
+            for url in urls:
+                fresh, active, error = _job_view(site_url, url)
+                if active is not None and active.get("force"):
+                    waiting[url] = active["job_id"]  # a forced re-inspection outranks the cache
+                    continue
+                hit = await asyncio.to_thread(_cache_get, site_url, url)
+                if hit is not None:
+                    results[url] = _normalize_inspection(url, hit[0], hit[1])
+                elif fresh is not None:
+                    results[url] = fresh
+                elif active is not None:
+                    waiting[url] = active["job_id"]
+                elif error is not None and not retry:
+                    unresolved[url] = error  # reported, not re-inspected unless retry=true
+                else:
+                    to_start.append(url)
+            if to_start:
+                job = await _start_inspect_job(site_url, service, resolved_alias, to_start,
+                                               force=False, concurrency=_INSPECT_DEFAULT_CONCURRENCY)
+                if job["state"] == "done":
+                    results.update(job["results"])
+                else:
+                    waiting.update({u: job["job_id"] for u in to_start})
+            if waiting:
+                return {"ok": True, "tool": tool, "status": "pending",
+                        "job_id": (job or {}).get("job_id") or next(iter(waiting.values())),
+                        "job_ids": sorted(set(waiting.values())), "pending": len(waiting),
+                        "poll_with": "gsc_inspect_status", "then_call": tool}
+
+        # Traffic value: clicks over the last 28 final days, per page.
+        ctx = _SaContext(site_url, account_alias, resolved_alias, service)
+        traffic: Dict[str, Dict[str, Any]] = {}
+        for chunk in _chunks(urls, 20):
+            t = await _sa_run(ctx, dimensions=["page"], days=28, fetch_all=True, step=f"{tool}.traffic",
+                              filter_groups=[{"filters": [{"dimension": "page", "operator": "includingRegex",
+                                                           "expression": _url_regex(chunk)}]}])
+            traffic.update({r["page"]: r for r in t["rows"]})
+
+        redirects = [u for u, r in results.items() if "redirect" in (r.get("coverage_state") or "").lower()]
+        live: Dict[str, Dict[str, Any]] = {}
+        control = None
+        if check_live and redirects:
+            async with _new_fetch_client() as client:
+                control = await _control_ok(client, site_url, redirects[0])
+                if control["ok"]:  # a failed control makes every live status meaningless
+                    live = await _fetch_statuses(client, redirects, site_url)
+
+        for url in urls:  # every URL ends up in exactly one list
+            if url not in results and url not in unresolved:
+                unresolved[url] = {"error": "not inspected"}
+        needs, mismatches, fine = [], [], []
+        for url in urls:
+            if url in unresolved:
+                continue
+            r = results[url]
+            changed = plan[url]
+            crawl = (r.get("last_crawl_time") or "")[:10]
+            entry = {
+                "url": url, "changed_on": changed, "last_crawl": crawl or None,
+                "verdict": r.get("verdict"), "coverage_state": r.get("coverage_state"),
+                "clicks_28d": (traffic.get(url) or {}).get("clicks", 0),
+                "impressions_28d": (traffic.get(url) or {}).get("impressions", 0),
+            }
+            if r.get("canonical_mismatch"):
+                mismatches.append(dict(entry, google_canonical=r.get("google_canonical"),
+                                       user_canonical=r.get("user_canonical")))
+                continue
+            reasons = []
+            if not crawl or crawl < changed:
+                reasons.append(f"crawled before the change (last crawl {crawl or 'never'}, changed {changed})")
+            coverage = (r.get("coverage_state") or "").lower()
+            if "redirect" in coverage:
+                status = (live.get(url) or {}).get("status")
+                if status == 200:
+                    reasons.append("Google sees 'Page with redirect' but the live URL answers 200")
+                elif status in (301, 302, 303, 307, 308):
+                    entry["note"] = f"live URL answers {status}; the redirect is real"
+                elif not reasons:
+                    # No usable live evidence and nothing else to go on:
+                    # neither "needs a request" nor "fine" can be claimed.
+                    why = ("live check skipped" if not check_live else
+                           "control request failed" if control and not control["ok"] else
+                           f"live check returned {status or (live.get(url) or {}).get('error') or 'nothing'}")
+                    unresolved[url] = {"error": f"Google sees 'Page with redirect'; {why}"}
+                    continue
+            elif r.get("verdict") != "PASS" and not reasons:
+                reasons.append(f"not indexed: {r.get('coverage_state')}")
+            if reasons:
+                needs.append(dict(entry, reasons=reasons))
+            else:
+                fine.append(entry)
+        needs.sort(key=lambda e: (-(e["clicks_28d"] or 0), -(e["impressions_28d"] or 0), e["url"]))
+        cap = max(0, int(daily_cap))
+        today_list, later = needs[:cap], needs[cap:]
+        return {
+            "ok": True, "tool": tool, "status": "complete", "site_url": site_url,
+            "needs_request_indexing": today_list,
+            "needs_request_indexing_later": later,
+            "paste_ready": "\n".join(e["url"] for e in today_list),
+            "canonical_mismatches": mismatches,
+            "no_action_needed": fine,
+            "unresolved": [{"url": u, "error": e} for u, e in unresolved.items()],
+            "counts": {"needs_request_indexing": len(needs), "canonical_mismatches": len(mismatches),
+                       "no_action_needed": len(fine), "unresolved": len(unresolved)},
+            "live_check_control": control,
+            "meta": _standard_meta(None, site_url=site_url, daily_cap=cap, job_id=(job or {}).get("job_id"),
+                                   api_limits={"request_indexing": _API_LIMITS["request_indexing"]}),
+        }
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, site_url=site_url)
+
+
+# --- Search Console UI export import (v1.5.0) ---
+# For data the API does not have (the Generative AI features report, and
+# any UI export): load the CSV/zip/XLSX a human downloaded, then query it
+# with SQL in the SQLite dialect. SQLite, not DuckDB, on purpose: exports
+# are ~1,000 rows per table, and an engine that cannot touch the
+# filesystem matters more than richer SQL (DuckDB's read_csv/COPY can read
+# and write arbitrary files unless external access is locked down).
+# Each session is an in-memory database with temp_store=MEMORY, a
+# read-only authorizer (SELECT/READ/FUNCTION only: no ATTACH, PRAGMA or
+# writes), query_only, no extensions, size limits, and a timeout.
+_UI_MAX_FILE_BYTES = 20 * 1024 * 1024
+_UI_MAX_ZIP_ENTRIES = 50
+_UI_MAX_UNZIPPED_BYTES = 50 * 1024 * 1024
+_UI_MAX_ROWS_PER_TABLE = 5_000
+_UI_MAX_CELL_CHARS = 10_000
+_UI_MAX_SESSIONS = 10
+_UI_MAX_SESSION_BYTES = 20 * 1024 * 1024
+_UI_MAX_SQL_CHARS = 20_000
+_UI_MAX_VALUE_BYTES = 1_000_000
+_UI_MAX_RESULT_ROWS = 5_000
+_UI_MAX_COLUMNS = 200
+_UI_MAX_RESULT_BYTES = 10 * 1024 * 1024
+_UI_QUERY_TIMEOUT_SEC = 5.0
+_UI_METRICS = {"clicks": "clicks", "impressions": "impr", "ctr": "ctr", "position": "pos"}
+_MONTHS = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+_ui_sessions: Dict[str, Dict[str, Any]] = {}
+
+
+class _UiExportError(ValueError):
+    pass
+
+
+def _check_sqlite_version() -> None:
+    if sqlite3.sqlite_version_info < (3, 25, 0):
+        raise _UiExportError(
+            f"SQLite {sqlite3.sqlite_version} is too old: window functions (LAG, RANK) need 3.25+. "
+            "Rebuild the venv on a newer Python."
+        )
+
+
+def _ui_table_name(raw: str, taken: set) -> str:
+    name = re.sub(r"[^a-z0-9]+", "_", Path(raw).stem.lower()).strip("_") or "table"
+    name = {"top_queries": "queries", "top_pages": "pages", "search_appearance": "search_appearance"}.get(name, name)
+    if name[0].isdigit():
+        name = "t_" + name
+    base, i = name, 2
+    while name in taken or name == "meta":
+        name = f"{base}_{i}"
+        i += 1
+    taken.add(name)
+    return name
+
+
+def _ui_value(cell: Any) -> Any:
+    """Typed cell: numbers become numbers, '2.5%' becomes 0.025."""
+    if cell is None:
+        return None
+    if isinstance(cell, bool):
+        return int(cell)
+    if isinstance(cell, float):
+        return int(cell) if cell.is_integer() else cell  # XLSX stores counts as floats
+    if isinstance(cell, int):
+        return cell
+    text = str(cell).strip()
+    if text == "":
+        return None
+    if len(text) > _UI_MAX_CELL_CHARS:
+        raise _UiExportError(f"A cell is over {_UI_MAX_CELL_CHARS} characters.")
+    t = text.replace(",", "")
+    try:
+        if t.endswith("%"):
+            return float(t[:-1]) / 100.0
+        if re.fullmatch(r"-?\d+", t):
+            return int(t)
+        if re.fullmatch(r"-?\d*\.\d+(e-?\d+)?", t, re.IGNORECASE):
+            return float(t)
+    except ValueError:
+        pass
+    return text
+
+
+_SLASH_DATE_RE = re.compile(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b")
+_ISO_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
+
+
+def _slash_order(labels: List[str]) -> Optional[str]:
+    """``"dmy"`` or ``"mdy"`` for slash dates in period labels, decided from
+    all labels together (Search Console writes dates in the account's
+    locale): a first part over 12 means day-first, a second part over 12
+    month-first. None when every date is ambiguous."""
+    firsts, seconds = [], []
+    for label in labels:
+        for a, b, _ in _SLASH_DATE_RE.findall(label):
+            firsts.append(int(a))
+            seconds.append(int(b))
+    if any(v > 12 for v in firsts):
+        return "dmy"
+    if any(v > 12 for v in seconds):
+        return "mdy"
+    return None
+
+
+def _parse_period(label: str, order: Optional[str]) -> Dict[str, Optional[str]]:
+    """``{start, end, month}`` for a compare-mode period label such as
+    '01/08/2026 - 27/08/2026' (dates ISO; month = start month, 'aug')."""
+    dates: List[str] = []
+    for y, m, d in _ISO_DATE_RE.findall(label):
+        dates.append(f"{y}-{m}-{d}")
+    if not dates and order:
+        for a, b, y in _SLASH_DATE_RE.findall(label):
+            day, mon = (int(a), int(b)) if order == "dmy" else (int(b), int(a))
+            year = int(y) + (2000 if len(y) == 2 else 0)
+            try:
+                dates.append(datetime(year, mon, day).date().isoformat())
+            except ValueError:
+                pass
+    month = _MONTHS[int(dates[0][5:7]) - 1] if dates else None
+    if month is None:
+        low = label.lower()
+        month = next((name for name in _MONTHS if re.search(rf"\b{name}", low)), None)
+    return {"start": dates[0] if dates else None, "end": dates[-1] if dates else None, "month": month}
+
+
+def _ui_columns(headers: List[str]) -> Tuple[List[str], List[Tuple[str, int]], List[Dict[str, Any]]]:
+    """Normalised column names, extra alias columns ``(alias, source_index)``
+    for compare mode, and a description of the periods found.
+
+    Compare-mode headers look like '<period> <Metric>'. Each period gets
+    ``<metric>_a`` / ``<metric>_b`` aliases (a = first in the file) and,
+    when its label names a month, ``<metric>_<mon>`` plus the short form
+    (``impr_aug``, ``pos_sep``)."""
+    seen: Dict[str, int] = {}
+    names = [_normalize_column(h, seen) for h in headers]
+    prefixes: Dict[str, List[Tuple[str, int]]] = {}
+    for i, h in enumerate(headers):
+        low = h.strip().lower()
+        for metric in _UI_METRICS:
+            if low.endswith(metric) and low != metric:
+                prefix = h.strip()[: -len(metric)].strip(" -:_")
+                if prefix:
+                    prefixes.setdefault(prefix, []).append((metric, i))
+                break
+    aliases: List[Tuple[str, int]] = []
+    periods: List[Dict[str, Any]] = []
+    if len(prefixes) >= 2:
+        taken = set(names)
+        order = _slash_order(list(prefixes))
+        parsed = {prefix: _parse_period(prefix, order) for prefix in prefixes}
+        months = [parsed[p]["month"] for p in prefixes]
+        if len(set(months)) != len(months):
+            # Two periods in the same month: month aliases would collide.
+            for p in parsed.values():
+                p["month"] = None
+        for letter, (prefix, cols) in zip("abcdefgh", prefixes.items()):
+            month = parsed[prefix]["month"]
+            periods.append({"label": prefix, "suffix": letter, "month": month,
+                            "start": parsed[prefix]["start"], "end": parsed[prefix]["end"],
+                            "date_order": order})
+            for metric, idx in cols:
+                wanted = [f"{metric}_{letter}"]
+                if month:
+                    wanted += [f"{metric}_{month}", f"{_UI_METRICS[metric]}_{month}"]
+                for alias in wanted:
+                    if alias not in taken:
+                        taken.add(alias)
+                        aliases.append((alias, idx))
+    return names, aliases, periods
+
+
+def _check_zip(path: Path) -> "zipfile.ZipFile":
+    import zipfile
+    try:
+        zf = zipfile.ZipFile(path)
+    except zipfile.BadZipFile as e:
+        raise _UiExportError(f"Not a valid zip/xlsx file: {e}")
+    infos = zf.infolist()
+    if len(infos) > _UI_MAX_ZIP_ENTRIES:
+        raise _UiExportError(f"Archive has {len(infos)} entries (max {_UI_MAX_ZIP_ENTRIES}).")
+    total = sum(i.file_size for i in infos)
+    if total > _UI_MAX_UNZIPPED_BYTES:
+        raise _UiExportError(f"Archive expands to {total} bytes (max {_UI_MAX_UNZIPPED_BYTES}).")
+    return zf
+
+
+def _decode_csv_bytes(data: bytes) -> str:
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return data.decode("utf-16")
+    return data.decode("utf-8-sig")
+
+
+def _check_row(row: List[Any], n_rows: int, name: str) -> None:
+    """Budgets enforced while reading, before a table is materialised."""
+    if len(row) > _UI_MAX_COLUMNS:
+        raise _UiExportError(f"Table {name!r} has {len(row)} columns (max {_UI_MAX_COLUMNS}).")
+    if n_rows > _UI_MAX_ROWS_PER_TABLE:
+        raise _UiExportError(
+            f"Table {name!r} has more than {_UI_MAX_ROWS_PER_TABLE} rows; UI exports are "
+            f"normally 1,000. Refusing rather than silently truncating."
+        )
+    for c in row:
+        if c is not None and len(str(c)) > _UI_MAX_CELL_CHARS:
+            raise _UiExportError(f"A cell in {name!r} is over {_UI_MAX_CELL_CHARS} characters.")
+
+
+def _csv_table(text: str, name: str = "table") -> Tuple[List[str], List[List[Any]]]:
+    header: Optional[List[str]] = None
+    rows: List[List[Any]] = []
+    for r in csv.reader(io.StringIO(text)):
+        if not any(c.strip() for c in r):
+            continue
+        if header is None:
+            _check_row(r, 0, name)
+            header = r
+        else:
+            _check_row(r, len(rows) + 1, name)
+            rows.append(r)
+    return header or [], rows
+
+
+def _read_export(path: Path) -> List[Tuple[str, List[str], List[List[Any]]]]:
+    """``[(raw_table_name, headers, rows), ...]`` from a .csv, .zip of CSVs or .xlsx."""
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        headers, rows = _csv_table(_decode_csv_bytes(path.read_bytes()), path.name)
+        return [(path.name, headers, rows)]
+    if suffix == ".zip":
+        zf = _check_zip(path)
+        tables = []
+        for info in zf.infolist():
+            if info.is_dir() or not info.filename.lower().endswith(".csv"):
+                continue
+            headers, rows = _csv_table(_decode_csv_bytes(zf.read(info)), info.filename)
+            tables.append((Path(info.filename).name, headers, rows))
+        return tables
+    if suffix == ".xlsx":
+        _check_zip(path).close()
+        import openpyxl
+        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        tables = []
+        try:
+            for ws in wb.worksheets:
+                if (ws.max_column or 0) > _UI_MAX_COLUMNS:
+                    raise _UiExportError(f"Sheet {ws.title!r} spans {ws.max_column} columns (max {_UI_MAX_COLUMNS}).")
+                def _trim(r: Any) -> List[Any]:
+                    r = list(r or [])
+                    while r and (r[-1] is None or str(r[-1]).strip() == ""):
+                        r.pop()
+                    return r
+                it = ws.iter_rows(values_only=True)
+                header = _trim(next(it, None))
+                if not header:
+                    continue
+                _check_row(header, 0, ws.title)
+                rows = []
+                for r in it:
+                    r = _trim(r)
+                    if not r:
+                        continue
+                    _check_row(r, len(rows) + 1, ws.title)
+                    rows.append(r)
+                tables.append((ws.title, [str(h or "") for h in header], rows))
+        finally:
+            wb.close()
+        return tables
+    raise _UiExportError(f"Unsupported file type {suffix!r}: pass a .csv, .zip or .xlsx export.")
+
+
+def _ui_authorizer(action: int, arg1: Any, arg2: Any, dbname: Any, source: Any) -> int:
+    allowed = {sqlite3.SQLITE_SELECT, sqlite3.SQLITE_READ, sqlite3.SQLITE_FUNCTION}
+    recursive = getattr(sqlite3, "SQLITE_RECURSIVE", None)
+    if recursive is not None:
+        allowed.add(recursive)
+    return sqlite3.SQLITE_OK if action in allowed else sqlite3.SQLITE_DENY
+
+
+def _build_ui_session(path: Path, report_kind: Optional[str]) -> Dict[str, Any]:
+    _check_sqlite_version()
+    if path.stat().st_size > _UI_MAX_FILE_BYTES:
+        raise _UiExportError(f"File is {path.stat().st_size} bytes (max {_UI_MAX_FILE_BYTES}).")
+    raw_tables = _read_export(path)
+    if not raw_tables:
+        raise _UiExportError("No tables found in the export.")
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    conn.execute("PRAGMA temp_store=MEMORY")  # sorts/GROUP BY never spill to temp files
+    conn.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _UI_MAX_VALUE_BYTES)
+    conn.setlimit(sqlite3.SQLITE_LIMIT_SQL_LENGTH, _UI_MAX_SQL_CHARS + 1000)
+    taken: set = set()
+    tables, size = [], 0
+    meta_rows: List[Tuple[str, str]] = [
+        ("source_file", path.name), ("report_kind", report_kind or ""),
+        ("loaded_at", datetime.now(timezone.utc).isoformat()),
+    ]
+    for raw_name, headers, rows in raw_tables:
+        if not headers:
+            continue
+        name = _ui_table_name(raw_name, taken)
+        cols, aliases, periods = _ui_columns(headers)
+        all_cols = cols + [a for a, _ in aliases]
+        conn.execute(f'CREATE TABLE "{name}" ({", ".join(chr(34) + c + chr(34) for c in all_cols)})')
+        # Only metric columns are coerced to numbers: a query "404" or
+        # "2026 budget" stays text.
+        numeric = [bool(re.search(r"clicks|impressions|impr|ctr|position|pos\b", c)) for c in cols]
+        typed = []
+        for r in rows:
+            vals = []
+            for i in range(len(cols)):
+                cell = r[i] if i < len(r) else None
+                if numeric[i]:
+                    vals.append(_ui_value(cell))
+                else:
+                    text = None if cell is None else str(cell).strip()
+                    vals.append(text if text else None)
+            vals += [vals[idx] for _, idx in aliases]
+            size += sum(len(str(v)) for v in vals if v is not None)
+            if size > _UI_MAX_SESSION_BYTES:
+                raise _UiExportError(f"Export is over {_UI_MAX_SESSION_BYTES} bytes once loaded.")
+            typed.append(vals)
+        conn.executemany(f'INSERT INTO "{name}" VALUES ({", ".join("?" * len(all_cols))})', typed)
+        tables.append({"name": name, "source": raw_name, "columns": all_cols,
+                       "row_count": len(typed), "compare_periods": periods})
+        # The Filters tab records only the first range in compare mode; the
+        # headers carry both, so they go into meta from there.
+        if periods and not any(k == "period_a" for k, _ in meta_rows):
+            for p in periods:
+                meta_rows.append((f"period_{p['suffix']}",
+                                  f"{p['start']}..{p['end']}" if p["start"] else p["label"]))
+                meta_rows.append((f"period_{p['suffix']}_label", p["label"]))
+        if name == "filters":
+            for r in rows:
+                if len(r) >= 2 and r[0]:
+                    key = str(r[0]).strip()
+                    meta_rows.append((f"filter:{key}", str(r[1] if r[1] is not None else "")))
+                    low = key.lower()
+                    if low == "date":
+                        meta_rows.append(("date_range", str(r[1])))
+                    elif low in ("search type", "type"):
+                        meta_rows.append(("search_type", str(r[1])))
+    meta_rows.append(("tables", ",".join(t["name"] for t in tables)))
+    conn.execute('CREATE TABLE meta ("key", "value")')
+    conn.executemany("INSERT INTO meta VALUES (?, ?)", meta_rows)
+    conn.commit()
+    conn.execute("PRAGMA query_only=ON")
+    try:
+        conn.enable_load_extension(False)
+    except AttributeError:
+        pass
+    conn.set_authorizer(_ui_authorizer)
+    return {"conn": conn, "tables": tables, "meta": dict(meta_rows), "size": size,
+            "lock": __import__("threading").Lock(), "last_used": time.time(), "path": str(path)}
+
+
+def _close_ui_session(sess: Dict[str, Any]) -> None:
+    with sess["lock"]:
+        sess["conn"].close()
+
+
+def _run_ui_sql(sess: Dict[str, Any], sql: str, limit: int) -> Tuple[List[str], List[List[Any]], bool, bool]:
+    deadline = time.monotonic() + _UI_QUERY_TIMEOUT_SEC
+    conn = sess["conn"]
+    with sess["lock"]:
+        conn.set_progress_handler(lambda: 1 if time.monotonic() > deadline else 0, 10_000)
+        out: List[List[Any]] = []
+        more = clipped = False
+        budget = _UI_MAX_RESULT_BYTES
+        try:
+            cur = conn.execute(sql)
+            columns = [d[0] for d in cur.description or []]
+            # Row by row, clipping each value before keeping it, under a
+            # total byte budget — never a bulk fetch of large values.
+            for r in cur:
+                if len(out) >= limit:
+                    more = True
+                    break
+                vals, cost = [], 0
+                for v in r:
+                    if isinstance(v, bytes):
+                        v, clipped = f"<blob {len(v)} bytes>", True
+                    elif isinstance(v, str) and len(v) > _UI_MAX_CELL_CHARS:
+                        v, clipped = v[:_UI_MAX_CELL_CHARS], True
+                    cost += len(v.encode("utf-8")) if isinstance(v, str) else 16
+                    vals.append(v)
+                if cost > budget:  # checked before the row is kept
+                    more = True
+                    break
+                budget -= cost
+                out.append(vals)
+        finally:
+            conn.set_progress_handler(None, 0)
+    return columns, out, more, clipped
+
+
+@mcp.tool()
+async def gsc_load_ui_export(
+    file_path: str,
+    report_kind: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Any:
+    """Load a Search Console UI export (.zip of CSVs, a single .csv, or .xlsx)
+    for SQL — the way to analyse data the API doesn't have, e.g. the
+    Generative AI features report (AI Overview / AI Mode). Each tab becomes a
+    table (queries, pages, countries, dates, chart, filters, …) plus a
+    `meta` table (source file, date range, search type, filters). Compare
+    exports get period aliases: `<metric>_a`/`_b` and, where the label names
+    a month, `<metric>_<mon>` / `impr_aug`-style short forms. Query with
+    `gsc_query_ui_export`.
+
+    Args:
+        file_path: absolute path to the export a human downloaded.
+        report_kind: free-text label, e.g. "generative_ai_features".
+        session_id: reuse an id to replace a loaded session.
+    """
+    tool = "gsc_load_ui_export"
+    try:
+        path = Path(file_path).expanduser()
+        if not path.is_absolute():
+            raise _UiExportError(f"file_path must be absolute, got {file_path!r}.")
+        if not path.is_file():
+            raise _UiExportError(f"File not found: {file_path!r}.")
+        sess = await asyncio.to_thread(_build_ui_session, path, report_kind)
+        sid = session_id or f"ui-{uuid4().hex[:12]}"
+        retired = [_ui_sessions.pop(sid)] if sid in _ui_sessions else []
+        while len(_ui_sessions) >= _UI_MAX_SESSIONS:
+            lru = min(_ui_sessions, key=lambda k: _ui_sessions[k]["last_used"])
+            retired.append(_ui_sessions.pop(lru))
+        _ui_sessions[sid] = sess
+        for old in retired:  # waits for any running query, off the event loop
+            await asyncio.to_thread(_close_ui_session, old)
+        return {
+            "ok": True, "tool": tool, "session_id": sid,
+            "tables": sess["tables"] + [{"name": "meta", "columns": ["key", "value"], "row_count": len(sess["meta"])}],
+            "export_meta": sess["meta"],
+            "sql_dialect": f"SQLite {sqlite3.sqlite_version} (window functions supported; read-only)",
+            "meta": _standard_meta(None, row_count=sum(t["row_count"] for t in sess["tables"]), truncated=False),
+        }
+    except _UiExportError as e:
+        return _format_error(_make_error_envelope(error=str(e), error_code=ErrorCode.BAD_REQUEST, tool=tool,
+                                                  hint="Pass the export exactly as downloaded from Search Console."),
+                             response_format="json")
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool)
+
+
+@mcp.tool()
+async def gsc_query_ui_export(
+    session_id: str,
+    sql: str,
+    limit: int = 200,
+    response_format: str = "json",
+    save_to_file: Optional[str] = None,
+) -> Any:
+    """Run one read-only SQL SELECT (SQLite dialect: CTEs, window functions
+    like LAG and RANK) against a session from `gsc_load_ui_export`.
+    Anything but reading is refused (no ATTACH, PRAGMA, writes or
+    extensions). Example:
+    `select page, impr_aug, impr_sep from pages order by impr_aug - impr_sep desc limit 20`.
+
+    Args:
+        session_id: from gsc_load_ui_export.
+        sql: a single SELECT statement (max 20,000 characters).
+        limit: max rows returned (default 200, max 5000).
+        response_format: json (default) | csv | markdown.
+        save_to_file: absolute .csv/.json path; writes the rows, returns 20.
+    """
+    tool = "gsc_query_ui_export"
+    try:
+        sess = _ui_sessions.get(session_id)
+        if sess is None:
+            return _format_error(_make_error_envelope(
+                error=f"Unknown UI export session {session_id!r}.",
+                hint="Sessions live in server memory; reload with gsc_load_ui_export.",
+                error_code=ErrorCode.NOT_FOUND, tool=tool), response_format="json")
+        if not isinstance(sql, str) or not sql.strip():
+            raise _SaValidationError("sql is empty.", "")
+        if len(sql) > _UI_MAX_SQL_CHARS:
+            raise _SaValidationError(f"sql is over {_UI_MAX_SQL_CHARS} characters.", "")
+        limit = max(1, min(int(limit), _UI_MAX_RESULT_ROWS))
+        sess["last_used"] = time.time()
+        try:
+            columns, rows, more, clipped = await asyncio.to_thread(_run_ui_sql, sess, sql, limit)
+        except sqlite3.DatabaseError as e:
+            msg = str(e)
+            hint = ("Only a single read-only SELECT is allowed." if "not authorized" in msg
+                    else "Query ran past the time limit; simplify it." if "interrupted" in msg
+                    else "Check table/column names: see the tables listed by gsc_load_ui_export.")
+            raise _SaValidationError(f"SQL error: {msg}", hint)
+        dict_rows = [dict(zip(columns, r)) for r in rows]
+        cols = [{"key": c, "display": c, "type": "str"} for c in columns]
+        warnings = ["Some text values were clipped to 10,000 characters."] if clipped else []
+        if save_to_file:
+            return await _saved_summary(
+                tool=tool, path=save_to_file, rows=dict_rows, columns=cols,
+                meta=_standard_meta(None, session_id=session_id, source_file=sess["meta"].get("source_file"),
+                                    row_count=len(dict_rows), truncated=more, warnings=warnings),
+                response_format=response_format, truncated=more,
+            )
+        out = _format_table(
+            dict_rows, cols, response_format=response_format, truncated=more,
+            truncation_hint=f"More rows exist; raise limit (max {_UI_MAX_RESULT_ROWS}) or add a WHERE/LIMIT.",
+            meta=_standard_meta(None, session_id=session_id, source_file=sess["meta"].get("source_file"),
+                                export_date_range=sess["meta"].get("date_range"),
+                                row_count=len(dict_rows), truncated=more, warnings=warnings),
+            text_meta=True,
+        )
+        if isinstance(out, dict):
+            out["tool"] = tool
+        return out
+    except Exception as e:  # noqa: BLE001 — every failure becomes an envelope
+        return _tool_error(e, tool=tool, response_format=response_format if response_format in _RESPONSE_FORMATS else "json")
+
+
 # --- Health check (Add 4) ---
 
 # §0 of the 2026-09-28 change request: things the API cannot do, stated
@@ -7197,6 +8995,8 @@ async def gsc_health_check(
     # v1.4.0 additions. Each is independent and never fails the check.
     result["server_version"] = _SERVER_VERSION
     result["api_limits"] = _API_LIMITS
+    cfg = _load_site_config(site_url)
+    result["site_config"] = {"present": bool(cfg), "keys": sorted(k for k in cfg if not k.startswith("_"))}
 
     # Data freshness (dataState=all probe; cached for an hour).
     ctx = _SaContext(site_url, account_alias, _resolved_alias, service)

@@ -5,6 +5,85 @@ Dates are ISO-8601. Pre-1.0 minor bumps may include behaviour-breaking
 changes; see `audit/03-remediation-plan.md` for the multi-tranche plan
 these releases are executing against.
 
+## [1.5.0] — 2026-09-28 — analysis tools, recrawl worklist, sitemap diff, UI-export SQL
+
+### Added
+
+- **`gsc_page_query_profile`** — one call per page brief: page total, every
+  query sorted by impressions, unattributed (anonymised) share, non-English
+  share from a per-query language guess (stopwords/diacritics; a flag, not an
+  assertion), brand and login share, machine-query flags and the position
+  distribution (1–3, 4–10, 11–20, 21+).
+- **Machine-query flags** (shared helper, also in striking distance): a single
+  query with more than 50% of the page's impressions at 0 clicks; operator
+  strings (`site:`, `+site.`, `%site.`, `inurl:` …); long assistant-style
+  prompts (flagged as an AEO signal, never removed); and 10× single-day spikes.
+- **`gsc_brand_split`** — branded, non-branded and login clicks/impressions by
+  month, ISO week or day. The split runs in the API
+  (`includingRegex` / `excludingRegex` on query); `anonymised` is what neither
+  pull can see, and shares are of the property total.
+- **Per-site config** at `$GSC_STATE_DIR/site-config.json` (untracked; keyed
+  by `site_url`): `brand_terms`, `login_terms` (RE2 regexes, OR-ed),
+  `ctr_curve`, `exclude_urls`. Per-call arguments override it; the health
+  check reports whether a site has one.
+- **`gsc_striking_distance`** — pages at average position 4–20 (configurable)
+  with enough impressions and, by default, CTR below the expected CTR for
+  their position (from `ctr_curve`, else the site's own median CTR by
+  position). Each candidate has the gap, the click upside and its top
+  queries with flags; ordered by upside.
+- **`gsc_movers`** — biggest gainers and losers between two periods (or
+  `days=N`) by page or query, ranked by clicks, impressions or position, with
+  each row's share of the net change. Both periods fetched in full.
+- **`gsc_cannibalisation`** — queries where two or more URLs earn
+  impressions, with each URL's position, impressions, clicks and share.
+  Jump-link URLs (`page#section`) are merged into their page by default.
+- **`gsc_recrawl_worklist`** — which changed URLs Google hasn't picked up:
+  crawled before the change, not indexed, or "Page with redirect" while the
+  live URL answers 200. Ordered by the last 28 days' clicks, capped at the
+  daily manual allowance (default 10), with a paste-ready list. Uninspected
+  URLs are inspected in a background job (first call returns `pending`);
+  canonical mismatches are listed separately, since Request Indexing does not
+  change Google's canonical choice; failed URLs land in `unresolved`, never a
+  silent pending. States plainly that the API cannot request indexing.
+- **`gsc_sitemap_diff`** — live 200 URLs missing from a sitemap, and sitemap
+  URLs that redirect or 404. Reads sitemap indexes (depth ≤ 3, cycle-safe,
+  ≤ 50k URLs; only each entry's own `<loc>`, not `image:loc`). URLs from a
+  list or a Screaming Frog session. A control request to the home page first:
+  if it fails, results are `inconclusive`.
+- **Safe live fetcher** (sitemap diff and worklist): http(s) only, hosts
+  inside the property only, every resolved address must be public and the
+  connection is pinned to the validated address (Host/SNI/TLS keep the
+  hostname), so DNS rebinding cannot redirect it; redirects are reported,
+  never followed; 10 MB body cap (gzip expansion bounded too); browser user
+  agent. An incompletely read sitemap only yields "possibly missing" URLs.
+- **`gsc_load_ui_export` / `gsc_query_ui_export`** — load a Search Console UI
+  export (`.zip` of CSVs, `.csv`, `.xlsx`), e.g. the Generative AI features
+  report, and query it with SQL in the **SQLite dialect** (CTEs, window
+  functions). One table per tab plus `meta` (source file, date range, search
+  type, filters). Compare exports get `<metric>_a`/`_b` and month aliases
+  (`impr_aug`, `clicks_sep`). Read-only by construction: in-memory database,
+  `temp_store=MEMORY`, an authorizer allowing only SELECT/READ/FUNCTION,
+  `query_only`, no extensions, size limits (20 MB file, 50 zip entries /
+  50 MB expanded, 5,000 rows per table — rejected, not truncated), a 5 s
+  query timeout. SQLite 3.25+ is required and checked.
+  Tested on a real Generative AI features export (Pages, Countries, Devices,
+  Filters; impressions only; no Queries tab). Compare-mode period ranges are
+  parsed from the column headers — Search Console writes them in the
+  account's locale, so day-first vs month-first is decided across all
+  headers (`27/08` settles it; if every date is ambiguous only `_a`/`_b`
+  aliases are made) — and written to `meta` as `period_a` / `period_b`,
+  because the Filters tab records only the first range. Whole-number
+  metrics from XLSX are stored as integers.
+
+### Dependencies
+
+- `openpyxl` (XLSX exports) and `httpx` (live fetches; previously only a
+  transitive dependency of `mcp`) are now declared.
+
+### Tests
+
+- 565 passing (56 new).
+
 ## [1.4.0] — 2026-09-28 — full Search Analytics coverage, honest windows, inspection that finishes
 
 ### Added

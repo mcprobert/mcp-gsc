@@ -12,11 +12,13 @@ uv pip install -r requirements.txt
 
 ## Architecture
 
-Single-file FastMCP server (`gsc_server.py`) with 33 tools covering:
+Single-file FastMCP server (`gsc_server.py`) with 42 tools covering:
 
 - **Properties**: `gsc_list_properties`, `gsc_add_site`, `gsc_delete_site`, `gsc_get_site_details`
 - **Search Analytics**: `gsc_query` (raw passthrough), `gsc_get_search_analytics`, `gsc_get_advanced_search_analytics`, `gsc_compare_search_periods`, `gsc_get_search_by_page_query`, `gsc_get_performance_overview`
 - **Landing pages**: `gsc_get_landing_page_summary`, `gsc_compare_periods_landing_pages`
+- **Analysis (v1.5.0)**: `gsc_page_query_profile`, `gsc_brand_split`, `gsc_striking_distance`, `gsc_movers`, `gsc_cannibalisation`, `gsc_recrawl_worklist`
+- **UI exports + sitemaps (v1.5.0)**: `gsc_load_ui_export`, `gsc_query_ui_export`, `gsc_sitemap_diff`
 - **URL Inspection**: `gsc_inspect_start` + `gsc_inspect_status` (async jobs), `gsc_inspect_url_enhanced`, `gsc_batch_url_inspection`, `gsc_check_indexing_issues`
 - **Sitemaps**: `gsc_get_sitemaps`, `gsc_list_sitemaps_enhanced`, `gsc_get_sitemap_details`, `gsc_submit_sitemap`, `gsc_delete_sitemap`, `gsc_manage_sitemaps`
 - **Account Management**: `gsc_list_accounts`, `gsc_whoami`, `gsc_add_account`, `gsc_remove_account`, plus the deprecated `gsc_get_active_account` and `gsc_switch_account`
@@ -142,6 +144,15 @@ field is dropped on first save.
   journal, not WAL. The ledger reserves before every outbound inspection
   attempt; Google's quota error is identical for every limit, so the ledger
   decides daily vs per-minute.
+- **Per-site config** (v1.5.0) `$GSC_STATE_DIR/site-config.json`, keyed by
+  `site_url`: `brand_terms`, `login_terms`, `ctr_curve`, `exclude_urls`.
+  Client data — never commit it or put client terms in code or tests.
+- **Live HTTP** (v1.5.0) only through `_safe_fetch`: in-property hosts,
+  public addresses (resolved and connected peer), no redirect following,
+  size caps. Callers make a control request (`_control_ok`) first.
+- **UI-export SQL** (v1.5.0) is SQLite, read-only by construction (see
+  `_build_ui_session`). Do not swap in DuckDB without locking off its file
+  access (`read_csv`, `COPY`).
 - **Test seams** (`tests/conftest.py`): `_retry_sleep` / `_async_retry_sleep`
   are no-ops, `_today_pt` is frozen at 2026-09-28, `_latest_final_date`
   returns 2026-09-25 without a call (opt out with
@@ -202,7 +213,7 @@ a centrally managed config — find out why before re-enabling anything.
 
 ## Dependencies
 
-Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth`, `google-auth-oauthlib` (`oauth2client` was dropped in v1.3.0). Everything added in v1.4.0 is stdlib (`sqlite3`, `zoneinfo`).
+Python 3.11+ (pinned in `.python-version`). Key deps: `mcp`, `google-api-python-client`, `google-auth`, `google-auth-oauthlib` (`oauth2client` was dropped in v1.3.0). Everything added in v1.4.0 is stdlib (`sqlite3`, `zoneinfo`); v1.5.0 adds `httpx` (live fetches) and `openpyxl` (XLSX exports).
 
 ## Response envelope convention
 
